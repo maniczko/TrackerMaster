@@ -76,6 +76,7 @@ export default function App() {
   const [restoreDone, setRestoreDone] = useState('');
   const [revisions, setRevisions] = useState<{ entryId: Id; items: Revision[] } | null>(null);
   const revisionsRequest = useRef(0);
+  const historyRef = useRef<HTMLElement>(null);
   const [loaded, setLoaded] = useState(false);
   const [now, setNow] = useState(Date.now());
   const refresh = useCallback(async () => {
@@ -210,8 +211,8 @@ export default function App() {
           </details>
         </aside>
       </div>
-      <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} />
-      <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
+      <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} onEditEntry={entry => { setEditing({ id: entry.id, expectedStart: entry.started_at, expectedEnd: entry.ended_at, start: localInputValue(entry.started_at), end: localInputValue(entry.ended_at) }); historyRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }} />
+      <section ref={historyRef} className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta, projekt i zadanie powyżej, a następnie podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
           <form onSubmit={e => { e.preventDefault(); const start = parseLocalDate(manualStart); const end = parseLocalDate(manualEnd); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('create_manual_entry', { taskId: Number(taskId), startedAt: start.toISOString(), endedAt: end.toISOString() }); setManualStart(''); setManualEnd(''); }, 'Wpis czasu został dodany.'); }}>
             <div className="selectors"><label>Rozpoczęcie<input type="datetime-local" step="1" required value={manualStart} onChange={e => setManualStart(e.target.value)} /></label><label>Zakończenie<input type="datetime-local" step="1" required value={manualEnd} onChange={e => setManualEnd(e.target.value)} /></label></div>

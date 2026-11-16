@@ -22,3 +22,4 @@
 .primary:hover:not(:disabled){background:var(--tm-primary-hover)}
 .mini-pin{display:grid;place-items:center;color:#566765;filter:none}.mini-pin.is-pinned{color:var(--tm-primary);filter:none}.mini-folder{flex-shrink:0}
 .report{margin-top:20px}.report-button{padding:9px 12px;border-radius:9px;font-size:12px;font-weight:700}.report-filters{margin:18px 0}.report-filters input,.report-filters select{display:block;margin-top:8px}.report-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:20px}.report-summary div{background:#f4f8f6;border:1px solid #e3eeea;border-radius:10px;padding:15px;display:grid;gap:8px}.report-summary small{font-size:11px;color:#70877b}.report-summary strong{font-size:20px;color:#285b51;font-variant-numeric:tabular-nums}@media(max-width:760px){.report-summary{grid-template-columns:1fr}}
+.report .alert .actions{flex-wrap:wrap}

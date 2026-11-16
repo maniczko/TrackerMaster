@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { dateInZone, reportByDay, validTimeZone } from './reportTime';
+import { dateInZone, reportByDay, reportOverlaps, validTimeZone } from './reportTime';
 import type { ReportEntry } from './reportTime';
 
 type Id = number | string;
@@ -21,7 +21,7 @@ function duration(value: number) {
   return [Math.floor(seconds / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map(n => String(n).padStart(2, '0')).join(':');
 }
 
-export default function Report({ clients, projects, tasks, loaded }: { clients: Client[]; projects: Project[]; tasks: Task[]; loaded: boolean }) {
+export default function Report({ clients, projects, tasks, loaded, onEditEntry }: { clients: Client[]; projects: Project[]; tasks: Task[]; loaded: boolean; onEditEntry: (entry: Completed) => void }) {
   const [open, setOpen] = useState(false);
   const [from, setFrom] = useState(() => todayWarsaw().slice(0, 8) + '01');
   const [through, setThrough] = useState(todayWarsaw);
@@ -69,7 +69,8 @@ export default function Report({ clients, projects, tasks, loaded }: { clients: 
       const activeEntry = active && !active.unresolved && active.ended_at !== null && active.duration_seconds !== null
         ? { id: active.id, started_at: active.started_at, ended_at: active.ended_at, duration_seconds: active.duration_seconds } : null;
       const combined = reportByDay(activeEntry ? [...entries, activeEntry] : entries, from, through, data.time_zone);
-      return { completed, combined, active, activeSeconds: combined.totalSeconds - completed.totalSeconds, missingRelations, invalidRange: false, invalidZone: false };
+      const overlaps = reportOverlaps(activeEntry ? [...entries, activeEntry] : entries, from, through, data.time_zone);
+      return { completed, combined, overlaps, active, activeSeconds: combined.totalSeconds - completed.totalSeconds, missingRelations, invalidRange: false, invalidZone: false };
     } catch {
       return { invalidRange: true as const, invalidZone: false };
     }
@@ -88,6 +89,7 @@ export default function Report({ clients, projects, tasks, loaded }: { clients: 
       {result && 'invalidRange' in result && result.invalidRange && <div role="alert" className="alert error">Podaj poprawny zakres dat od 1970 roku; data końcowa nie może być wcześniejsza niż początkowa.</div>}
       {result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <>
         {(result.combined.excludedEntryIds.length > 0 || result.missingRelations) && <div role="alert" className="alert error"><strong>Raport jest niepełny.</strong> {result.combined.excludedEntryIds.length > 0 && <>Nie można bezpiecznie przypisać czasu do dni dla wpisów: {result.combined.excludedEntryIds.join(', ')}. Sprawdź je w historii. </>}{result.missingRelations && 'Brakuje powiązania części wpisów z klientem.'}</div>}
+        {result.overlaps.entryIds.length > 0 && <div role="alert" className="alert error"><strong>Wykryto nakładające się pomiary.</strong> Suma może uwzględniać ten sam czas więcej niż raz. Sprawdź wpisy: {result.overlaps.entryIds.map(id => `#${id}`).join(', ')}{result.overlaps.truncated ? ' i być może kolejne' : ''}. <div className="actions">{data?.entries.filter(entry => result.overlaps.entryIds.includes(entry.id)).map(entry => <button type="button" className="secondary" key={entry.id} onClick={() => onEditEntry(entry)}>Popraw wpis #{entry.id}</button>)}</div>{result.active && result.overlaps.entryIds.includes(result.active.id) && <p>Zatrzymaj aktywny pomiar, aby go poprawić.</p>}</div>}
         {result.active?.unresolved && <div role="alert" className="alert error">Aktywny pomiar wymaga weryfikacji lub sprawdzenia zegara. Nie jest doliczany do raportu.</div>}
         <div className="report-summary"><div><small>Łącznie{result.combined.excludedEntryIds.length || result.missingRelations ? ' — niepełne' : ''}</small><strong>{duration(result.combined.totalSeconds)}</strong></div><div><small>Średnio na dzień z pracą</small><strong>{result.combined.averageSeconds === null ? 'Brak danych' : duration(result.combined.averageSeconds)}</strong></div><div><small>W tym aktywny pomiar · orientacyjnie</small><strong>{duration(result.activeSeconds)}</strong></div></div>
         {result.active && !result.active.unresolved && <p className="muted">Aktywny pomiar jest tymczasowy i aktualizuje się co kilka sekund.</p>}

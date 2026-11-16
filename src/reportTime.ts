@@ -3,6 +3,7 @@ import { Temporal } from '@js-temporal/polyfill';
 export type ReportEntry = { id: number; started_at: string; ended_at: string; duration_seconds: number };
 export type ReportDay = { date: string; seconds: number };
 export type ReportResult = { days: ReportDay[]; totalSeconds: number; averageSeconds: number | null; excludedEntryIds: number[] };
+export type OverlapWarning = { entryIds: number[]; truncated: boolean };
 
 export function validTimeZone(timeZone: string): boolean {
   if (!timeZone || timeZone !== timeZone.trim() || timeZone.length > 128 || !/^[A-Za-z0-9_+\-/]+$/.test(timeZone) || (timeZone !== 'UTC' && !timeZone.includes('/'))) return false;
@@ -81,3 +82,25 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
 }
 
 export const reportByWarsawDay = (entries: ReportEntry[], from: string, through: string) => reportByDay(entries, from, through, 'Europe/Warsaw');
+
+// Existing legacy data may contain overlaps even though new ones are rejected.
+// Do not silently change historical totals: surface affected IDs for correction.
+export function reportOverlaps(entries: ReportEntry[], from: string, through: string, zone: string): OverlapWarning {
+  if (!validDate(from) || !validDate(through) || from > through || from < '1970-01-01' || !validTimeZone(zone)) throw new Error('Nieprawidłowy zakres lub strefa.');
+  const intervals = entries.map(entry => ({ id: entry.id, start: Date.parse(entry.started_at), end: Date.parse(entry.ended_at), validOffsets: /(?:Z|[+-]\d\d:\d\d)$/i.test(entry.started_at) && /(?:Z|[+-]\d\d:\d\d)$/i.test(entry.ended_at) }))
+    .filter(entry => entry.validOffsets && Number.isFinite(entry.start) && Number.isFinite(entry.end) && entry.start >= 0 && entry.end > entry.start && entry.end - entry.start <= 3660 * 86400_000)
+    .filter(entry => pieces(entry.start, entry.end, zone).some(part => part.date >= from && part.date <= through))
+    .sort((a, b) => a.start - b.start || a.id - b.id);
+  const ids = new Set<number>();
+  for (let i = 0; i < intervals.length; i++) {
+    for (let j = i + 1; j < intervals.length && intervals[j].start < intervals[i].end; j++) {
+      const start = Math.max(intervals[i].start, intervals[j].start);
+      const end = Math.min(intervals[i].end, intervals[j].end);
+      if (pieces(start, end, zone).some(part => part.date >= from && part.date <= through)) {
+        ids.add(intervals[i].id); ids.add(intervals[j].id);
+        if (ids.size >= 50) return { entryIds: [...ids], truncated: true };
+      }
+    }
+  }
+  return { entryIds: [...ids], truncated: false };
+}

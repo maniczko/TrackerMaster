@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reportByWarsawDay, reportByDay, validTimeZone } from '../src/reportTime.ts';
+import { reportByWarsawDay, reportByDay, reportOverlaps, validTimeZone } from '../src/reportTime.ts';
 
 const entry = (id: number, started_at: string, ended_at: string, duration_seconds: number) => ({ id, started_at, ended_at, duration_seconds });
 const range = (entries: ReturnType<typeof entry>[], from = '2026-01-01', through = '2026-12-31') => reportByWarsawDay(entries, from, through);
@@ -72,4 +72,18 @@ test('handles a clock rollback crossing midnight twice', () => {
   const result = reportByDay(e, '1988-10-29', '1988-10-30', 'America/St_Johns');
   assert.deepEqual(result.days, [{ date: '1988-10-29', seconds: 7740 }, { date: '1988-10-30', seconds: 1860 }]);
   assert.equal(result.totalSeconds, 9600);
+});
+
+test('warns about historical overlaps in the selected dates without changing the total', () => {
+  const data = [entry(1, '2026-01-01T09:00:00Z', '2026-01-01T10:00:00Z', 3600), entry(2, '2026-01-01T09:30:00Z', '2026-01-01T10:30:00Z', 3600), entry(3, '2026-01-01T10:30:00Z', '2026-01-01T11:00:00Z', 1800)];
+  assert.deepEqual(reportOverlaps(data, '2026-01-01', '2026-01-01', 'Europe/Warsaw'), { entryIds: [1, 2], truncated: false });
+  assert.equal(reportByDay(data, '2026-01-01', '2026-01-01', 'Europe/Warsaw').totalSeconds, 9000);
+  assert.deepEqual(reportOverlaps(data, '2026-01-02', '2026-01-02', 'Europe/Warsaw').entryIds, []);
+});
+
+test('overlap alert follows report zone and half-open intervals', () => {
+  const data = [entry(1, '2026-01-01T23:20:00Z', '2026-01-01T23:50:00Z', 1800), entry(2, '2026-01-01T23:30:00Z', '2026-01-02T00:00:00Z', 1800), entry(3, '2026-01-02T00:00:00Z', '2026-01-02T00:10:00Z', 600)];
+  assert.deepEqual(reportOverlaps(data, '2026-01-01', '2026-01-01', 'Europe/Warsaw').entryIds, []);
+  assert.deepEqual(reportOverlaps(data, '2026-01-02', '2026-01-02', 'Europe/Warsaw').entryIds, [1, 2]);
+  assert.deepEqual(reportOverlaps(data, '2026-01-01', '2026-01-01', 'Europe/London').entryIds, [1, 2]);
 });
