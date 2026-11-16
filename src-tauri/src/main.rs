@@ -380,11 +380,7 @@ fn validate_schema(db: &Connection) -> rusqlite::Result<()> {
     if db.prepare("PRAGMA foreign_key_check")?.query([])?.next()?.is_some() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let index_ok = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_index_list('time_entries') WHERE name='one_running_timer' AND \"unique\"=1 AND partial=1)",
-        [], |row| row.get::<_, bool>(0),
-    )?;
-    if !index_ok { return Err(rusqlite::Error::InvalidQuery); }
+    storage_safety::validate_timer_index(db)?;
     Ok(())
 }
 
@@ -800,6 +796,17 @@ mod tests {
         tracker.db.execute("INSERT INTO projects(id,client_id,name) VALUES(2,999,'Orphan')", []).unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM projects WHERE id=2", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn current_schema_with_wrong_timer_index_definition_is_rejected() {
+        let mut tracker = seeded();
+        tracker.db.execute_batch("
+            DROP INDEX one_running_timer;
+            CREATE UNIQUE INDEX one_running_timer ON time_entries(task_id)
+              WHERE ended_at IS NULL;
+        ").unwrap();
+        assert!(initialise(&mut tracker.db).is_err());
     }
 
     #[test]
