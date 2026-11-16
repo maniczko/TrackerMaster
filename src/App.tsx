@@ -30,6 +30,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [lastBackup, setLastBackup] = useState('');
   const [recoveryEnd, setRecoveryEnd] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -96,7 +97,7 @@ export default function App() {
   };
 
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><span className="brand-mark">T</span><div><strong>TrackerMaster</strong><small>Twój czas, pod kontrolą</small></div></div><div className="topbar-actions"><button className="widget-open" onClick={() => invoke('open_widget').catch(e => setError(`Nie udało się otworzyć widgetu: ${String(e)}`))}>Otwórz widget</button><span className="local-pill"><span /> Lokalnie na tym komputerze</span></div></header>
+    <header className="topbar"><div className="brand"><span className="brand-mark">T</span><div><strong>TrackerMaster</strong><small>Twój czas, pod kontrolą</small></div></div><div className="topbar-actions"><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => execute(async () => { const path = await invoke<string>('create_backup'); setLastBackup(path); }, 'Utworzono i zweryfikowano kopię bazy.')}>Utwórz kopię bazy</button><button className="widget-open" onClick={() => invoke('open_widget').catch(e => setError(`Nie udało się otworzyć widgetu: ${String(e)}`))}>Otwórz widget</button><span className="local-pill"><span /> Lokalnie na tym komputerze</span></div></header>
     <main>
       <div className="heading"><div><p className="eyebrow">TWÓJ DZIEŃ PRACY</p><h1>Rejestracja czasu</h1><p className="subtitle">Wybierz zadanie i skup się na pracy. Resztą zajmie się licznik.</p></div><div className="date">{new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())}</div></div>
       {error && <div role="alert" className="alert error">{error}</div>}
@@ -107,6 +108,7 @@ export default function App() {
           <button type="submit" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
         </form></div>}
       {notice && <div role="status" className="alert success">{notice}</div>}
+      {lastBackup && <div role="status" className="alert success">Lokalna kopia: <code>{lastBackup}</code>. Plik zawiera dane klientów i nie jest szyfrowany — przechowuj go bezpiecznie.</div>}
       <div className="grid">
         <section className="timer card" aria-label="Pomiar czasu">
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered ? 'running' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
