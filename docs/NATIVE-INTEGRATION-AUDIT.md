@@ -50,3 +50,11 @@ npm run tauri -- build --no-bundle
 Repo ma workflow `.github/workflows/windows-build.yml` wykonujący te kontrole na GitHub Actions. Wynik należy sprawdzić po push/PR; z samego utworzenia kodu nie wynika PASS. Dodatkowo sprawdzić ręcznie na **fikcyjnej bazie**: backup z uruchomionym timerem, otwarcie kopii i porównanie klientów/projektów/zadań/wpisów, weryfikację braku pliku `.partial` po udanym backupie, oraz start na niekompletnej bazie (bez naprawy).
 
 **Status:** częściowe przeniesienie, wymaga CI, sprawdzenia Windows i review. Nie zamyka DEV-03, DEV-13, DEV-14. Kopie i katalogi testowe mogą zawierać dane poufne; repo nie powinno zawierać rzeczywistych plików SQLite.
+
+## Dodatkowy przegląd bezpieczeństwa — 16.11.2026
+
+- Uzupełniono `.gitignore` o `*.sqlite3`, `*.sqlite`, pliki dzienników SQLite i kopie częściowe, a także lokalne `.env`. Dotychczasowy wzorzec `*.db` nie chronił rzeczywistej nazwy `tracker.sqlite3`.
+- Workflow Windows uruchamia się na pull requestach i odrzuca pliki baz danych znajdujące się w indeksie Git (`git ls-files`). Nie usuwa to plików już występujących w historii; w przypadku wcześniejszego ujawnienia danych konieczna jest osobna procedura.
+- Sama obecność indeksu `one_running_timer` z oznaczeniem UNIQUE/PARTIAL nie wystarcza do ochrony. Nowy walidator weryfikuje jego rzeczywistą definicję `ON time_entries((1)) WHERE ended_at IS NULL`; indeks `ON time_entries(task_id) WHERE ended_at IS NULL` musi być odrzucony.
+- Dodano testy Rust: błędna definicja indeksu, osierocony projekt naruszający FK oraz regresja w `initialise`. Stan w repo to **kod i testy do uruchomienia**; nie przyznawano PASS bez wyniku `cargo test`.
+- GitHub PR #1 pozostaje wersją roboczą. W chwili aktualizacji odczyt przez konektor nie zwrócił potwierdzonych wyników workflow/checks dla najnowszej gałęzi. Sprawdzenie testów w GitHub Actions i niezależny odbiór Windows pozostają obowiązkowe.
