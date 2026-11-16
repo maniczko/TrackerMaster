@@ -1,0 +1,47 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { reportByWarsawDay } from '../src/reportTime.ts';
+
+const entry = (id: number, started_at: string, ended_at: string, duration_seconds: number) => ({ id, started_at, ended_at, duration_seconds });
+const range = (entries: ReturnType<typeof entry>[], from = '2026-01-01', through = '2026-12-31') => reportByWarsawDay(entries, from, through);
+
+test('splits a single source entry at Warsaw midnight and filters each month', () => {
+  const data = [entry(1, '2026-01-31T22:50:00Z', '2026-01-31T23:10:00Z', 1200)];
+  assert.deepEqual(range(data).days, [{ date: '2026-01-31', seconds: 600 }, { date: '2026-02-01', seconds: 600 }]);
+  assert.equal(range(data, '2026-01-01', '2026-01-31').totalSeconds, 600);
+  assert.equal(range(data, '2026-02-01', '2026-02-28').totalSeconds, 600);
+});
+
+test('counts real elapsed seconds on 23-hour and 25-hour DST days', () => {
+  const spring = range([entry(1, '2026-03-28T23:00:00Z', '2026-03-29T22:00:00Z', 23 * 3600)]);
+  const autumn = range([entry(2, '2026-10-24T22:00:00Z', '2026-10-25T23:00:00Z', 25 * 3600)]);
+  assert.deepEqual(spring.days, [{ date: '2026-03-29', seconds: 23 * 3600 }]);
+  assert.deepEqual(autumn.days, [{ date: '2026-10-25', seconds: 25 * 3600 }]);
+});
+
+test('preserves seconds at a fractional midnight boundary', () => {
+  const data = [entry(1, '2026-01-01T22:59:59.500Z', '2026-01-01T23:00:01.500Z', 2)];
+  assert.deepEqual(range(data).days, [{ date: '2026-01-02', seconds: 2 }]);
+  assert.equal(range(data).totalSeconds, 2);
+});
+
+test('averages only days with recorded work, including weekends', () => {
+  const data = [entry(1, '2026-01-02T09:00:00Z', '2026-01-02T17:00:00Z', 28800), entry(2, '2026-01-03T09:00:00Z', '2026-01-03T15:00:00Z', 21600)];
+  const report = range(data);
+  assert.equal(report.totalSeconds, 50400);
+  assert.equal(report.averageSeconds, 25200);
+  assert.equal(range([]).averageSeconds, null);
+});
+
+test('excludes inconsistent, malformed and timezone-free records', () => {
+  const data = [entry(1, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 3599), entry(2, 'bad', '2026-01-01T11:00:00Z', 0), entry(3, '2026-01-01T10:00:00', '2026-01-01T11:00:00', 3600)];
+  assert.deepEqual(range(data).excludedEntryIds, [1, 2, 3]);
+  assert.equal(range(data).totalSeconds, 0);
+});
+
+test('rejects invalid dates and duplicate source entries', () => {
+  assert.throws(() => range([], '2026-02-30', '2026-03-01'));
+  assert.throws(() => range([], '2026-03-01', '2026-02-28'));
+  const e = entry(1, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 3600);
+  assert.throws(() => range([e, e]));
+});
