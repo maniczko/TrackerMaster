@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod storage_safety;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -112,6 +114,23 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
 fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
     let tracker = locked(&state)?;
     snapshot(&tracker)
+}
+
+#[tauri::command]
+fn diagnose_database(state: State<'_, Shared>) -> Cmd<storage_safety::DatabaseHealth> {
+    let tracker = locked(&state)?;
+    storage_safety::diagnose_database(&tracker.db)
+        .map_err(|_| "Weryfikacja danych nie powiodła się: możliwy problem integralności lub schematu bazy.".into())
+}
+
+#[tauri::command]
+fn create_backup(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<String> {
+    let data_dir = app.path().app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu danych aplikacji.".to_string())?;
+    let tracker = locked(&state)?;
+    storage_safety::create_backup(&tracker.db, &data_dir)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| "Nie udało się utworzyć ani zweryfikować kopii bazy danych.".into())
 }
 
 #[tauri::command]
@@ -368,11 +387,7 @@ fn validate_schema(db: &Connection) -> rusqlite::Result<()> {
     if db.prepare("PRAGMA foreign_key_check")?.query([])?.next()?.is_some() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let index_ok = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_index_list('time_entries') WHERE name='one_running_timer' AND \"unique\"=1 AND partial=1)",
-        [], |row| row.get::<_, bool>(0),
-    )?;
-    if !index_ok { return Err(rusqlite::Error::InvalidQuery); }
+    storage_safety::validate_timer_index(db)?;
     Ok(())
 }
 
@@ -441,7 +456,13 @@ fn main() {
                 })?;
                 app.manage(guard);
             }
-            let mut db = Connection::open(dir.join("tracker.sqlite3"))?;
+            let database_path = dir.join("tracker.sqlite3");
+            storage_safety::preflight_existing(&database_path).map_err(|err| {
+                #[cfg(windows)]
+                show_start_error("Baza danych nie przeszła kontroli integralności lub brakuje jej wymaganych tabel. Nie zmieniaj pliku; użyj sprawdzonej kopii.");
+                err
+            })?;
+            let mut db = Connection::open(&database_path)?;
             initialise(&mut db).map_err(|err| {
                 #[cfg(windows)]
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
@@ -498,7 +519,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,create_backup,diagnose_database,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -782,6 +803,17 @@ mod tests {
         tracker.db.execute("INSERT INTO projects(id,client_id,name) VALUES(2,999,'Orphan')", []).unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM projects WHERE id=2", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn current_schema_with_wrong_timer_index_definition_is_rejected() {
+        let mut tracker = seeded();
+        tracker.db.execute_batch("
+            DROP INDEX one_running_timer;
+            CREATE UNIQUE INDEX one_running_timer ON time_entries(task_id)
+              WHERE ended_at IS NULL;
+        ").unwrap();
+        assert!(initialise(&mut tracker.db).is_err());
     }
 
     #[test]

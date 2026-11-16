@@ -2,6 +2,8 @@ name: Windows test build
 
 on:
   push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -13,6 +15,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Reject tracked SQLite database files
+        shell: pwsh
+        run: |
+          $databaseFiles = @(git ls-files | Where-Object { $_ -match '\.(sqlite3?|db)(?:-(wal|shm)|\.partial)?$' })
+          if ($databaseFiles.Count -gt 0) {
+            $databaseFiles | Write-Output
+            throw 'SQLite database files must not be tracked in Git.'
+          }
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -25,6 +35,17 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build Windows executable
         run: npm run tauri -- build --no-bundle
+      - name: Native executable process probe (environment-dependent)
+        id: process_smoke
+        shell: pwsh
+        continue-on-error: true
+        run: ./scripts/windows-process-smoke.ps1
+      - name: Summarize native executable probe
+        if: always()
+        shell: pwsh
+        run: |
+          "Native process launch/restart probe: ${{ steps.process_smoke.outcome }}" >> $env:GITHUB_STEP_SUMMARY
+          "This is not a manual GUI, backup UI or sleep/resume acceptance test." >> $env:GITHUB_STEP_SUMMARY
       - name: Save unsigned test build
         uses: actions/upload-artifact@v4
         with:

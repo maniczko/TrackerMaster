@@ -7,3 +7,18 @@ target/
 __pycache__/
 src-tauri/gen/
 *.tsbuildinfo
+# Actual TrackerMaster SQLite data and WAL/journal files (not only *.db).
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite-journal
+*.sqlite3-journal
+*.sqlite.partial
+*.sqlite3.partial
+# Local credentials and per-machine configuration.
+.env
+.env.local
+.env.*.local
