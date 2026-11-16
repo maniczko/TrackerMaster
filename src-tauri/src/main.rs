@@ -708,6 +708,16 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+// Existing databases are backed up and verified before any schema migration.
+// A failed backup prevents migration; a new installation needs no backup.
+fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: bool) -> rusqlite::Result<()> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if existing && (0..6).contains(&version) {
+        storage_safety::create_backup(db, dir)?;
+    }
+    initialise(db)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
@@ -743,13 +753,14 @@ fn main() {
                 app.manage(guard);
             }
             let database_path = dir.join("tracker.sqlite3");
+            let existing_database = database_path.exists();
             storage_safety::preflight_existing(&database_path).map_err(|err| {
                 #[cfg(windows)]
                 show_start_error("Nie można bezpiecznie zweryfikować bazy danych. Nie zmieniaj ani nie usuwaj pliku; sprawdź kopię zapasową.");
                 err
             })?;
             let mut db = Connection::open(&database_path)?;
-            initialise(&mut db).map_err(|err| {
+            initialise_with_backup(&mut db, &dir, existing_database).map_err(|err| {
                 #[cfg(windows)]
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
                 err
@@ -881,6 +892,34 @@ mod tests {
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
+    }
+
+    #[test]
+    fn migration_requires_verified_backup_and_can_retry_after_failure() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tracker-migration-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"test").unwrap();
+        let mut tracker = seeded();
+        tracker.db.execute_batch("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); DROP TABLE app_settings; PRAGMA user_version=5;").unwrap();
+        assert!(initialise_with_backup(&mut tracker.db, &blocker, true).is_err());
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(snapshot(&tracker).unwrap().entries.len(), 1);
+        initialise_with_backup(&mut tracker.db, &dir, true).unwrap();
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 6);
+        let backups: Vec<_> = std::fs::read_dir(dir.join("backups")).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(backups.len(), 1);
+        storage_safety::preflight_existing(&backups[0]).unwrap();
+        let old = Connection::open_with_flags(&backups[0], rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(old.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(old.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(old);
+        std::fs::remove_file(&backups[0]).unwrap();
+        std::fs::remove_dir(dir.join("backups")).unwrap();
+        std::fs::remove_file(blocker).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
