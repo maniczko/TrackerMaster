@@ -14,9 +14,16 @@ param(
   [int]$StartupSeconds = 20
 )
 $ErrorActionPreference = 'Stop'
+if ($env:GITHUB_ACTIONS -ne 'true') {
+  throw 'This process probe is restricted to disposable GitHub-hosted runners. Do not run it against a real user profile.'
+}
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $originalAppData = $env:APPDATA
 $originalLocalAppData = $env:LOCALAPPDATA
+$nativeAppData = Join-Path $originalAppData 'pl.tracker.personal'
+if (Test-Path -LiteralPath $nativeAppData) {
+  throw 'The runner already contains TrackerMaster data. Refusing to touch an existing profile.'
+}
 $root = Join-Path ([IO.Path]::GetTempPath()) ("trackermaster-smoke-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N'))
 $process = $null
 $pass = $false
@@ -44,7 +51,16 @@ function Start-And-Probe([string]$label) {
     if ($script:process.HasExited) {
       throw "${label}: application exited during startup (exit code $($script:process.ExitCode)); GUI session or WebView2 may be unavailable."
     }
-    $dbs = @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter 'tracker.sqlite3' -ErrorAction SilentlyContinue)
+    # On Windows, Tauri may use SHGetKnownFolderPath and ignore APPDATA overrides.
+    # Both locations are inside this disposable CI runner, and the native
+    # profile is verified nonexistent before the process is launched.
+    $dbs = @(
+      foreach ($searchRoot in @($root, $nativeAppData)) {
+        if (Test-Path -LiteralPath $searchRoot) {
+          Get-ChildItem -LiteralPath $searchRoot -Recurse -File -Filter 'tracker.sqlite3' -ErrorAction SilentlyContinue
+        }
+      }
+    )
     if ($dbs.Count -eq 1) { $database = $dbs[0].FullName; break }
     if ($dbs.Count -gt 1) { throw "${label}: unexpectedly created multiple databases." }
   }
@@ -63,7 +79,7 @@ function Start-And-Probe([string]$label) {
 }
 
 try {
-  New-Item -ItemType Directory -Path (Join-Path $root 'Roaming'), (Join-Path $root 'Local') -Force | Out-Null
+  New-Item -ItemType Directory -Path @((Join-Path $root 'Roaming'), (Join-Path $root 'Local')) -Force | Out-Null
   $env:APPDATA = Join-Path $root 'Roaming'
   $env:LOCALAPPDATA = Join-Path $root 'Local'
 
@@ -80,6 +96,9 @@ try {
   $env:LOCALAPPDATA = $originalLocalAppData
   if (Test-Path -LiteralPath $root) {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path -LiteralPath $nativeAppData) {
+    Remove-Item -LiteralPath $nativeAppData -Recurse -Force -ErrorAction SilentlyContinue
   }
   if (-not $pass) {
     Write-Host 'PROCESS_SMOKE_FAIL: this is an environment-dependent executable smoke; investigate runner GUI/WebView2 before attributing failure to the product.'
