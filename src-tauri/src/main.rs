@@ -81,21 +81,23 @@ type Cmd<T> = Result<T, String>;
 #[derive(Serialize)]
 struct Client { id: i64, name: String, archived: bool }
 #[derive(Serialize)]
-struct Project { id: i64, client_id: i64, name: String, archived: bool }
+struct Project { id: i64, client_id: i64, name: String, archived: bool, billable: bool }
 #[derive(Serialize)]
 struct Task { id: i64, project_id: i64, name: String }
 #[derive(Serialize)]
-struct Active { id: i64, task_id: i64, started_at: String, recovered: bool }
+struct Active { id: i64, task_id: i64, started_at: String, recovered: bool, billable: bool }
 #[derive(Serialize)]
-struct Entry { id: i64, task_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool }
+struct Entry { id: i64, task_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool }
 #[derive(Serialize)]
 struct DeletedEntry { id: i64, task_id: i64, started_at: String, ended_at: String, duration_seconds: i64, deleted_at: String }
 #[derive(Serialize)]
 struct EntryRevision { id: i64, changed_at: String, before_start: String, before_end: String, before_seconds: i64, after_start: String, after_end: String, after_seconds: i64 }
 #[derive(Serialize)]
+struct BillingRevision { id: i64, changed_at: String, before_billable: bool, after_billable: bool }
+#[derive(Serialize)]
 struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>, active: Option<Active>, entries: Vec<Entry> }
 #[derive(Serialize)]
-struct ReportActive { id: i64, task_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool }
+struct ReportActive { id: i64, task_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool }
 #[derive(Serialize)]
 struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
 
@@ -123,17 +125,17 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
     let clients = db.prepare("SELECT id,name,EXISTS(SELECT 1 FROM client_archives a WHERE a.client_id=clients.id) FROM clients ORDER BY name COLLATE NOCASE,id").map_err(db_err)?
         .query_map([], |r| Ok(Client { id:r.get(0)?, name:r.get(1)?, archived:r.get(2)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    let projects = db.prepare("SELECT id,client_id,name,archived FROM projects ORDER BY name COLLATE NOCASE,id").map_err(db_err)?
-        .query_map([], |r| Ok(Project { id:r.get(0)?, client_id:r.get(1)?, name:r.get(2)?, archived:r.get(3)? })).map_err(db_err)?
+    let projects = db.prepare("SELECT id,client_id,name,archived,EXISTS(SELECT 1 FROM billable_projects b WHERE b.project_id=projects.id) FROM projects ORDER BY name COLLATE NOCASE,id").map_err(db_err)?
+        .query_map([], |r| Ok(Project { id:r.get(0)?, client_id:r.get(1)?, name:r.get(2)?, archived:r.get(3)?, billable:r.get(4)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     let tasks = db.prepare("SELECT id,project_id,name FROM tasks ORDER BY name COLLATE NOCASE,id").map_err(db_err)?
         .query_map([], |r| Ok(Task { id:r.get(0)?, project_id:r.get(1)?, name:r.get(2)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    let active = db.query_row("SELECT id,task_id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok(Active {
-        id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, recovered:tracker.running_since.is_none()
+    let active = db.query_row("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id) FROM time_entries WHERE ended_at IS NULL", [], |r| Ok(Active {
+        id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, recovered:tracker.running_since.is_none(), billable:r.get(3)?
     })).optional().map_err(db_err)?;
-    let entries = db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500").map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)? })).map_err(db_err)?
+    let entries = db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id) FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500").map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     Ok(Snapshot { clients, projects, tasks, active, entries })
 }
@@ -149,11 +151,11 @@ fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
 // sleep, a clock change, a restart, or an unavailable power sample is detected.
 fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample>) -> Cmd<ReportData> {
     ensure_available(tracker)?;
-    let entries = tracker.db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id").map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)? })).map_err(db_err)?
+    let entries = tracker.db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id) FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id").map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    let row: Option<(i64, i64, String)> = tracker.db.query_row("SELECT id,task_id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(db_err)?;
-    let active = row.map(|(id, task_id, started_at)| {
+    let row: Option<(i64, i64, String, bool)> = tracker.db.query_row("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id) FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?))).optional().map_err(db_err)?;
+    let active = row.map(|(id, task_id, started_at, billable)| {
         let projection = tracker.running_since.as_ref().and_then(|clock| {
             let power = power.as_ref().ok()?;
             if sleep_or_invalid(clock.power, *power) { return None; }
@@ -167,7 +169,7 @@ fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample
         });
         let unresolved = projection.is_none();
         let (ended_at, duration_seconds) = match projection { Some((end, duration)) => (Some(end), Some(duration)), None => (None, None) };
-        ReportActive { id, task_id, started_at, ended_at, duration_seconds, unresolved }
+        ReportActive { id, task_id, started_at, ended_at, duration_seconds, unresolved, billable }
     });
     let time_zone = tracker.db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
     Ok(ReportData { entries, active, time_zone })
@@ -368,6 +370,39 @@ fn create_task(state: State<'_, Shared>, project_id: i64, name: String) -> Cmd<i
     Ok(tracker.db.last_insert_rowid())
 }
 
+fn set_project_billing(db: &mut Connection, project_id: i64, expected: bool, billable: bool) -> Cmd<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
+    let current: Option<bool> = tx.query_row("SELECT EXISTS(SELECT 1 FROM billable_projects b WHERE b.project_id=projects.id) FROM projects WHERE id=?1", [project_id], |r| r.get(0)).optional().map_err(db_err)?;
+    if current != Some(expected) { return Err("Projekt zmienił się lub już nie istnieje. Odśwież dane.".into()); }
+    if billable { tx.execute("INSERT OR IGNORE INTO billable_projects(project_id) VALUES(?1)", [project_id]).map_err(db_err)?; }
+    else { tx.execute("DELETE FROM billable_projects WHERE project_id=?1", [project_id]).map_err(db_err)?; }
+    tx.commit().map_err(db_err)
+}
+
+fn set_entry_billing(db: &mut Connection, entry_id: i64, expected: bool, billable: bool, changed_at: &str) -> Cmd<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
+    let current: Option<bool> = tx.query_row("SELECT EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id) FROM time_entries WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| r.get(0)).optional().map_err(db_err)?;
+    if current != Some(expected) { return Err("Wpis zmienił się lub został usunięty. Odśwież dane.".into()); }
+    if expected != billable {
+        if billable { tx.execute("INSERT INTO billable_entries(entry_id) VALUES(?1)", [entry_id]).map_err(db_err)?; }
+        else { tx.execute("DELETE FROM billable_entries WHERE entry_id=?1", [entry_id]).map_err(db_err)?; }
+        tx.execute("INSERT INTO billing_revisions(entry_id,changed_at,before_billable,after_billable) VALUES(?1,?2,?3,?4)", params![entry_id,changed_at,expected,billable]).map_err(db_err)?;
+    }
+    tx.commit().map_err(db_err)
+}
+
+#[tauri::command]
+fn set_project_billable(state: State<'_, Shared>, project_id: i64, expected: bool, billable: bool) -> Cmd<()> {
+    let mut tracker = locked(&state)?;
+    set_project_billing(&mut tracker.db, project_id, expected, billable)
+}
+
+#[tauri::command]
+fn set_entry_billable(state: State<'_, Shared>, entry_id: i64, expected: bool, billable: bool) -> Cmd<()> {
+    let mut tracker = locked(&state)?;
+    set_entry_billing(&mut tracker.db, entry_id, expected, billable, &now())
+}
+
 // Rename only the existing entity: relationships and historical entries keep
 // their IDs. Compare the displayed name so stale windows cannot overwrite it.
 fn rename_entity(db: &Connection, kind: &str, id: i64, expected: &str, name: &str) -> Cmd<()> {
@@ -471,6 +506,8 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
         let start = DateTime::parse_from_rfc3339(end).map_err(|_| "Niepoprawny czas systemowy.")?.with_timezone(&Utc);
         ensure_no_overlap(&tx, start, DateTime::<Utc>::MAX_UTC, None).map_err(|_| "Nie można rozpocząć pomiaru: inny wpis trwa teraz lub znajduje się w przyszłości. Sprawdź zegar i historię.".to_string())?;
         tx.execute("INSERT INTO time_entries(task_id,started_at) VALUES(?1,?2)",params![task_id,end]).map_err(db_err)?;
+        let id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO billable_entries(entry_id) SELECT ?1 WHERE EXISTS(SELECT 1 FROM tasks t JOIN billable_projects b ON b.project_id=t.project_id WHERE t.id=?2)", params![id,task_id]).map_err(db_err)?;
     }
     let next_clock = if next_task.is_some() { Some(RunningClock { since: Instant::now(), power: power_sample()? }) } else { None };
     tx.commit().map_err(db_err)?;
@@ -598,6 +635,7 @@ fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended
     let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
     tx.execute("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds,manually_resolved) VALUES(?1,?2,?3,?4,1)", params![task_id,start_text,end_text,(end-start).num_seconds()]).map_err(db_err)?;
     let id = tx.last_insert_rowid();
+    tx.execute("INSERT INTO billable_entries(entry_id) SELECT ?1 WHERE EXISTS(SELECT 1 FROM tasks t JOIN billable_projects b ON b.project_id=t.project_id WHERE t.id=?2)", params![id,task_id]).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
     Ok(id)
 }
@@ -630,6 +668,14 @@ fn entry_revisions(state: State<'_, Shared>, entry_id: i64) -> Cmd<Vec<EntryRevi
     let tracker = locked(&state)?;
     let mut stmt = tracker.db.prepare("SELECT id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds FROM entry_revisions WHERE entry_id=?1 ORDER BY id DESC").map_err(db_err)?;
     let revisions = stmt.query_map([entry_id], |r| Ok(EntryRevision { id:r.get(0)?,changed_at:r.get(1)?,before_start:r.get(2)?,before_end:r.get(3)?,before_seconds:r.get(4)?,after_start:r.get(5)?,after_end:r.get(6)?,after_seconds:r.get(7)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    Ok(revisions)
+}
+
+#[tauri::command]
+fn billing_revisions(state: State<'_, Shared>, entry_id: i64) -> Cmd<Vec<BillingRevision>> {
+    let tracker = locked(&state)?;
+    let mut stmt = tracker.db.prepare("SELECT id,changed_at,before_billable,after_billable FROM billing_revisions WHERE entry_id=?1 ORDER BY id DESC").map_err(db_err)?;
+    let revisions = stmt.query_map([entry_id], |r| Ok(BillingRevision { id:r.get(0)?, changed_at:r.get(1)?, before_billable:r.get(2)?, after_billable:r.get(3)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     Ok(revisions)
 }
 
@@ -723,18 +769,32 @@ fn validate_client_archives_schema(db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn validate_billing_schema(db: &Connection) -> rusqlite::Result<()> {
+    for (table, column, target) in [("billable_projects", "project_id", "projects"), ("billable_entries", "entry_id", "time_entries")] {
+        let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2 AND UPPER(type)='INTEGER' AND pk=1) AND (SELECT COUNT(*) FROM pragma_table_info(?1) WHERE pk>0)=1 AND EXISTS(SELECT 1 FROM pragma_foreign_key_list(?1) WHERE \"from\"=?2 AND \"table\"=?3 AND \"to\"='id')", params![table,column,target], |r| r.get(0))?;
+        if !valid { return Err(rusqlite::Error::InvalidQuery); }
+    }
+    db.prepare("SELECT id,entry_id,changed_at,before_billable,after_billable FROM billing_revisions LIMIT 0")?;
+    let fk: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('billing_revisions') WHERE \"from\"='entry_id' AND \"table\"='time_entries' AND \"to\"='id')", [], |r| r.get(0))?;
+    let columns: bool = db.query_row("SELECT (SELECT COUNT(*) FROM pragma_table_info('billing_revisions') WHERE name IN ('entry_id','changed_at','before_billable','after_billable') AND \"notnull\"=1)=4 AND EXISTS(SELECT 1 FROM pragma_table_info('billing_revisions') WHERE name='id' AND UPPER(type)='INTEGER' AND pk=1) AND (SELECT COUNT(*) FROM pragma_table_info('billing_revisions') WHERE pk>0)=1", [], |r| r.get(0))?;
+    let invalid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM billing_revisions WHERE before_billable NOT IN (0,1) OR after_billable NOT IN (0,1) OR before_billable=after_billable)", [], |r| r.get(0))?;
+    if !fk || !columns || invalid { return Err(rusqlite::Error::InvalidQuery); }
+    Ok(())
+}
+
 fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > 7 {
+    if version > 8 {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    if version == 7 {
+    if version == 8 {
         validate_schema(db)?;
         validate_revisions_schema(db)?;
         validate_deletions_schema(db)?;
         validate_settings_schema(db)?;
-        return validate_client_archives_schema(db);
+        validate_client_archives_schema(db)?;
+        return validate_billing_schema(db);
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch("
@@ -764,9 +824,11 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     validate_deletions_schema(&tx)?;
     if version < 6 { tx.execute_batch("CREATE TABLE app_settings (id INTEGER PRIMARY KEY CHECK(id=1), report_timezone TEXT NOT NULL); INSERT INTO app_settings(id,report_timezone) VALUES(1,'Europe/Warsaw');")?; }
     validate_settings_schema(&tx)?;
-    tx.execute_batch("CREATE TABLE client_archives (client_id INTEGER PRIMARY KEY REFERENCES clients(id));")?;
+    if version < 7 { tx.execute_batch("CREATE TABLE client_archives (client_id INTEGER PRIMARY KEY REFERENCES clients(id));")?; }
     validate_client_archives_schema(&tx)?;
-    tx.pragma_update(None, "user_version", 7)?;
+    tx.execute_batch("CREATE TABLE billable_projects (project_id INTEGER PRIMARY KEY REFERENCES projects(id)); CREATE TABLE billable_entries (entry_id INTEGER PRIMARY KEY REFERENCES time_entries(id)); CREATE TABLE billing_revisions (id INTEGER PRIMARY KEY, entry_id INTEGER NOT NULL REFERENCES time_entries(id), changed_at TEXT NOT NULL, before_billable INTEGER NOT NULL CHECK(before_billable IN (0,1)), after_billable INTEGER NOT NULL CHECK(after_billable IN (0,1)), CHECK(before_billable != after_billable)); CREATE INDEX billing_revisions_by_entry ON billing_revisions(entry_id,id);")?;
+    validate_billing_schema(&tx)?;
+    tx.pragma_update(None, "user_version", 8)?;
     tx.commit()
 }
 
@@ -774,7 +836,7 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
 // A failed backup prevents migration; a new installation needs no backup.
 fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: bool) -> rusqlite::Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if existing && (0..7).contains(&version) {
+    if existing && (0..8).contains(&version) {
         storage_safety::create_backup(db, dir)?;
     }
     initialise(db)
@@ -898,7 +960,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,rename_item,archive_project,archive_client,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,rename_item,archive_project,archive_client,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,billing_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -930,6 +992,56 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn billing_inherits_project_but_keeps_previous_entries_and_audits_changes() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let old = add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        assert!(!snapshot(&tracker).unwrap().entries[0].billable);
+        set_project_billing(&mut tracker.db, 1, false, true).unwrap();
+        let next = add_manual_entry(&mut tracker, 1, "2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", current).unwrap();
+        let state = snapshot(&tracker).unwrap();
+        assert!(state.projects[0].billable);
+        assert!(!state.entries.iter().find(|e| e.id == old).unwrap().billable);
+        assert!(state.entries.iter().find(|e| e.id == next).unwrap().billable);
+        assert!(set_project_billing(&mut tracker.db, 1, false, false).is_err());
+        set_project_billing(&mut tracker.db, 1, true, false).unwrap();
+        assert!(snapshot(&tracker).unwrap().entries.iter().find(|e| e.id == next).unwrap().billable);
+        set_entry_billing(&mut tracker.db, next, true, false, &now()).unwrap();
+        assert!(set_entry_billing(&mut tracker.db, next, true, true, &now()).is_err());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM billing_revisions WHERE entry_id=?1", [next], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        set_entry_billing(&mut tracker.db, old, false, true, &now()).unwrap();
+        assert!(report_data(&tracker, current, Err("clock".into())).unwrap().entries.iter().find(|e| e.id == old).unwrap().billable);
+        tracker.db.execute_batch("CREATE TRIGGER reject_billing_audit BEFORE INSERT ON billing_revisions BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+        assert!(set_entry_billing(&mut tracker.db, old, true, false, &now()).is_err());
+        assert!(snapshot(&tracker).unwrap().entries.iter().find(|e| e.id == old).unwrap().billable);
+        tracker.db.execute_batch("DROP TRIGGER reject_billing_audit;").unwrap();
+        set_entry_billing(&mut tracker.db, old, true, false, &now()).unwrap();
+    }
+
+    #[test]
+    fn timer_inherits_billing_and_future_changes_do_not_rewrite_it() {
+        let mut tracker = seeded();
+        set_project_billing(&mut tracker.db, 1, false, true).unwrap();
+        close_active(&mut tracker, &now(), Some(1)).unwrap();
+        assert!(snapshot(&tracker).unwrap().active.unwrap().billable);
+        set_project_billing(&mut tracker.db, 1, true, false).unwrap();
+        assert!(snapshot(&tracker).unwrap().active.unwrap().billable);
+        close_active(&mut tracker, &now(), None).unwrap();
+        assert!(snapshot(&tracker).unwrap().entries[0].billable);
+    }
+
+    #[test]
+    fn version_seven_migration_preserves_entries_as_nonbillable_by_default() {
+        let mut tracker = seeded();
+        tracker.db.execute_batch("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; PRAGMA user_version=7;").unwrap();
+        initialise(&mut tracker.db).unwrap();
+        let state = snapshot(&tracker).unwrap();
+        assert!(!state.projects[0].billable && !state.entries[0].billable);
+        assert_eq!(state.entries[0].duration_seconds, 3600);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 8);
     }
 
     #[test]
@@ -985,9 +1097,9 @@ mod tests {
     fn version_six_migrates_clients_without_changing_history_or_settings() {
         let mut tracker = seeded();
         update_report_timezone(&tracker.db, "Europe/Warsaw", "Europe/London").unwrap();
-        tracker.db.execute_batch("DROP TABLE client_archives; PRAGMA user_version=6;").unwrap();
+        tracker.db.execute_batch("DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; PRAGMA user_version=6;").unwrap();
         initialise(&mut tracker.db).unwrap();
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 7);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 8);
         assert!(!snapshot(&tracker).unwrap().clients[0].archived);
         assert_eq!(report_data(&tracker, Utc::now(), Err("clock".into())).unwrap().time_zone, "Europe/London");
     }
@@ -1020,7 +1132,7 @@ mod tests {
     #[test]
     fn timezone_migration_preserves_history_and_uses_optimistic_updates() {
         let mut tracker = seeded();
-        tracker.db.execute_batch("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); DROP TABLE client_archives; DROP TABLE app_settings; PRAGMA user_version=5;").unwrap();
+        tracker.db.execute_batch("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; PRAGMA user_version=5;").unwrap();
         initialise(&mut tracker.db).unwrap();
         let report = report_data(&tracker, Utc::now(), Err("clock".into())).unwrap();
         assert_eq!(report.time_zone, "Europe/Warsaw");
@@ -1050,12 +1162,12 @@ mod tests {
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"test").unwrap();
         let mut tracker = seeded();
-        tracker.db.execute_batch("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); DROP TABLE client_archives; DROP TABLE app_settings; PRAGMA user_version=5;").unwrap();
+        tracker.db.execute_batch("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; PRAGMA user_version=5;").unwrap();
         assert!(initialise_with_backup(&mut tracker.db, &blocker, true).is_err());
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         initialise_with_backup(&mut tracker.db, &dir, true).unwrap();
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 8);
         let backups: Vec<_> = std::fs::read_dir(dir.join("backups")).unwrap().map(|entry| entry.unwrap().path()).collect();
         assert_eq!(backups.len(), 1);
         storage_safety::preflight_existing(&backups[0]).unwrap();
@@ -1161,7 +1273,7 @@ mod tests {
         let mut tracker = seeded();
         close_active(&mut tracker, &now(), Some(1)).unwrap();
         close_active(&mut tracker, &now(), None).unwrap();
-        tracker.db.execute_batch("DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
+        tracker.db.execute_batch("DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
         initialise(&mut tracker.db).unwrap();
         let state = snapshot(&tracker).unwrap();
         assert!(!state.projects[0].archived);
@@ -1182,7 +1294,7 @@ mod tests {
         {
             let mut db = Connection::open(&path).unwrap();
             initialise(&mut db).unwrap();
-            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient testowy'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt testowy'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie testowe'); INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60); DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
+            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient testowy'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt testowy'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie testowe'); INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60); DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
         }
         {
             let mut db = Connection::open(&path).unwrap();
@@ -1204,7 +1316,7 @@ mod tests {
     #[test]
     fn invalid_version_two_schema_rolls_back_archive_migration() {
         let mut tracker = seeded();
-        tracker.db.execute_batch("DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; ALTER TABLE time_entries DROP COLUMN manually_resolved; PRAGMA user_version=2;").unwrap();
+        tracker.db.execute_batch("DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; ALTER TABLE time_entries DROP COLUMN manually_resolved; PRAGMA user_version=2;").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, 2);
@@ -1388,10 +1500,10 @@ mod tests {
         let mut tracker = seeded();
         let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
         add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
-        tracker.db.execute_batch("DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
+        tracker.db.execute_batch("DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
         initialise(&mut tracker.db).unwrap();
         assert_eq!(snapshot(&tracker).unwrap().entries.len(), 1);
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 8);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
@@ -1425,11 +1537,11 @@ mod tests {
         let id = add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
         let entry = snapshot(&tracker).unwrap().entries.remove(0);
         correct_entry(&mut tracker, id, &entry.started_at, &entry.ended_at, "2026-01-01T09:00:00Z", "2026-01-01T10:30:00Z", current).unwrap();
-        tracker.db.execute_batch("DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; PRAGMA user_version=4;").unwrap();
+        tracker.db.execute_batch("DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; PRAGMA user_version=4;").unwrap();
         initialise(&mut tracker.db).unwrap();
         assert_eq!(snapshot(&tracker).unwrap().entries.len(), 1);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 8);
     }
 
     #[test]
@@ -1447,7 +1559,7 @@ mod tests {
     #[test]
     fn deletion_migration_rolls_back_if_unexpected_table_exists() {
         let mut tracker = seeded();
-        tracker.db.execute_batch("DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; CREATE TABLE entry_deletions(unexpected TEXT); PRAGMA user_version=4;").unwrap();
+        tracker.db.execute_batch("DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; CREATE TABLE entry_deletions(unexpected TEXT); PRAGMA user_version=4;").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 4);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
@@ -1495,7 +1607,7 @@ mod tests {
         let mut tracker = seeded();
         initialise(&mut tracker.db).unwrap();
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
     }
 
@@ -1524,7 +1636,7 @@ mod tests {
         tracker.db.pragma_update(None, "foreign_keys", false).unwrap();
         tracker.db.execute_batch("DROP TABLE tasks; CREATE TABLE tasks(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL);").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 8);
     }
 
     #[test]
@@ -1535,7 +1647,7 @@ mod tests {
         let tracker = Tracker { db, running_since: None, restored: false };
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 1);
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -1552,11 +1664,11 @@ mod tests {
     #[test]
     fn newer_database_version_is_rejected_without_changes() {
         let mut tracker = seeded();
-        tracker.db.pragma_update(None, "user_version", 8).unwrap();
+        tracker.db.pragma_update(None, "user_version", 9).unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
