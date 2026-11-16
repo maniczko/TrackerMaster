@@ -117,6 +117,13 @@ fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
 }
 
 #[tauri::command]
+fn diagnose_database(state: State<'_, Shared>) -> Cmd<storage_safety::DatabaseHealth> {
+    let tracker = locked(&state)?;
+    storage_safety::diagnose_database(&tracker.db)
+        .map_err(|_| "Weryfikacja danych nie powiodła się: możliwy problem integralności lub schematu bazy.".into())
+}
+
+#[tauri::command]
 fn create_backup(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<String> {
     let data_dir = app.path().app_data_dir()
         .map_err(|_| "Nie można ustalić katalogu danych aplikacji.".to_string())?;
@@ -512,7 +519,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,create_backup,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,create_backup,diagnose_database,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
