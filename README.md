@@ -50,4 +50,3 @@ Po przygotowaniu nowej wersji należy sprawdzić na fikcyjnych danych:
 3. Ponownie sprawdzić skrót globalny, przywracanie okna z zasobnika i wygląd widgetu; uruchomić testy backendu oraz pełną kompilację.
 
 Istniejącej Piaskownicy nie należy zamykać bez uprzedniego zabezpieczenia potrzebnych danych: jej zamknięcie usuwa dane zapisane w tym środowisku.
-

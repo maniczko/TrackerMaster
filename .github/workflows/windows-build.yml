@@ -1,0 +1,34 @@
+name: Windows test build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Check frontend
+        run: npm run build
+      - name: Run Rust tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build Windows executable
+        run: npm run tauri -- build --no-bundle
+      - name: Save unsigned test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackerMaster-Windows-unsigned-test
+          path: src-tauri/target/release/tracker-master.exe
+          if-no-files-found: error
+          retention-days: 7
