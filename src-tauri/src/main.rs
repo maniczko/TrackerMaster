@@ -84,6 +84,8 @@ struct Active { id: i64, task_id: i64, started_at: String, recovered: bool }
 #[derive(Serialize)]
 struct Entry { id: i64, task_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool }
 #[derive(Serialize)]
+struct EntryRevision { id: i64, changed_at: String, before_start: String, before_end: String, before_seconds: i64, after_start: String, after_end: String, after_seconds: i64 }
+#[derive(Serialize)]
 struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>, active: Option<Active>, entries: Vec<Entry> }
 
 fn now() -> String { Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true) }
@@ -373,7 +375,7 @@ fn recover_timer(state: State<'_, Shared>, ended_at: String, expected_active_id:
     snapshot(&tracker)
 }
 
-fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<i64> {
+fn parse_manual_range(started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<(DateTime<Utc>, DateTime<Utc>)> {
     let start = DateTime::parse_from_rfc3339(started_at).map_err(|_| "Podaj poprawny czas rozpoczęcia.")?.with_timezone(&Utc);
     let end = DateTime::parse_from_rfc3339(ended_at).map_err(|_| "Podaj poprawny czas zakończenia.")?.with_timezone(&Utc);
     if start.timestamp_subsec_nanos() != 0 || end.timestamp_subsec_nanos() != 0 {
@@ -381,30 +383,70 @@ fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended
     }
     if end <= start { return Err("Koniec musi być późniejszy od początku.".into()); }
     if end > current { return Err("Czas zakończenia nie może być w przyszłości.".into()); }
+    Ok((start, end))
+}
+
+fn ensure_no_overlap(db: &Connection, start: DateTime<Utc>, end: DateTime<Utc>, exclude_id: Option<i64>) -> Cmd<()> {
+    let mut stmt = db.prepare("SELECT id,started_at,ended_at FROM time_entries").map_err(db_err)?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))).map_err(db_err)?;
+    for row in rows {
+        let (id, other_start, other_end) = row.map_err(db_err)?;
+        if Some(id) == exclude_id { continue; }
+        let other_start = DateTime::parse_from_rfc3339(&other_start).map_err(|_| "Nie można zweryfikować istniejącego wpisu. Zmiany nie zostały zapisane.")?.with_timezone(&Utc);
+        let other_end = other_end.map(|value| DateTime::parse_from_rfc3339(&value).map(|v| v.with_timezone(&Utc))).transpose()
+            .map_err(|_| "Nie można zweryfikować istniejącego wpisu. Zmiany nie zostały zapisane.")?;
+        if other_end.is_some_and(|value| value < other_start) { return Err("Nie można zweryfikować istniejącego wpisu. Zmiany nie zostały zapisane.".into()); }
+        if other_end == Some(other_start) { continue; }
+        if other_start < end && other_end.map_or(true, |value| value > start) {
+            return Err("Ten czas nakłada się na istniejący pomiar. Popraw godziny przed zapisaniem.".into());
+        }
+    }
+    Ok(())
+}
+
+fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<i64> {
+    let (start, end) = parse_manual_range(started_at, ended_at, current)?;
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let valid_task = tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?1 AND p.archived=0)", [task_id], |r| r.get::<_, bool>(0)).map_err(db_err)?;
     if !valid_task { return Err("Wybierz zadanie w aktywnym projekcie.".into()); }
-    {
-        let mut stmt = tx.prepare("SELECT started_at,ended_at FROM time_entries").map_err(db_err)?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).map_err(db_err)?;
-        for row in rows {
-            let (other_start, other_end) = row.map_err(db_err)?;
-            let other_start = DateTime::parse_from_rfc3339(&other_start).map_err(|_| "Nie można zweryfikować istniejącego wpisu. Wpis nie został dodany.")?.with_timezone(&Utc);
-            let other_end = other_end.map(|value| DateTime::parse_from_rfc3339(&value).map(|v| v.with_timezone(&Utc))).transpose()
-                .map_err(|_| "Nie można zweryfikować istniejącego wpisu. Wpis nie został dodany.")?;
-            if other_end.is_some_and(|value| value < other_start) { return Err("Nie można zweryfikować istniejącego wpisu. Wpis nie został dodany.".into()); }
-            if other_end == Some(other_start) { continue; }
-            if other_start < end && other_end.map_or(true, |value| value > start) {
-                return Err("Ten czas nakłada się na istniejący pomiar. Popraw godziny przed zapisaniem.".into());
-            }
-        }
-    }
+    ensure_no_overlap(&tx, start, end, None)?;
     let start_text = start.to_rfc3339_opts(SecondsFormat::Millis, true);
     let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
     tx.execute("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds,manually_resolved) VALUES(?1,?2,?3,?4,1)", params![task_id,start_text,end_text,(end-start).num_seconds()]).map_err(db_err)?;
     let id = tx.last_insert_rowid();
     tx.commit().map_err(db_err)?;
     Ok(id)
+}
+
+fn correct_entry(tracker: &mut Tracker, entry_id: i64, expected_start: &str, expected_end: &str, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<()> {
+    let (start, end) = parse_manual_range(started_at, ended_at, current)?;
+    let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
+    let previous: Option<(String, String, i64)> = tx.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
+    let (old_start, old_end, old_seconds) = previous.ok_or("Nie znaleziono zakończonego wpisu.")?;
+    if old_start != expected_start || old_end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed korektą.".into()); }
+    ensure_no_overlap(&tx, start, end, Some(entry_id))?;
+    let new_start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let new_end = end.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let seconds = (end - start).num_seconds();
+    if old_start == new_start && old_end == new_end { return Ok(()); }
+    tx.execute("INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![entry_id,current.to_rfc3339_opts(SecondsFormat::Millis, true),old_start,old_end,old_seconds,new_start,new_end,seconds]).map_err(db_err)?;
+    tx.execute("UPDATE time_entries SET started_at=?1,ended_at=?2,duration_seconds=?3,manually_resolved=1 WHERE id=?4", params![new_start,new_end,seconds,entry_id]).map_err(db_err)?;
+    tx.commit().map_err(db_err)
+}
+
+#[tauri::command]
+fn edit_time_entry(state: State<'_, Shared>, entry_id: i64, expected_start: String, expected_end: String, started_at: String, ended_at: String) -> Cmd<Snapshot> {
+    let mut tracker = locked(&state)?;
+    correct_entry(&mut tracker, entry_id, &expected_start, &expected_end, &started_at, &ended_at, Utc::now())?;
+    snapshot(&tracker)
+}
+
+#[tauri::command]
+fn entry_revisions(state: State<'_, Shared>, entry_id: i64) -> Cmd<Vec<EntryRevision>> {
+    let tracker = locked(&state)?;
+    let mut stmt = tracker.db.prepare("SELECT id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds FROM entry_revisions WHERE entry_id=?1 ORDER BY id DESC").map_err(db_err)?;
+    let revisions = stmt.query_map([entry_id], |r| Ok(EntryRevision { id:r.get(0)?,changed_at:r.get(1)?,before_start:r.get(2)?,before_end:r.get(3)?,before_seconds:r.get(4)?,after_start:r.get(5)?,after_end:r.get(6)?,after_seconds:r.get(7)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    Ok(revisions)
 }
 
 #[tauri::command]
@@ -445,14 +487,22 @@ fn validate_schema(db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn validate_revisions_schema(db: &Connection) -> rusqlite::Result<()> {
+    db.prepare("SELECT id,entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds FROM entry_revisions LIMIT 0")?;
+    let found = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('entry_revisions') WHERE \"from\"='entry_id' AND \"table\"='time_entries' AND \"to\"='id')", [], |row| row.get::<_, bool>(0))?;
+    if !found { return Err(rusqlite::Error::InvalidQuery); }
+    Ok(())
+}
+
 fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > 3 {
+    if version > 4 {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    if version == 3 {
-        return validate_schema(db);
+    if version == 4 {
+        validate_schema(db)?;
+        return validate_revisions_schema(db);
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch("
@@ -470,9 +520,13 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     if version < 2 {
         tx.execute_batch("ALTER TABLE time_entries ADD COLUMN manually_resolved INTEGER NOT NULL DEFAULT 0 CHECK(manually_resolved IN (0, 1));")?;
     }
-    tx.execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1));")?;
+    if version < 3 {
+        tx.execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1));")?;
+    }
     validate_schema(&tx)?;
-    tx.pragma_update(None, "user_version", 3)?;
+    tx.execute_batch("CREATE TABLE entry_revisions (id INTEGER PRIMARY KEY, entry_id INTEGER NOT NULL REFERENCES time_entries(id), changed_at TEXT NOT NULL, before_start TEXT NOT NULL, before_end TEXT NOT NULL, before_seconds INTEGER NOT NULL CHECK(before_seconds >= 0), after_start TEXT NOT NULL, after_end TEXT NOT NULL, after_seconds INTEGER NOT NULL CHECK(after_seconds >= 0)); CREATE INDEX entry_revisions_by_entry ON entry_revisions(entry_id,id);")?;
+    validate_revisions_schema(&tx)?;
+    tx.pragma_update(None, "user_version", 4)?;
     tx.commit()
 }
 
@@ -586,7 +640,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -671,7 +725,7 @@ mod tests {
         let mut tracker = seeded();
         close_active(&mut tracker, &now(), Some(1)).unwrap();
         close_active(&mut tracker, &now(), None).unwrap();
-        tracker.db.execute_batch("ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
+        tracker.db.execute_batch("DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
         initialise(&mut tracker.db).unwrap();
         let state = snapshot(&tracker).unwrap();
         assert!(!state.projects[0].archived);
@@ -692,7 +746,7 @@ mod tests {
         {
             let mut db = Connection::open(&path).unwrap();
             initialise(&mut db).unwrap();
-            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient testowy'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt testowy'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie testowe'); INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60); ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
+            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient testowy'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt testowy'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie testowe'); INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60); DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
         }
         {
             let mut db = Connection::open(&path).unwrap();
@@ -714,7 +768,7 @@ mod tests {
     #[test]
     fn invalid_version_two_schema_rolls_back_archive_migration() {
         let mut tracker = seeded();
-        tracker.db.execute_batch("ALTER TABLE projects DROP COLUMN archived; ALTER TABLE time_entries DROP COLUMN manually_resolved; PRAGMA user_version=2;").unwrap();
+        tracker.db.execute_batch("DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; ALTER TABLE time_entries DROP COLUMN manually_resolved; PRAGMA user_version=2;").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, 2);
@@ -874,6 +928,38 @@ mod tests {
     }
 
     #[test]
+    fn corrections_keep_history_reject_conflicts_and_roll_back_together() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let first = add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        add_manual_entry(&mut tracker, 2, "2026-01-01T11:00:00Z", "2026-01-01T12:00:00Z", current).unwrap();
+        let original = snapshot(&tracker).unwrap().entries.into_iter().find(|e| e.id == first).unwrap();
+        assert!(correct_entry(&mut tracker, first, &original.started_at, &original.ended_at, "2026-01-01T10:30:00Z", "2026-01-01T11:30:00Z", current).is_err());
+        tracker.db.execute_batch("CREATE TRIGGER reject_correction BEFORE UPDATE ON time_entries BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+        assert!(correct_entry(&mut tracker, first, &original.started_at, &original.ended_at, "2026-01-01T09:00:00Z", "2026-01-01T10:30:00Z", current).is_err());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        tracker.db.execute_batch("DROP TRIGGER reject_correction;").unwrap();
+        correct_entry(&mut tracker, first, &original.started_at, &original.ended_at, "2026-01-01T09:00:00Z", "2026-01-01T10:30:00Z", current).unwrap();
+        assert!(correct_entry(&mut tracker, first, &original.started_at, &original.ended_at, "2026-01-01T08:30:00Z", "2026-01-01T10:00:00Z", current).is_err());
+        let updated = snapshot(&tracker).unwrap().entries.into_iter().find(|e| e.id == first).unwrap();
+        correct_entry(&mut tracker, first, &updated.started_at, &updated.ended_at, "2026-01-01T08:30:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        let revisions: Vec<(i64,i64)> = tracker.db.prepare("SELECT before_seconds,after_seconds FROM entry_revisions WHERE entry_id=?1 ORDER BY id").unwrap().query_map([first], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(revisions, vec![(3600, 5400), (5400, 5400)]);
+    }
+
+    #[test]
+    fn version_three_migrates_to_revision_history_without_losing_entries() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        tracker.db.execute_batch("DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
+        initialise(&mut tracker.db).unwrap();
+        assert_eq!(snapshot(&tracker).unwrap().entries.len(), 1);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 4);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
     fn clock_discrepancy_preserves_entry_for_manual_recovery() {
         let mut tracker = seeded();
         close_active(&mut tracker, &now(), Some(1)).unwrap();
@@ -915,7 +1001,7 @@ mod tests {
         let mut tracker = seeded();
         initialise(&mut tracker.db).unwrap();
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
     }
 
@@ -944,7 +1030,7 @@ mod tests {
         tracker.db.pragma_update(None, "foreign_keys", false).unwrap();
         tracker.db.execute_batch("DROP TABLE tasks; CREATE TABLE tasks(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL);").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 4);
     }
 
     #[test]
@@ -955,7 +1041,7 @@ mod tests {
         let tracker = Tracker { db, running_since: None };
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 1);
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -972,11 +1058,11 @@ mod tests {
     #[test]
     fn newer_database_version_is_rejected_without_changes() {
         let mut tracker = seeded();
-        tracker.db.pragma_update(None, "user_version", 4).unwrap();
+        tracker.db.pragma_update(None, "user_version", 5).unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 
 type Id = number | string;
@@ -7,6 +7,7 @@ type Client = { id: Id; name: string };
 type Project = { id: Id; client_id: Id; name: string; archived: boolean };
 type Task = { id: Id; project_id: Id; name: string };
 type Entry = { id: Id; task_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null; recovered?: boolean; manually_resolved?: boolean };
+type Revision = { id: Id; changed_at: string; before_start: string; before_end: string; before_seconds: number; after_start: string; after_end: string; after_seconds: number };
 export type Snapshot = { clients: Client[]; projects: Project[]; tasks: Task[]; active: Entry | null; entries: Entry[] };
 const EMPTY: Snapshot = { clients: [], projects: [], tasks: [], active: null, entries: [] };
 export const same = (a: Id | undefined | null, b: Id | undefined | null) => a != null && b != null && String(a) === String(b);
@@ -18,6 +19,16 @@ const formatDate = (value: string | null) => {
   if (!value) return '—';
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'short' });
+};
+const localInputValue = (value: string) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+};
+const formatPreciseDate = (value: string) => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'medium' });
 };
 const parseLocalDate = (value: string) => {
   const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
@@ -49,6 +60,9 @@ export default function App() {
   const [recoveryEnd, setRecoveryEnd] = useState('');
   const [manualStart, setManualStart] = useState('');
   const [manualEnd, setManualEnd] = useState('');
+  const [editing, setEditing] = useState<{ id: Id; expectedStart: string; expectedEnd: string; start: string; end: string } | null>(null);
+  const [revisions, setRevisions] = useState<{ entryId: Id; items: Revision[] } | null>(null);
+  const revisionsRequest = useRef(0);
   const [loaded, setLoaded] = useState(false);
   const [now, setNow] = useState(Date.now());
   const refresh = useCallback(async () => {
@@ -97,6 +111,13 @@ export default function App() {
     try { await refresh(); setNotice('Dane zostały odświeżone.'); }
     catch (e) { setError(`Nie udało się odczytać danych: ${String(e)}`); }
     finally { setBusy(false); }
+  }
+  async function showRevisions(entryId: Id) {
+    const request = ++revisionsRequest.current;
+    try {
+      const items = await invoke<Revision[]>('entry_revisions', { entryId: Number(entryId) });
+      if (request === revisionsRequest.current) setRevisions({ entryId, items });
+    } catch (e) { if (request === revisionsRequest.current) setError(`Nie udało się odczytać historii zmian: ${String(e)}`); }
   }
   const create = (kind: 'client' | 'project' | 'task') => async (event: FormEvent) => {
     event.preventDefault();
@@ -151,7 +172,13 @@ export default function App() {
             <button className="secondary" type="submit" disabled={busy || !loaded || !taskId || !!selectedProject?.archived || !manualStart || !manualEnd}>Dodaj wpis</button>
           </form>
         </details>
-        {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : <div className="table-wrap"><table><thead><tr><th>Zadanie</th><th>Klient / projekt</th><th>Rozpoczęcie</th><th>Zakończenie</th><th>Czas</th></tr></thead><tbody>{entries.map(e => { const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, t?.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id)); return <tr key={e.id}><td><strong>{t?.name || 'Nieznane zadanie'}</strong></td><td>{c?.name || '—'} / {p?.name || '—'}</td><td>{formatDate(e.started_at)}</td><td>{formatDate(e.ended_at)}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td><td className="duration">{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td></tr>; })}</tbody></table></div>}
+        {editing && <form aria-label="Korekta wpisu" onSubmit={e => { e.preventDefault(); const start = parseLocalDate(editing.start); const end = parseLocalDate(editing.end); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('edit_time_entry', { entryId: Number(editing.id), expectedStart: editing.expectedStart, expectedEnd: editing.expectedEnd, startedAt: start.toISOString(), endedAt: end.toISOString() }); setEditing(null); if (revisions && same(revisions.entryId, editing.id)) await showRevisions(editing.id); }, 'Korekta została zapisana.'); }}>
+          <h3>Korekta wpisu</h3><p className="muted">Podaj godziny w strefie czasowej komputera. Poprzednie wartości pozostaną w historii zmian.</p>
+          <div className="selectors"><label>Rozpoczęcie<input type="datetime-local" step="1" required value={editing.start} onChange={e => setEditing({ ...editing, start: e.target.value })} /></label><label>Zakończenie<input type="datetime-local" step="1" required value={editing.end} onChange={e => setEditing({ ...editing, end: e.target.value })} /></label></div>
+          <button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz korektę</button>{' '}<button className="secondary" type="button" onClick={() => setEditing(null)}>Anuluj</button>
+        </form>}
+        {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : <div className="table-wrap"><table><thead><tr><th>Zadanie</th><th>Klient / projekt</th><th>Rozpoczęcie</th><th>Zakończenie</th><th>Czas</th><th>Operacje</th></tr></thead><tbody>{entries.map(e => { const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, t?.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id)); return <tr key={e.id}><td><strong>{t?.name || 'Nieznane zadanie'}</strong></td><td>{c?.name || '—'} / {p?.name || '—'}</td><td>{formatDate(e.started_at)}</td><td>{formatDate(e.ended_at)}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td><td className="duration">{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td><td><button type="button" className="secondary" disabled={busy || !e.ended_at} aria-label={`Popraw wpis: ${t?.name || 'zadanie'}`} onClick={() => e.ended_at && setEditing({ id: e.id, expectedStart: e.started_at, expectedEnd: e.ended_at, start: localInputValue(e.started_at), end: localInputValue(e.ended_at) })}>Popraw</button>{' '}<button type="button" className="secondary" aria-label={`Historia zmian: ${t?.name || 'zadanie'}`} onClick={() => void showRevisions(e.id)}>Historia zmian</button></td></tr>; })}</tbody></table></div>}
+        {revisions && <section aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.items.length === 0 ? <p className="muted">Ten wpis nie ma zapisanych korekt.</p> : <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}</section>}
       </section>
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
     </main>
