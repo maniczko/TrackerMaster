@@ -60,7 +60,7 @@ fn validate_database(db: &Connection) -> Result<()> {
         return Err(invalid());
     }
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if !(0..=5).contains(&version) {
+    if !(0..=6).contains(&version) {
         return Err(invalid());
     }
 
@@ -84,6 +84,7 @@ fn validate_database(db: &Connection) -> Result<()> {
     }
     if version >= 4 { crate::validate_revisions_schema(db)?; }
     if version >= 5 { crate::validate_deletions_schema(db)?; }
+    if version >= 6 { crate::validate_settings_schema(db)?; }
     // A PRAGMA integrity_check does not detect broken relationships, and
     // stored data may have been written with foreign_keys disabled.
     for (table, from, target, to) in [
@@ -333,7 +334,7 @@ mod tests {
             INSERT INTO time_entries(id,task_id,started_at) VALUES(2,1,'2026-01-04T10:00:00Z');
         ").unwrap();
         let health = diagnose_database(&db).unwrap();
-        assert_eq!((health.schema_version, health.completed_entries, health.open_entries), (5, 0, 1));
+        assert_eq!((health.schema_version, health.completed_entries, health.open_entries), (6, 0, 1));
         let backup = create_backup(&db, &dir).unwrap();
         let copy = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(copy.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
@@ -363,6 +364,7 @@ mod tests {
         let dir = dest_path.with_extension("dir");
         let mut source = Connection::open(&source_path).unwrap();
         crate::initialise(&mut source).unwrap();
+        crate::update_report_timezone(&source, "Europe/Warsaw", "Europe/London").unwrap();
         source.execute_batch("INSERT INTO clients VALUES(1,'Backup client'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO tasks VALUES(1,1,'T'); INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(1,'2026-01-02T00:00:00Z','2026-01-01T08:00:00Z','2026-01-01T09:00:00Z',3600,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_deletions VALUES(1,'2026-01-03T00:00:00Z'); INSERT INTO time_entries(id,task_id,started_at) VALUES(2,1,'2026-01-04T10:00:00Z');").unwrap();
         let prepared = prepare_restore(&source_path).unwrap();
         assert_eq!((prepared.health.clients, prepared.health.completed_entries, prepared.health.open_entries), (1, 0, 1));
@@ -373,6 +375,7 @@ mod tests {
         dest.execute("INSERT INTO clients VALUES(1,'Current client')", []).unwrap();
         let safety = restore_prepared(&mut dest, &prepared, &dir).unwrap();
         assert_eq!(dest.query_row("SELECT name FROM clients WHERE id=1", [], |r| r.get::<_,String>(0)).unwrap(), "Backup client");
+        assert_eq!(dest.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get::<_,String>(0)).unwrap(), "Europe/London");
         assert_eq!(dest.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
         assert_eq!(dest.query_row("SELECT COUNT(*) FROM entry_deletions", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
         assert_eq!(dest.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
@@ -398,9 +401,9 @@ mod tests {
         assert!(prepare_restore(&invalid_path).is_err());
         let mut source = Connection::open(&source_path).unwrap();
         crate::initialise(&mut source).unwrap();
-        source.pragma_update(None, "user_version", 6).unwrap();
+        source.pragma_update(None, "user_version", 7).unwrap();
         assert!(prepare_restore(&source_path).is_err());
-        source.pragma_update(None, "user_version", 5).unwrap();
+        source.pragma_update(None, "user_version", 6).unwrap();
         let prepared = prepare_restore(&source_path).unwrap();
         let mut dest = Connection::open(&dest_path).unwrap();
         crate::initialise(&mut dest).unwrap();
@@ -416,9 +419,9 @@ mod tests {
         let _cleanup = Cleanup(path.clone());
         let mut source = Connection::open(&path).unwrap();
         crate::initialise(&mut source).unwrap();
-        source.execute_batch("INSERT INTO clients VALUES(1,'Legacy'); DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
+        source.execute_batch("INSERT INTO clients VALUES(1,'Legacy'); DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
         let prepared = prepare_restore(&path).unwrap();
-        assert_eq!((prepared.health.schema_version, prepared.health.clients), (5, 1));
+        assert_eq!((prepared.health.schema_version, prepared.health.clients), (6, 1));
         assert_eq!(source.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 3);
         assert!(!source.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entry_revisions')", [], |r| r.get::<_,bool>(0)).unwrap());
     }
@@ -481,7 +484,7 @@ mod tests {
         ").unwrap();
         let result = diagnose_database(&db).unwrap();
         assert_eq!(result, DatabaseHealth {
-            schema_version: 5, clients: 1, projects: 1, tasks: 1,
+            schema_version: 6, clients: 1, projects: 1, tasks: 1,
             completed_entries: 1, open_entries: 1,
         });
         // No business strings in the exposed diagnostics model.

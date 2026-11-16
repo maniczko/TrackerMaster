@@ -1,89 +1,83 @@
-// The initial implementation deliberately covers Warsaw only. Other IANA zones
-// need their own transition coverage before the setting can be exposed.
-const formatter = new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'Europe/Warsaw', year: 'numeric', month: '2-digit', day: '2-digit',
-});
+import { Temporal } from '@js-temporal/polyfill';
 
-export type ReportEntry = {
-  id: number; started_at: string; ended_at: string; duration_seconds: number;
-};
+export type ReportEntry = { id: number; started_at: string; ended_at: string; duration_seconds: number };
 export type ReportDay = { date: string; seconds: number };
-export type ReportResult = {
-  days: ReportDay[]; totalSeconds: number; averageSeconds: number | null;
-  excludedEntryIds: number[];
-};
+export type ReportResult = { days: ReportDay[]; totalSeconds: number; averageSeconds: number | null; excludedEntryIds: number[] };
 
-function localDate(ms: number): string {
-  const parts = formatter.formatToParts(ms);
-  const part = (type: string) => parts.find(p => p.type === type)?.value;
-  return `${part('year')}-${part('month')}-${part('day')}`;
+export function validTimeZone(timeZone: string): boolean {
+  if (!timeZone || timeZone !== timeZone.trim() || timeZone.length > 128 || !/^[A-Za-z0-9_+\-/]+$/.test(timeZone) || (timeZone !== 'UTC' && !timeZone.includes('/'))) return false;
+  try { Temporal.Instant.fromEpochMilliseconds(0).toZonedDateTimeISO(timeZone); return true; } catch { return false; }
+}
+
+export function dateInZone(ms: number, timeZone: string): string {
+  return Temporal.Instant.fromEpochMilliseconds(ms).toZonedDateTimeISO(timeZone).toPlainDate().toString();
 }
 
 function validDate(value: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const ms = Date.parse(`${value}T00:00:00Z`);
-  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 10) === value;
+  try { return Temporal.PlainDate.from(value).toString() === value; } catch { return false; }
 }
 
-/**
- * Allocate a verified elapsed duration to local days. Half-open intervals and
- * cumulative flooring ensure that fractional seconds are counted exactly once.
- * A discrepancy with stored seconds is excluded, not silently redistributed.
- */
-export function reportByWarsawDay(entries: ReportEntry[], from: string, through: string): ReportResult {
-  if (!validDate(from) || !validDate(through) || from > through || from < '1970-01-01') {
-    throw new Error('Nieprawidłowy zakres dat raportu.');
+// Split at local midnight and at offset transitions. The latter matters when
+// clocks move backward across midnight, or an entire local date is skipped.
+function pieces(start: number, end: number, zone: string): ReportDay[] {
+  const result: ReportDay[] = [];
+  let cursor = start;
+  while (cursor < end) {
+    const zoned = Temporal.Instant.fromEpochMilliseconds(cursor).toZonedDateTimeISO(zone);
+    const day = zoned.toPlainDate().toString();
+    const nextDate = zoned.toPlainDate().add({ days: 1 });
+    const nextMidnight = nextDate.toPlainDateTime();
+    const candidates = [end];
+    for (const disambiguation of ['earlier', 'later'] as const) {
+      const candidate = nextMidnight.toZonedDateTime(zone, { disambiguation });
+      if (candidate.toPlainDate().equals(nextDate) && candidate.epochMilliseconds > cursor) candidates.push(candidate.epochMilliseconds);
+    }
+    const transition = zoned.getTimeZoneTransition('next');
+    if (transition && transition.epochMilliseconds > cursor) candidates.push(transition.epochMilliseconds);
+    const boundary = Math.min(...candidates);
+    const seconds = Math.floor((boundary - start) / 1000) - Math.floor((cursor - start) / 1000);
+    result.push({ date: day, seconds });
+    cursor = boundary;
   }
+  return result;
+}
+
+/** Allocate stored durations without silently redistributing ambiguous time. */
+export function reportByDay(entries: ReportEntry[], from: string, through: string, timeZone: string): ReportResult {
+  if (!validDate(from) || !validDate(through) || from > through || from < '1970-01-01') throw new Error('Nieprawidłowy zakres dat raportu.');
+  if (!validTimeZone(timeZone)) throw new Error('Nieprawidłowa strefa czasowa.');
   const totals = new Map<string, number>();
   const excludedEntryIds: number[] = [];
   const ids = new Set<number>();
   for (const entry of entries) {
     if (ids.has(entry.id)) throw new Error('Powtórzony wpis w danych raportu.');
     ids.add(entry.id);
-    const start = Date.parse(entry.started_at);
-    const end = Date.parse(entry.ended_at);
+    const start = Date.parse(entry.started_at), end = Date.parse(entry.ended_at);
     const hasOffsets = /(?:Z|[+-]\d\d:\d\d)$/i.test(entry.started_at) && /(?:Z|[+-]\d\d:\d\d)$/i.test(entry.ended_at);
-    // Bounds avoid ambiguous historical calendar transitions and excessive work.
     if (!hasOffsets || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start ||
         end - start > 3660 * 86400_000 || !Number.isSafeInteger(entry.duration_seconds) || entry.duration_seconds < 0) {
-      excludedEntryIds.push(entry.id);
-      continue;
+      excludedEntryIds.push(entry.id); continue;
     }
-    const firstDay = localDate(start);
-    const lastDay = localDate(Math.max(start, end - 1));
-    if (lastDay < from || firstDay > through) continue;
+    const segments = pieces(start, end, timeZone);
+    const inRange = (date: string) => date >= from && date <= through;
+    if (segments.length && !segments.some(segment => inRange(segment.date))) continue;
     const difference = Math.abs(Math.floor((end - start) / 1000) - entry.duration_seconds);
     if (difference !== 0) {
-      // A normal timer uses a monotonic clock and can differ by up to two
-      // seconds from wall time. Within one day its destination is unambiguous.
-      if (difference <= 2 && end > start && firstDay === lastDay) {
-        if (entry.duration_seconds > 0) totals.set(firstDay, (totals.get(firstDay) ?? 0) + entry.duration_seconds);
-      } else {
-        excludedEntryIds.push(entry.id);
-      }
+      const dates = new Set(segments.map(segment => segment.date));
+      if (difference <= 2 && dates.size === 1) {
+        const day = segments[0].date;
+        if (inRange(day) && entry.duration_seconds > 0) totals.set(day, (totals.get(day) ?? 0) + entry.duration_seconds);
+      } else excludedEntryIds.push(entry.id);
       continue;
     }
-    let cursor = start;
-    while (cursor < end) {
-      const day = localDate(cursor);
-      // Warsaw's civil date cannot change twice within six hours from 1970.
-      let probe = Math.min(cursor + 6 * 3600_000, end);
-      while (probe < end && localDate(probe) === day) probe = Math.min(probe + 6 * 3600_000, end);
-      let boundary = end;
-      if (localDate(probe) !== day) {
-        let low = cursor, high = probe;
-        while (high - low > 1) {
-          const mid = Math.floor((low + high) / 2);
-          if (localDate(mid) === day) low = mid; else high = mid;
-        }
-        boundary = high;
-      }
-      const seconds = Math.floor((boundary - start) / 1000) - Math.floor((cursor - start) / 1000);
-      if (day >= from && day <= through && seconds > 0) totals.set(day, (totals.get(day) ?? 0) + seconds);
-      cursor = boundary;
+    for (const segment of segments) {
+      if (inRange(segment.date) && segment.seconds > 0) totals.set(segment.date, (totals.get(segment.date) ?? 0) + segment.seconds);
     }
   }
   const days = [...totals].sort(([a], [b]) => a.localeCompare(b)).map(([date, seconds]) => ({ date, seconds }));
   const totalSeconds = days.reduce((sum, day) => sum + day.seconds, 0);
   return { days, totalSeconds, averageSeconds: days.length ? totalSeconds / days.length : null, excludedEntryIds };
 }
+
+export const reportByWarsawDay = (entries: ReportEntry[], from: string, through: string) => reportByDay(entries, from, through, 'Europe/Warsaw');

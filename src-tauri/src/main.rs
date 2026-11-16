@@ -97,7 +97,7 @@ struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>
 #[derive(Serialize)]
 struct ReportActive { id: i64, task_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool }
 #[derive(Serialize)]
-struct ReportData { entries: Vec<Entry>, active: Option<ReportActive> }
+struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
 
 fn now() -> String { Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true) }
 fn valid_name(name: &str) -> Cmd<&str> {
@@ -169,13 +169,31 @@ fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample
         let (ended_at, duration_seconds) = match projection { Some((end, duration)) => (Some(end), Some(duration)), None => (None, None) };
         ReportActive { id, task_id, started_at, ended_at, duration_seconds, unresolved }
     });
-    Ok(ReportData { entries, active })
+    let time_zone = tracker.db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
+    Ok(ReportData { entries, active, time_zone })
 }
 
 #[tauri::command]
 fn get_report_data(state: State<'_, Shared>) -> Cmd<ReportData> {
     let tracker = locked(&state)?;
     report_data(&tracker, Utc::now(), power_sample())
+}
+
+fn update_report_timezone(db: &Connection, expected: &str, zone: &str) -> Cmd<()> {
+    if zone.is_empty() || zone.len() > 128 || zone.trim() != zone ||
+        !zone.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'+')) ||
+        !(zone == "UTC" || zone.contains('/')) {
+        return Err("Nieprawidłowa nazwa strefy czasowej.".into());
+    }
+    let changed = db.execute("UPDATE app_settings SET report_timezone=?1 WHERE id=1 AND report_timezone=?2", params![zone,expected]).map_err(db_err)?;
+    if changed != 1 { return Err("Ustawienie zmieniło się w innym oknie. Odśwież dane i spróbuj ponownie.".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_report_timezone(state: State<'_, Shared>, expected_time_zone: String, time_zone: String) -> Cmd<()> {
+    let tracker = locked(&state)?;
+    update_report_timezone(&tracker.db, &expected_time_zone, &time_zone)
 }
 
 #[tauri::command]
@@ -639,16 +657,24 @@ fn validate_deletions_schema(db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn validate_settings_schema(db: &Connection) -> rusqlite::Result<()> {
+    let key_ok = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('app_settings') WHERE name='id' AND UPPER(type)='INTEGER' AND pk=1) AND (SELECT COUNT(*) FROM pragma_table_info('app_settings') WHERE pk>0)=1 AND EXISTS(SELECT 1 FROM pragma_table_info('app_settings') WHERE name='report_timezone' AND UPPER(type)='TEXT' AND \"notnull\"=1)", [], |r| r.get::<_,bool>(0))?;
+    let row_ok = db.query_row("SELECT COUNT(*)=1 AND COALESCE(MIN(id),0)=1 AND COALESCE(LENGTH(MIN(report_timezone)),0) BETWEEN 1 AND 128 FROM app_settings", [], |r| r.get::<_,bool>(0))?;
+    if !key_ok || !row_ok { return Err(rusqlite::Error::InvalidQuery); }
+    Ok(())
+}
+
 fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > 5 {
+    if version > 6 {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    if version == 5 {
+    if version == 6 {
         validate_schema(db)?;
         validate_revisions_schema(db)?;
-        return validate_deletions_schema(db);
+        validate_deletions_schema(db)?;
+        return validate_settings_schema(db);
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch("
@@ -674,9 +700,11 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
         tx.execute_batch("CREATE TABLE entry_revisions (id INTEGER PRIMARY KEY, entry_id INTEGER NOT NULL REFERENCES time_entries(id), changed_at TEXT NOT NULL, before_start TEXT NOT NULL, before_end TEXT NOT NULL, before_seconds INTEGER NOT NULL CHECK(before_seconds >= 0), after_start TEXT NOT NULL, after_end TEXT NOT NULL, after_seconds INTEGER NOT NULL CHECK(after_seconds >= 0)); CREATE INDEX entry_revisions_by_entry ON entry_revisions(entry_id,id);")?;
     }
     validate_revisions_schema(&tx)?;
-    tx.execute_batch("CREATE TABLE entry_deletions (entry_id INTEGER PRIMARY KEY REFERENCES time_entries(id), deleted_at TEXT NOT NULL);")?;
+    if version < 5 { tx.execute_batch("CREATE TABLE entry_deletions (entry_id INTEGER PRIMARY KEY REFERENCES time_entries(id), deleted_at TEXT NOT NULL);")?; }
     validate_deletions_schema(&tx)?;
-    tx.pragma_update(None, "user_version", 5)?;
+    tx.execute_batch("CREATE TABLE app_settings (id INTEGER PRIMARY KEY CHECK(id=1), report_timezone TEXT NOT NULL); INSERT INTO app_settings(id,report_timezone) VALUES(1,'Europe/Warsaw');")?;
+    validate_settings_schema(&tx)?;
+    tx.pragma_update(None, "user_version", 6)?;
     tx.commit()
 }
 
@@ -797,7 +825,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -829,6 +857,30 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn timezone_migration_preserves_history_and_uses_optimistic_updates() {
+        let mut tracker = seeded();
+        tracker.db.execute_batch("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); DROP TABLE app_settings; PRAGMA user_version=5;").unwrap();
+        initialise(&mut tracker.db).unwrap();
+        let report = report_data(&tracker, Utc::now(), Err("clock".into())).unwrap();
+        assert_eq!(report.time_zone, "Europe/Warsaw");
+        assert_eq!(report.entries.len(), 1);
+        update_report_timezone(&tracker.db, "Europe/Warsaw", "Europe/London").unwrap();
+        assert!(update_report_timezone(&tracker.db, "Europe/Warsaw", "Europe/Berlin").is_err());
+        assert!(update_report_timezone(&tracker.db, "Europe/London", "invalid zone").is_err());
+        initialise(&mut tracker.db).unwrap();
+        assert_eq!(report_data(&tracker, Utc::now(), Err("clock".into())).unwrap().time_zone, "Europe/London");
+    }
+
+    #[test]
+    fn timezone_migration_rolls_back_when_table_already_exists() {
+        let mut tracker = seeded();
+        tracker.db.pragma_update(None, "user_version", 5).unwrap();
+        assert!(initialise(&mut tracker.db).is_err());
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
     }
 
     #[test]
@@ -923,7 +975,7 @@ mod tests {
         let mut tracker = seeded();
         close_active(&mut tracker, &now(), Some(1)).unwrap();
         close_active(&mut tracker, &now(), None).unwrap();
-        tracker.db.execute_batch("DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
+        tracker.db.execute_batch("DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
         initialise(&mut tracker.db).unwrap();
         let state = snapshot(&tracker).unwrap();
         assert!(!state.projects[0].archived);
@@ -944,7 +996,7 @@ mod tests {
         {
             let mut db = Connection::open(&path).unwrap();
             initialise(&mut db).unwrap();
-            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient testowy'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt testowy'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie testowe'); INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60); DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
+            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient testowy'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt testowy'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie testowe'); INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60); DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; PRAGMA user_version=2;").unwrap();
         }
         {
             let mut db = Connection::open(&path).unwrap();
@@ -966,7 +1018,7 @@ mod tests {
     #[test]
     fn invalid_version_two_schema_rolls_back_archive_migration() {
         let mut tracker = seeded();
-        tracker.db.execute_batch("DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; ALTER TABLE time_entries DROP COLUMN manually_resolved; PRAGMA user_version=2;").unwrap();
+        tracker.db.execute_batch("DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; ALTER TABLE projects DROP COLUMN archived; ALTER TABLE time_entries DROP COLUMN manually_resolved; PRAGMA user_version=2;").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, 2);
@@ -1150,10 +1202,10 @@ mod tests {
         let mut tracker = seeded();
         let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
         add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
-        tracker.db.execute_batch("DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
+        tracker.db.execute_batch("DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
         initialise(&mut tracker.db).unwrap();
         assert_eq!(snapshot(&tracker).unwrap().entries.len(), 1);
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 6);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
@@ -1187,11 +1239,11 @@ mod tests {
         let id = add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
         let entry = snapshot(&tracker).unwrap().entries.remove(0);
         correct_entry(&mut tracker, id, &entry.started_at, &entry.ended_at, "2026-01-01T09:00:00Z", "2026-01-01T10:30:00Z", current).unwrap();
-        tracker.db.execute_batch("DROP TABLE entry_deletions; PRAGMA user_version=4;").unwrap();
+        tracker.db.execute_batch("DROP TABLE app_settings; DROP TABLE entry_deletions; PRAGMA user_version=4;").unwrap();
         initialise(&mut tracker.db).unwrap();
         assert_eq!(snapshot(&tracker).unwrap().entries.len(), 1);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 6);
     }
 
     #[test]
@@ -1209,7 +1261,7 @@ mod tests {
     #[test]
     fn deletion_migration_rolls_back_if_unexpected_table_exists() {
         let mut tracker = seeded();
-        tracker.db.execute_batch("DROP TABLE entry_deletions; CREATE TABLE entry_deletions(unexpected TEXT); PRAGMA user_version=4;").unwrap();
+        tracker.db.execute_batch("DROP TABLE app_settings; DROP TABLE entry_deletions; CREATE TABLE entry_deletions(unexpected TEXT); PRAGMA user_version=4;").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 4);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
@@ -1257,7 +1309,7 @@ mod tests {
         let mut tracker = seeded();
         initialise(&mut tracker.db).unwrap();
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
     }
 
@@ -1286,7 +1338,7 @@ mod tests {
         tracker.db.pragma_update(None, "foreign_keys", false).unwrap();
         tracker.db.execute_batch("DROP TABLE tasks; CREATE TABLE tasks(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL);").unwrap();
         assert!(initialise(&mut tracker.db).is_err());
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 6);
     }
 
     #[test]
@@ -1297,7 +1349,7 @@ mod tests {
         let tracker = Tracker { db, running_since: None, restored: false };
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 1);
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1314,11 +1366,11 @@ mod tests {
     #[test]
     fn newer_database_version_is_rejected_without_changes() {
         let mut tracker = seeded();
-        tracker.db.pragma_update(None, "user_version", 6).unwrap();
+        tracker.db.pragma_update(None, "user_version", 7).unwrap();
         assert!(initialise(&mut tracker.db).is_err());
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 2);
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]

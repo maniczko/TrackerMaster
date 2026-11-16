@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reportByWarsawDay } from '../src/reportTime.ts';
+import { reportByWarsawDay, reportByDay, validTimeZone } from '../src/reportTime.ts';
 
 const entry = (id: number, started_at: string, ended_at: string, duration_seconds: number) => ({ id, started_at, ended_at, duration_seconds });
 const range = (entries: ReturnType<typeof entry>[], from = '2026-01-01', through = '2026-12-31') => reportByWarsawDay(entries, from, through);
@@ -52,4 +52,24 @@ test('rejects invalid dates and duplicate source entries', () => {
   assert.throws(() => range([], '2026-03-01', '2026-02-28'));
   const e = entry(1, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 3600);
   assert.throws(() => range([e, e]));
+});
+
+test('changing the report zone changes day allocation without changing total duration', () => {
+  const e = [entry(1, '2026-01-01T23:30:00Z', '2026-01-02T01:30:00Z', 7200)];
+  assert.deepEqual(reportByDay(e, '2026-01-01', '2026-01-02', 'Europe/Warsaw').days, [{ date: '2026-01-02', seconds: 7200 }]);
+  assert.deepEqual(reportByDay(e, '2026-01-01', '2026-01-02', 'Europe/London').days, [{ date: '2026-01-01', seconds: 1800 }, { date: '2026-01-02', seconds: 5400 }]);
+  assert.ok(!validTimeZone('Not/A_Zone'));
+  assert.throws(() => reportByDay(e, '2026-01-01', '2026-01-02', 'Not/A_Zone'));
+});
+
+test('handles a skipped local date without inventing time', () => {
+  const e = [entry(1, '2011-12-30T09:30:00Z', '2011-12-30T10:30:00Z', 3600)];
+  assert.deepEqual(reportByDay(e, '2011-12-29', '2011-12-31', 'Pacific/Apia').days, [{ date: '2011-12-29', seconds: 1800 }, { date: '2011-12-31', seconds: 1800 }]);
+});
+
+test('handles a clock rollback crossing midnight twice', () => {
+  const e = [entry(1, '1988-10-30T01:20:00Z', '1988-10-30T04:00:00Z', 9600)];
+  const result = reportByDay(e, '1988-10-29', '1988-10-30', 'America/St_Johns');
+  assert.deepEqual(result.days, [{ date: '1988-10-29', seconds: 7740 }, { date: '1988-10-30', seconds: 1860 }]);
+  assert.equal(result.totalSeconds, 9600);
 });

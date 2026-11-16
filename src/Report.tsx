@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useEffect, useMemo, useState } from 'react';
-import { reportByWarsawDay } from './reportTime';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { dateInZone, reportByDay, validTimeZone } from './reportTime';
 import type { ReportEntry } from './reportTime';
 
 type Id = number | string;
@@ -9,7 +9,7 @@ type Project = { id: Id; client_id: Id; name: string };
 type Task = { id: Id; project_id: Id; name: string };
 type Completed = ReportEntry & { task_id: number };
 type Active = { id: number; task_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean };
-type Data = { entries: Completed[]; active: Active | null };
+type Data = { entries: Completed[]; active: Active | null; time_zone: string };
 
 function todayWarsaw() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
@@ -29,6 +29,10 @@ export default function Report({ clients, projects, tasks, loaded }: { clients: 
   const [data, setData] = useState<Data | null>(null);
   const [error, setError] = useState('');
   const [refresh, setRefresh] = useState(0);
+  const [zoneDraft, setZoneDraft] = useState('');
+  const [zoneError, setZoneError] = useState('');
+  const [zoneSaving, setZoneSaving] = useState(false);
+  const zoneInitialised = useRef(false);
 
   useEffect(() => {
     if (!open || !loaded) { setData(null); return; }
@@ -37,7 +41,7 @@ export default function Report({ clients, projects, tasks, loaded }: { clients: 
     async function update() {
       try {
         const next = await invoke<Data>('get_report_data');
-        if (!cancelled) { setData(next); setError(''); }
+        if (!cancelled) { setData(next); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
       } catch (e) {
         if (!cancelled) { setData(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
       } finally {
@@ -60,26 +64,29 @@ export default function Report({ clients, projects, tasks, loaded }: { clients: 
     const entries = data.entries.filter(e => belongs(e.task_id));
     const active = data.active && belongs(data.active.task_id) ? data.active : null;
     try {
-      const completed = reportByWarsawDay(entries, from, through);
+      if (!validTimeZone(data.time_zone)) return { invalidZone: true as const };
+      const completed = reportByDay(entries, from, through, data.time_zone);
       const activeEntry = active && !active.unresolved && active.ended_at !== null && active.duration_seconds !== null
         ? { id: active.id, started_at: active.started_at, ended_at: active.ended_at, duration_seconds: active.duration_seconds } : null;
-      const combined = reportByWarsawDay(activeEntry ? [...entries, activeEntry] : entries, from, through);
-      return { completed, combined, active, activeSeconds: combined.totalSeconds - completed.totalSeconds, missingRelations, invalidRange: false };
+      const combined = reportByDay(activeEntry ? [...entries, activeEntry] : entries, from, through, data.time_zone);
+      return { completed, combined, active, activeSeconds: combined.totalSeconds - completed.totalSeconds, missingRelations, invalidRange: false, invalidZone: false };
     } catch {
-      return { invalidRange: true as const };
+      return { invalidRange: true as const, invalidZone: false };
     }
   }, [data, from, through, client, tasks, projects]);
 
   return <section className="card report" aria-label="Raport czasu">
     <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div><button type="button" className="secondary report-button" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
     {open && <>
-      <p className="muted">Czas według dni w strefie Europe/Warsaw. Zmiana strefy komputera nie zmienia raportu.</p>
+      <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
+      {data && <details className="report-zone"><summary>Zmień strefę raportowania</summary><p className="muted">Podaj nazwę strefy IANA, np. Europe/Warsaw, Europe/London lub America/New_York. Zmiana przeliczy przypisanie wcześniejszych pomiarów do dni, bez zmiany zapisanych pomiarów.</p><label>Strefa raportowania<input value={zoneDraft} list="report-time-zones" onChange={e => { setZoneDraft(e.target.value); setZoneError(''); }} /></label><datalist id="report-time-zones"><option value="Europe/Warsaw" /><option value="Europe/London" /><option value="Europe/Berlin" /><option value="America/New_York" /><option value="UTC" /></datalist>{' '}<button className="secondary report-button" type="button" disabled={zoneSaving || !loaded} onClick={() => { if (!validTimeZone(zoneDraft)) { setZoneError('Podaj poprawną nazwę strefy IANA, np. Europe/Warsaw.'); return; } setZoneSaving(true); setZoneError(''); void invoke('set_report_timezone', { expectedTimeZone: data.time_zone, timeZone: zoneDraft }).then(() => setRefresh(n => n + 1)).catch(e => { setZoneError(`Nie udało się zapisać strefy: ${String(e)}`); setRefresh(n => n + 1); }).finally(() => setZoneSaving(false)); }}>Zapisz strefę</button>{zoneError && <div role="alert" className="alert error">{zoneError}</div>}</details>}
       <div className="selectors report-filters"><label>Od<input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label>Do<input type="date" value={through} onChange={e => setThrough(e.target.value)} /></label><label>Klient<select value={client} onChange={e => setClient(e.target.value)}><option value="">Wszyscy klienci</option>{clients.map(c => <option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></label></div>
       {!loaded && <p role="status">Odśwież dane aplikacji, aby wyświetlić raport.</p>}
       {error && <div role="alert" className="alert error">{error} <button type="button" onClick={() => setRefresh(n => n + 1)}>Ponów</button></div>}
       {loaded && !data && !error && <p role="status">Wczytywanie raportu…</p>}
-      {result?.invalidRange && <div role="alert" className="alert error">Podaj poprawny zakres dat od 1970 roku; data końcowa nie może być wcześniejsza niż początkowa.</div>}
-      {result && !result.invalidRange && <>
+      {result?.invalidZone && <div role="alert" className="alert error">Zapisana strefa raportu nie jest obsługiwana. Wybierz poprawną strefę przed wyświetleniem wyników.</div>}
+      {result && 'invalidRange' in result && result.invalidRange && <div role="alert" className="alert error">Podaj poprawny zakres dat od 1970 roku; data końcowa nie może być wcześniejsza niż początkowa.</div>}
+      {result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <>
         {(result.combined.excludedEntryIds.length > 0 || result.missingRelations) && <div role="alert" className="alert error"><strong>Raport jest niepełny.</strong> {result.combined.excludedEntryIds.length > 0 && <>Nie można bezpiecznie przypisać czasu do dni dla wpisów: {result.combined.excludedEntryIds.join(', ')}. Sprawdź je w historii. </>}{result.missingRelations && 'Brakuje powiązania części wpisów z klientem.'}</div>}
         {result.active?.unresolved && <div role="alert" className="alert error">Aktywny pomiar wymaga weryfikacji lub sprawdzenia zegara. Nie jest doliczany do raportu.</div>}
         <div className="report-summary"><div><small>Łącznie{result.combined.excludedEntryIds.length || result.missingRelations ? ' — niepełne' : ''}</small><strong>{duration(result.combined.totalSeconds)}</strong></div><div><small>Średnio na dzień z pracą</small><strong>{result.combined.averageSeconds === null ? 'Brak danych' : duration(result.combined.averageSeconds)}</strong></div><div><small>W tym aktywny pomiar · orientacyjnie</small><strong>{duration(result.activeSeconds)}</strong></div></div>
