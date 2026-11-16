@@ -38,7 +38,7 @@ fn sleep_or_invalid(start: PowerSample, end: PowerSample) -> bool {
     total.abs_diff(awake) > 2_000
 }
 
-struct Tracker { db: Connection, running_since: Option<RunningClock> }
+struct Tracker { db: Connection, running_since: Option<RunningClock>, restored: bool }
 #[cfg(windows)]
 struct InstanceGuard { _file: std::fs::File }
 
@@ -73,6 +73,9 @@ type Shared = Mutex<Tracker>;
 #[derive(Default)]
 struct HotkeyState { task_id: Option<i64>, registered: bool, message: String }
 type Hotkey = Mutex<HotkeyState>;
+#[derive(Default)]
+struct RestoreState { sequence: u64, pending: Option<storage_safety::PreparedRestore> }
+type Restore = Mutex<RestoreState>;
 type Cmd<T> = Result<T, String>;
 
 #[derive(Serialize)]
@@ -101,8 +104,14 @@ fn valid_name(name: &str) -> Cmd<&str> {
     Ok(name)
 }
 fn db_err(_: rusqlite::Error) -> String { "Nie udało się zapisać lub odczytać danych lokalnych.".into() }
+fn ensure_available(tracker: &Tracker) -> Cmd<()> {
+    if tracker.restored { return Err("Kopia została przywrócona. Zamknij aplikację i uruchom ją ponownie.".into()); }
+    Ok(())
+}
 fn locked<'a>(state: &'a State<'_, Shared>) -> Cmd<std::sync::MutexGuard<'a, Tracker>> {
-    state.lock().map_err(|_| "Błąd dostępu do danych lokalnych.".into())
+    let guard = state.lock().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())?;
+    ensure_available(&guard)?;
+    Ok(guard)
 }
 
 fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
@@ -145,6 +154,54 @@ fn create_backup(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<String>
     storage_safety::create_backup(&tracker.db, &data_dir)
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|_| "Nie udało się utworzyć ani zweryfikować kopii bazy danych.".into())
+}
+
+#[derive(Serialize)]
+struct RestorePreview { token: String, health: storage_safety::DatabaseHealth }
+
+#[tauri::command]
+fn prepare_backup_restore(state: State<'_, Restore>, path: String) -> Cmd<RestorePreview> {
+    let path = std::path::Path::new(path.trim());
+    if !path.is_absolute() { return Err("Podaj pełną ścieżkę do pliku kopii.".into()); }
+    let prepared = storage_safety::prepare_restore(path)
+        .map_err(|_| "Nie można odczytać tej kopii lub jej format jest niezgodny. Bieżące dane nie zostały zmienione.".to_string())?;
+    let health = prepared.health.clone();
+    let mut state = state.lock().map_err(|_| "Nie można przygotować kopii.".to_string())?;
+    state.sequence = state.sequence.checked_add(1).ok_or("Nie można przygotować kolejnej kopii.")?;
+    let token = state.sequence.to_string();
+    state.pending = Some(prepared);
+    Ok(RestorePreview { token, health })
+}
+
+#[tauri::command]
+fn cancel_backup_restore(state: State<'_, Restore>, token: String) -> Cmd<()> {
+    let mut state = state.lock().map_err(|_| "Nie można anulować przygotowania.".to_string())?;
+    if state.sequence.to_string() == token { state.pending = None; }
+    Ok(())
+}
+
+#[tauri::command]
+fn apply_backup_restore(app: tauri::AppHandle, state: State<'_, Shared>, restore: State<'_, Restore>, token: String, confirmed: bool) -> Cmd<String> {
+    if !confirmed { return Err("Potwierdź przywrócenie kopii.".into()); }
+    let data_dir = app.path().app_data_dir().map_err(|_| "Nie można ustalić katalogu danych aplikacji.".to_string())?;
+    let mut restore = restore.lock().map_err(|_| "Nie można odczytać przygotowanej kopii.".to_string())?;
+    if restore.sequence.to_string() != token || restore.pending.is_none() { return Err("Przygotowana kopia jest nieaktualna. Sprawdź ją ponownie.".into()); }
+    let mut tracker = locked(&state)?;
+    if snapshot(&tracker)?.active.is_some() { return Err("Najpierw zakończ lub rozlicz aktywny pomiar.".into()); }
+    let prepared = restore.pending.take().ok_or("Nie znaleziono przygotowanej kopii.")?;
+    let safety = storage_safety::restore_prepared(&mut tracker.db, &prepared, &data_dir)
+        .map_err(|_| "Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.".to_string())?;
+    tracker.running_since = None;
+    tracker.restored = true;
+    Ok(safety.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn exit_after_restore(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<()> {
+    let tracker = state.lock().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())?;
+    if !tracker.restored { return Err("Nie wykonano przywrócenia kopii.".into()); }
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -274,6 +331,7 @@ fn archive_project(state: State<'_, Shared>, project_id: i64, archived: bool) ->
 // A persisted timer surviving a process restart cannot safely infer how much time was worked.
 // Reject stop/switch and leave the durable row for manual recovery.
 fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd<()> {
+    ensure_available(tracker)?;
     let elapsed = tracker.running_since.as_ref().map(|clock| clock.since.elapsed().as_secs() as i64);
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let active: Option<(i64, i64, String)> = tx.query_row("SELECT id,task_id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
@@ -630,8 +688,9 @@ fn main() {
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
                 err
             })?;
-            app.manage(Mutex::new(Tracker { db, running_since: None }));
+            app.manage(Mutex::new(Tracker { db, running_since: None, restored: false }));
             app.manage(Mutex::new(HotkeyState::default()));
+            app.manage(Mutex::new(RestoreState::default()));
             let registered = app.global_shortcut().register("Ctrl+Shift+Space");
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
                 state.registered = registered.is_ok();
@@ -700,7 +759,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,create_backup,diagnose_database,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -731,7 +790,17 @@ mod tests {
         db.execute_batch("INSERT INTO clients(id,name) VALUES (1,'A');
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
-        Tracker { db, running_since: None }
+        Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn restored_session_blocks_old_window_and_shortcut_operations() {
+        let mut tracker = seeded();
+        tracker.restored = true;
+        assert!(ensure_available(&tracker).is_err());
+        assert!(change_timer_if_current(&mut tracker, None, Some(1)).is_err());
+        assert!(close_active(&mut tracker, &now(), Some(1)).is_err());
+        assert!(snapshot(&tracker).unwrap().active.is_none());
     }
 
     #[test]
@@ -816,7 +885,7 @@ mod tests {
         {
             let mut db = Connection::open(&path).unwrap();
             initialise(&mut db).unwrap();
-            let tracker = Tracker { db, running_since: None };
+            let tracker = Tracker { db, running_since: None, restored: false };
             let state = snapshot(&tracker).unwrap();
             assert!(state.projects[0].archived);
             assert_eq!(state.entries.len(), 1);
@@ -1156,7 +1225,7 @@ mod tests {
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE clients (id INTEGER PRIMARY KEY, name TEXT NOT NULL); CREATE TABLE projects (id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id), name TEXT NOT NULL); CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), name TEXT NOT NULL); CREATE TABLE time_entries (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id), started_at TEXT NOT NULL, ended_at TEXT, duration_seconds INTEGER); INSERT INTO clients VALUES(1,'A'); INSERT INTO projects VALUES(1,1,'P'); INSERT INTO tasks VALUES(1,1,'T');").unwrap();
         initialise(&mut db).unwrap();
-        let tracker = Tracker { db, running_since: None };
+        let tracker = Tracker { db, running_since: None, restored: false };
         assert_eq!(snapshot(&tracker).unwrap().tasks.len(), 1);
         let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, 5);
@@ -1167,7 +1236,7 @@ mod tests {
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE clients (id INTEGER PRIMARY KEY, name TEXT NOT NULL); CREATE TABLE projects (id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id), name TEXT NOT NULL); CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), name TEXT NOT NULL); CREATE TABLE time_entries (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id), started_at TEXT NOT NULL, ended_at TEXT, duration_seconds INTEGER); INSERT INTO clients VALUES(1,'A'); INSERT INTO projects VALUES(1,1,'P'); INSERT INTO tasks VALUES(1,1,'T'); INSERT INTO time_entries VALUES(1,1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60); PRAGMA user_version=1;").unwrap();
         initialise(&mut db).unwrap();
-        let tracker = Tracker { db, running_since: None };
+        let tracker = Tracker { db, running_since: None, restored: false };
         let entry = snapshot(&tracker).unwrap().entries.remove(0);
         assert_eq!(entry.duration_seconds, 60);
         assert!(!entry.manually_resolved);

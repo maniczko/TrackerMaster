@@ -108,7 +108,7 @@ fn validate_database(db: &Connection) -> Result<()> {
 
 /// Read-only health indicators. Never return client names, time-entry
 /// descriptions, paths, tokens or other business content to diagnostics.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DatabaseHealth {
     pub schema_version: i64,
     pub clients: i64,

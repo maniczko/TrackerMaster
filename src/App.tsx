@@ -10,6 +10,7 @@ type Entry = { id: Id; task_id: Id; started_at: string; ended_at: string | null;
 type DeletedEntry = { id: Id; task_id: Id; started_at: string; ended_at: string; duration_seconds: number; deleted_at: string };
 type Revision = { id: Id; changed_at: string; before_start: string; before_end: string; before_seconds: number; after_start: string; after_end: string; after_seconds: number };
 type DatabaseHealth = { schema_version: number; clients: number; projects: number; tasks: number; completed_entries: number; open_entries: number };
+type RestorePreview = { token: string; health: DatabaseHealth };
 export type Snapshot = { clients: Client[]; projects: Project[]; tasks: Task[]; active: Entry | null; entries: Entry[] };
 const EMPTY: Snapshot = { clients: [], projects: [], tasks: [], active: null, entries: [] };
 export const same = (a: Id | undefined | null, b: Id | undefined | null) => a != null && b != null && String(a) === String(b);
@@ -67,6 +68,10 @@ export default function App() {
   const [deleted, setDeleted] = useState<DeletedEntry[] | null>(null);
   const [lastBackup, setLastBackup] = useState('');
   const [databaseHealth, setDatabaseHealth] = useState<DatabaseHealth | null>(null);
+  const [restorePath, setRestorePath] = useState('');
+  const [restorePreview, setRestorePreview] = useState<RestorePreview | null>(null);
+  const [restoreConfirmed, setRestoreConfirmed] = useState(false);
+  const [restoreDone, setRestoreDone] = useState('');
   const [revisions, setRevisions] = useState<{ entryId: Id; items: Revision[] } | null>(null);
   const revisionsRequest = useRef(0);
   const [loaded, setLoaded] = useState(false);
@@ -129,6 +134,26 @@ export default function App() {
     try { setDeleted(await invoke<DeletedEntry[]>('deleted_entries')); }
     catch (e) { setDeleted(null); setError(`Nie udało się odczytać usuniętych wpisów: ${String(e)}`); }
   }
+  async function prepareRestore() {
+    setBusy(true); setError(''); setNotice('');
+    try { setRestorePreview(await invoke<RestorePreview>('prepare_backup_restore', { path: restorePath })); setRestoreConfirmed(false); }
+    catch (e) { setRestorePreview(null); setError(String(e)); }
+    finally { setBusy(false); }
+  }
+  async function cancelRestore() {
+    if (!restorePreview) return;
+    try { await invoke('cancel_backup_restore', { token: restorePreview.token }); setRestorePreview(null); setRestoreConfirmed(false); }
+    catch (e) { setError(`Nie udało się anulować: ${String(e)}`); }
+  }
+  async function applyRestore() {
+    if (!restorePreview || !restoreConfirmed) return;
+    setBusy(true); setError(''); setNotice('');
+    try {
+      const safetyPath = await invoke<string>('apply_backup_restore', { token: restorePreview.token, confirmed: true });
+      setRestoreDone(safetyPath); setRestorePreview(null); setRestoreConfirmed(false);
+    } catch (e) { setRestorePreview(null); setRestoreConfirmed(false); setError(`${String(e)} Sprawdź kopię ponownie przed kolejną próbą.`); }
+    finally { setBusy(false); }
+  }
   const create = (kind: 'client' | 'project' | 'task') => async (event: FormEvent) => {
     event.preventDefault();
     const name = names[kind].trim();
@@ -143,6 +168,8 @@ export default function App() {
       setNames(old => ({ ...old, [kind]: '' }));
     }, kind === 'client' ? 'Klient dodany. Możesz teraz dodać projekt.' : kind === 'project' ? 'Projekt dodany. Możesz teraz dodać zadanie.' : 'Zadanie dodane. Możesz rozpocząć pomiar.');
   };
+
+  if (restoreDone) return <div className="app-shell"><main><section className="card"><h1>Kopia została przywrócona</h1><p>Ze względów bezpieczeństwa zamknij aplikację i uruchom ją ponownie. Jeśli kopia zawierała otwarty pomiar, po uruchomieniu będzie on wymagał weryfikacji.</p><p>Kopia danych sprzed przywrócenia: <code>{restoreDone}</code>. Nie jest szyfrowana.</p>{error && <div role="alert" className="alert error">{error}</div>}<button className="primary" onClick={() => invoke('exit_after_restore').catch(e => setError(`Nie udało się zamknąć aplikacji: ${String(e)}`))}>Zamknij aplikację</button></section></main></div>;
 
   return <div className="app-shell">
     <header className="topbar"><div className="brand"><span className="brand-mark">T</span><div><strong>TrackerMaster</strong><small>Twój czas, pod kontrolą</small></div></div><div className="topbar-actions"><button className="widget-open" onClick={() => invoke('open_widget').catch(e => setError(`Nie udało się otworzyć widgetu: ${String(e)}`))}>Otwórz widget</button><span className="local-pill"><span /> Lokalnie na tym komputerze</span></div></header>
@@ -192,7 +219,11 @@ export default function App() {
         <details onToggle={e => { if (e.currentTarget.open) void loadDeleted(); }}><summary>Usunięte wpisy</summary><p className="muted">Te wpisy nie są uwzględniane w aktywnej historii. Zachowano je wraz z historią zmian.</p><button type="button" className="secondary" onClick={() => void loadDeleted()}>Odśwież listę</button>{deleted === null ? <p className="muted">Odczytywanie lub brak dostępu do listy.</p> : deleted.length === 0 ? <p className="muted">Brak usuniętych wpisów.</p> : <ul>{deleted.map(entry => <li key={entry.id}><strong>{data.tasks.find(task => same(task.id, entry.task_id))?.name || 'Nieznane zadanie'}</strong> · {formatPreciseDate(entry.started_at)} – {formatPreciseDate(entry.ended_at)} · {formatDuration(entry.duration_seconds)} · usunięto {formatPreciseDate(entry.deleted_at)}{' '}<button type="button" className="secondary" onClick={() => void showRevisions(entry.id)}>Historia zmian</button></li>)}</ul>}{deleted?.length === 500 && <p className="muted">Wyświetlono ostatnie 500 usuniętych wpisów.</p>}</details>
         {revisions && <section aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.items.length === 0 ? <p className="muted">Ten wpis nie ma zapisanych korekt.</p> : <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}</section>}
       </section>
-      <section className="card" aria-label="Bezpieczeństwo danych"><div className="section-top"><div><p className="section-kicker">TWOJE DANE</p><h2>Kopia zapasowa</h2></div></div><p className="muted">Utwórz lokalną kopię bazy danych, również podczas trwającego pomiaru.</p><div className="actions"><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setLastBackup(await invoke<string>('create_backup')); }, 'Kopia została utworzona i sprawdzona.')}>Utwórz kopię</button><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setDatabaseHealth(await invoke<DatabaseHealth>('diagnose_database')); }, 'Sprawdzono bazę danych.')}>Sprawdź bazę</button></div>{lastBackup && <p role="status">Kopia została zapisana: <code>{lastBackup}</code>. Zawiera dane klientów i nie jest szyfrowana.</p>}{databaseHealth && <p role="status">Baza poprawna · Klienci: {databaseHealth.clients} · Projekty: {databaseHealth.projects} · Zadania: {databaseHealth.tasks} · Zakończone wpisy: {databaseHealth.completed_entries} · Otwarte pomiary: {databaseHealth.open_entries}</p>}</section>
+      <section className="card" aria-label="Bezpieczeństwo danych"><div className="section-top"><div><p className="section-kicker">TWOJE DANE</p><h2>Kopia zapasowa</h2></div></div><p className="muted">Utwórz lokalną kopię bazy danych, również podczas trwającego pomiaru.</p><div className="actions"><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setLastBackup(await invoke<string>('create_backup')); }, 'Kopia została utworzona i sprawdzona.')}>Utwórz kopię</button><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setDatabaseHealth(await invoke<DatabaseHealth>('diagnose_database')); }, 'Sprawdzono bazę danych.')}>Sprawdź bazę</button></div>{lastBackup && <p role="status">Kopia została zapisana: <code>{lastBackup}</code>. Zawiera dane klientów i nie jest szyfrowana.</p>}{databaseHealth && <p role="status">Baza poprawna · Klienci: {databaseHealth.clients} · Projekty: {databaseHealth.projects} · Zadania: {databaseHealth.tasks} · Zakończone wpisy: {databaseHealth.completed_entries} · Otwarte pomiary: {databaseHealth.open_entries}</p>}
+        <details><summary>Przywróć kopię</summary><p className="muted">Podaj pełną ścieżkę do pliku kopii. Przed przywróceniem aplikacja sprawdzi plik i utworzy kopię obecnych danych. Zakończ aktywny pomiar.</p><label>Ścieżka do kopii <input type="text" value={restorePath} disabled={busy || !!restorePreview} onChange={e => setRestorePath(e.target.value)} placeholder="C:\\...\\kopia.sqlite3" /></label>{' '}{!restorePreview && <button className="secondary" type="button" disabled={busy || !restorePath.trim()} onClick={() => void prepareRestore()}>Sprawdź kopię</button>}
+          {restorePreview && <div><p role="status">Kopia zawiera: klientów {restorePreview.health.clients}, projektów {restorePreview.health.projects}, zadań {restorePreview.health.tasks}, zakończonych wpisów {restorePreview.health.completed_entries}, otwartych pomiarów {restorePreview.health.open_entries}.</p><p>Przywrócenie zastąpi obecne dane. Najpierw zostanie utworzona ich lokalna kopia bezpieczeństwa. Po przywróceniu konieczne będzie ponowne uruchomienie aplikacji.</p>{restorePreview.health.open_entries > 0 && <p>Otwarty pomiar z kopii będzie wymagał weryfikacji po ponownym uruchomieniu.</p>}<label><input type="checkbox" checked={restoreConfirmed} onChange={e => setRestoreConfirmed(e.target.checked)} /> Rozumiem, że bieżące dane zostaną zastąpione.</label><div className="actions"><button className="primary" type="button" disabled={busy || !loaded || !!data.active || !restoreConfirmed} onClick={() => void applyRestore()}>Przywróć kopię</button><button className="secondary" type="button" disabled={busy} onClick={() => void cancelRestore()}>Anuluj</button></div>{data.active && <p className="muted">Zakończ lub rozlicz aktywny pomiar przed przywróceniem.</p>}</div>}
+        </details>
+      </section>
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
     </main>
   </div>;
