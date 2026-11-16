@@ -299,16 +299,23 @@ fn stop_expected_for_exit(tracker: &mut Tracker, expected_id: i64) -> Cmd<()> {
     }
     close_active(tracker, &now(), None)
 }
+
+fn change_timer_if_current(tracker: &mut Tracker, expected_active_id: Option<i64>, next_task: Option<i64>) -> Cmd<()> {
+    if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != expected_active_id {
+        return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into());
+    }
+    close_active(tracker, &now(), next_task)
+}
 #[tauri::command]
-fn start_timer(state: State<'_, Shared>, task_id: i64) -> Cmd<Snapshot> {
+fn start_timer(state: State<'_, Shared>, task_id: i64, expected_active_id: Option<i64>) -> Cmd<Snapshot> {
     let mut tracker = locked(&state)?;
-    close_active(&mut tracker, &now(), Some(task_id))?;
+    change_timer_if_current(&mut tracker, expected_active_id, Some(task_id))?;
     snapshot(&tracker)
 }
 #[tauri::command]
-fn stop_timer(state: State<'_, Shared>) -> Cmd<Snapshot> {
+fn stop_timer(state: State<'_, Shared>, expected_active_id: i64) -> Cmd<Snapshot> {
     let mut tracker = locked(&state)?;
-    close_active(&mut tracker, &now(), None)?;
+    change_timer_if_current(&mut tracker, Some(expected_active_id), None)?;
     snapshot(&tracker)
 }
 
@@ -357,8 +364,11 @@ fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -
 }
 
 #[tauri::command]
-fn recover_timer(state: State<'_, Shared>, ended_at: String) -> Cmd<Snapshot> {
+fn recover_timer(state: State<'_, Shared>, ended_at: String, expected_active_id: i64) -> Cmd<Snapshot> {
     let mut tracker = locked(&state)?;
+    if snapshot(&tracker)?.active.as_ref().map(|entry| entry.id) != Some(expected_active_id) {
+        return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into());
+    }
     resolve_recovered(&mut tracker, &ended_at, Utc::now())?;
     snapshot(&tracker)
 }
@@ -776,6 +786,24 @@ mod tests {
     }
 
     #[test]
+    fn stale_window_cannot_start_switch_or_stop_another_timer() {
+        let mut tracker = seeded();
+        change_timer_if_current(&mut tracker, None, Some(1)).unwrap();
+        let first_id = snapshot(&tracker).unwrap().active.unwrap().id;
+        assert!(change_timer_if_current(&mut tracker, None, Some(2)).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, first_id);
+
+        change_timer_if_current(&mut tracker, Some(first_id), Some(2)).unwrap();
+        let second_id = snapshot(&tracker).unwrap().active.unwrap().id;
+        assert_ne!(first_id, second_id);
+        assert!(change_timer_if_current(&mut tracker, Some(first_id), None).is_err());
+        assert!(change_timer_if_current(&mut tracker, Some(first_id), Some(1)).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, second_id);
+        change_timer_if_current(&mut tracker, Some(second_id), None).unwrap();
+        assert!(snapshot(&tracker).unwrap().active.is_none());
+    }
+
+    #[test]
     fn clock_discrepancy_preserves_entry_for_manual_recovery() {
         let mut tracker = seeded();
         close_active(&mut tracker, &now(), Some(1)).unwrap();
@@ -891,4 +919,3 @@ mod tests {
         assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'projects')", [], |r| r.get::<_, bool>(0)).unwrap());
     }
 }
-
