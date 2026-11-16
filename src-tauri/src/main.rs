@@ -373,6 +373,47 @@ fn recover_timer(state: State<'_, Shared>, ended_at: String, expected_active_id:
     snapshot(&tracker)
 }
 
+fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<i64> {
+    let start = DateTime::parse_from_rfc3339(started_at).map_err(|_| "Podaj poprawny czas rozpoczęcia.")?.with_timezone(&Utc);
+    let end = DateTime::parse_from_rfc3339(ended_at).map_err(|_| "Podaj poprawny czas zakończenia.")?.with_timezone(&Utc);
+    if start.timestamp_subsec_nanos() != 0 || end.timestamp_subsec_nanos() != 0 {
+        return Err("Podaj czas z dokładnością do pełnej sekundy.".into());
+    }
+    if end <= start { return Err("Koniec musi być późniejszy od początku.".into()); }
+    if end > current { return Err("Czas zakończenia nie może być w przyszłości.".into()); }
+    let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
+    let valid_task = tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?1 AND p.archived=0)", [task_id], |r| r.get::<_, bool>(0)).map_err(db_err)?;
+    if !valid_task { return Err("Wybierz zadanie w aktywnym projekcie.".into()); }
+    {
+        let mut stmt = tx.prepare("SELECT started_at,ended_at FROM time_entries").map_err(db_err)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).map_err(db_err)?;
+        for row in rows {
+            let (other_start, other_end) = row.map_err(db_err)?;
+            let other_start = DateTime::parse_from_rfc3339(&other_start).map_err(|_| "Nie można zweryfikować istniejącego wpisu. Wpis nie został dodany.")?.with_timezone(&Utc);
+            let other_end = other_end.map(|value| DateTime::parse_from_rfc3339(&value).map(|v| v.with_timezone(&Utc))).transpose()
+                .map_err(|_| "Nie można zweryfikować istniejącego wpisu. Wpis nie został dodany.")?;
+            if other_end.is_some_and(|value| value < other_start) { return Err("Nie można zweryfikować istniejącego wpisu. Wpis nie został dodany.".into()); }
+            if other_end == Some(other_start) { continue; }
+            if other_start < end && other_end.map_or(true, |value| value > start) {
+                return Err("Ten czas nakłada się na istniejący pomiar. Popraw godziny przed zapisaniem.".into());
+            }
+        }
+    }
+    let start_text = start.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
+    tx.execute("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds,manually_resolved) VALUES(?1,?2,?3,?4,1)", params![task_id,start_text,end_text,(end-start).num_seconds()]).map_err(db_err)?;
+    let id = tx.last_insert_rowid();
+    tx.commit().map_err(db_err)?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn create_manual_entry(state: State<'_, Shared>, task_id: i64, started_at: String, ended_at: String) -> Cmd<Snapshot> {
+    let mut tracker = locked(&state)?;
+    add_manual_entry(&mut tracker, task_id, &started_at, &ended_at, Utc::now())?;
+    snapshot(&tracker)
+}
+
 fn validate_schema(db: &Connection) -> rusqlite::Result<()> {
     for query in [
         "SELECT id, name FROM clients LIMIT 0",
@@ -545,7 +586,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -801,6 +842,35 @@ mod tests {
         assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, second_id);
         change_timer_if_current(&mut tracker, Some(second_id), None).unwrap();
         assert!(snapshot(&tracker).unwrap().active.is_none());
+    }
+
+    #[test]
+    fn manual_entries_reject_overlaps_and_allow_touching_boundaries() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        assert!(add_manual_entry(&mut tracker, 2, "2026-01-01T09:30:00Z", "2026-01-01T10:30:00Z", current).is_err());
+        add_manual_entry(&mut tracker, 2, "2026-01-01T11:00:00+01:00", "2026-01-01T12:00:00+01:00", current).unwrap();
+        let entries = snapshot(&tracker).unwrap().entries;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.duration_seconds == 3600 && entry.manually_resolved));
+        assert!(add_manual_entry(&mut tracker, 1, "2026-01-01T12:00:00Z", "2026-01-01T12:00:00Z", current).is_err());
+        assert!(add_manual_entry(&mut tracker, 1, "2026-01-01T23:30:00Z", "2026-01-02T00:00:01Z", current).is_err());
+        assert!(add_manual_entry(&mut tracker, 99, "2026-01-01T12:00:00Z", "2026-01-01T13:00:00Z", current).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn manual_entry_cannot_overlap_a_running_timer_or_use_an_archived_project() {
+        let mut tracker = seeded();
+        tracker.db.execute("INSERT INTO time_entries(task_id,started_at) VALUES(1,'2026-01-01T10:00:00Z')", []).unwrap();
+        let current = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(add_manual_entry(&mut tracker, 2, "2026-01-01T09:30:00Z", "2026-01-01T10:30:00Z", current).is_err());
+        add_manual_entry(&mut tracker, 2, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        tracker.db.execute("UPDATE projects SET archived=1 WHERE id=1", []).unwrap();
+        assert!(add_manual_entry(&mut tracker, 1, "2026-01-01T08:00:00Z", "2026-01-01T09:00:00Z", current).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().entries.len(), 1);
+        assert!(snapshot(&tracker).unwrap().active.is_some());
     }
 
     #[test]

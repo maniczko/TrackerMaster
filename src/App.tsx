@@ -19,6 +19,22 @@ const formatDate = (value: string | null) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'short' });
 };
+const parseLocalDate = (value: string) => {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
+  if (!parts) return null;
+  const date = new Date(value);
+  const expected = parts.slice(1).map(part => Number(part || 0));
+  const actual = [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()];
+  if (Number.isNaN(date.getTime()) || actual.some((part, index) => part !== expected[index])) return null;
+  // A repeated local time at the end of daylight saving does not identify one instant.
+  for (let minutes = -180; minutes <= 180; minutes++) {
+    if (minutes === 0) continue;
+    const other = new Date(date.getTime() + minutes * 60_000);
+    const components = [other.getFullYear(), other.getMonth() + 1, other.getDate(), other.getHours(), other.getMinutes(), other.getSeconds()];
+    if (components.every((part, index) => part === expected[index])) return null;
+  }
+  return date;
+};
 
 export default function App() {
   const [data, setData] = useState<Snapshot>(EMPTY);
@@ -31,6 +47,8 @@ export default function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [recoveryEnd, setRecoveryEnd] = useState('');
+  const [manualStart, setManualStart] = useState('');
+  const [manualEnd, setManualEnd] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [now, setNow] = useState(Date.now());
   const refresh = useCallback(async () => {
@@ -127,6 +145,12 @@ export default function App() {
         </aside>
       </div>
       <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
+        <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta, projekt i zadanie powyżej, a następnie podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
+          <form onSubmit={e => { e.preventDefault(); const start = parseLocalDate(manualStart); const end = parseLocalDate(manualEnd); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('create_manual_entry', { taskId: Number(taskId), startedAt: start.toISOString(), endedAt: end.toISOString() }); setManualStart(''); setManualEnd(''); }, 'Wpis czasu został dodany.'); }}>
+            <div className="selectors"><label>Rozpoczęcie<input type="datetime-local" step="1" required value={manualStart} onChange={e => setManualStart(e.target.value)} /></label><label>Zakończenie<input type="datetime-local" step="1" required value={manualEnd} onChange={e => setManualEnd(e.target.value)} /></label></div>
+            <button className="secondary" type="submit" disabled={busy || !loaded || !taskId || !!selectedProject?.archived || !manualStart || !manualEnd}>Dodaj wpis</button>
+          </form>
+        </details>
         {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : <div className="table-wrap"><table><thead><tr><th>Zadanie</th><th>Klient / projekt</th><th>Rozpoczęcie</th><th>Zakończenie</th><th>Czas</th></tr></thead><tbody>{entries.map(e => { const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, t?.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id)); return <tr key={e.id}><td><strong>{t?.name || 'Nieznane zadanie'}</strong></td><td>{c?.name || '—'} / {p?.name || '—'}</td><td>{formatDate(e.started_at)}</td><td>{formatDate(e.ended_at)}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td><td className="duration">{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td></tr>; })}</tbody></table></div>}
       </section>
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
