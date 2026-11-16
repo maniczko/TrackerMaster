@@ -56,6 +56,17 @@ fn show_start_error(message: &str) {
     let title: Vec<u16> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
     unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10); }
 }
+
+#[cfg(windows)]
+fn confirm_stop_and_exit() -> bool {
+    #[link(name = "user32")]
+    extern "system" { fn MessageBoxW(hwnd: *mut std::ffi::c_void, text: *const u16, caption: *const u16, flags: u32) -> i32; }
+    let message: Vec<u16> = "Pomiar nadal trwa. Czy chcesz go zatrzymać i zakończyć aplikację?\n\nWybierz Nie, aby kontynuować pomiar."
+        .encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
+    // Yes/No, question icon, default to No.
+    unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), 0x4 | 0x20 | 0x100) == 6 }
+}
 type Shared = Mutex<Tracker>;
 #[derive(Default)]
 struct HotkeyState { task_id: Option<i64>, registered: bool, message: String }
@@ -281,6 +292,13 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
     tracker.running_since = next_clock;
     Ok(())
 }
+
+fn stop_expected_for_exit(tracker: &mut Tracker, expected_id: i64) -> Cmd<()> {
+    if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != Some(expected_id) {
+        return Err("Pomiar zmienił się podczas potwierdzania. Sprawdź aktualny stan i spróbuj ponownie.".into());
+    }
+    close_active(tracker, &now(), None)
+}
 #[tauri::command]
 fn start_timer(state: State<'_, Shared>, task_id: i64) -> Cmd<Snapshot> {
     let mut tracker = locked(&state)?;
@@ -467,16 +485,35 @@ fn main() {
                     "quit" => {
                         let shared = app.state::<Shared>();
                         let guard = shared.lock();
-                        let may_exit = guard.as_ref().ok().and_then(|tracker| snapshot(tracker).ok()).map(|s| s.active.is_none()).unwrap_or(false);
-                        if !may_exit {
-                            // Never keep the tracker locked while waiting for a dialog.
-                            // The tray callback also runs on the UI thread, so the native
-                            // modal dialog must run on a separate thread.
+                        let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
+                            .and_then(|tracker| snapshot(tracker).map(|s| s.active));
+                        if matches!(active, Ok(None)) { app.exit(0); }
+                        else {
+                            // Do not hold the tracker lock or block the UI thread during a dialog.
                             drop(guard);
-                            let app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(app).await; });
+                            let main_app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(main_app).await; });
                             #[cfg(windows)]
-                            std::thread::spawn(|| show_start_error("Aby zakończyć aplikację, najpierw zatrzymaj lub rozlicz trwający pomiar."));
-                        } else { app.exit(0); }
+                            {
+                                let app = app.clone();
+                                std::thread::spawn(move || match active {
+                                    Ok(Some(entry)) if !entry.recovered => {
+                                        if !confirm_stop_and_exit() { return; }
+                                        let shared = app.state::<Shared>();
+                                        let mut tracker = match shared.lock() {
+                                            Ok(tracker) => tracker,
+                                            Err(_) => { show_start_error("Nie można odczytać pomiaru. Aplikacja pozostaje otwarta."); return; }
+                                        };
+                                        if let Err(err) = stop_expected_for_exit(&mut tracker, entry.id) {
+                                            drop(tracker);
+                                            show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta."));
+                                        } else { app.exit(0); }
+                                    }
+                                    Ok(Some(_)) => show_start_error("Pomiar wymaga ręcznej weryfikacji. Rozlicz go przed zakończeniem aplikacji."),
+                                    Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
+                                    Ok(None) => {}
+                                });
+                            }
+                        }
                     }
                     _ => {}
                 })
@@ -720,6 +757,25 @@ mod tests {
     }
 
     #[test]
+    fn exit_stops_only_the_confirmed_timer_and_preserves_failed_writes() {
+        let mut tracker = seeded();
+        close_active(&mut tracker, &now(), Some(1)).unwrap();
+        let first_id = snapshot(&tracker).unwrap().active.unwrap().id;
+        assert!(stop_expected_for_exit(&mut tracker, first_id + 1).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, first_id);
+
+        tracker.db.execute_batch("CREATE TRIGGER reject_exit_close BEFORE UPDATE ON time_entries BEGIN SELECT RAISE(FAIL, 'test'); END;").unwrap();
+        assert!(stop_expected_for_exit(&mut tracker, first_id).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, first_id);
+        tracker.db.execute_batch("DROP TRIGGER reject_exit_close;").unwrap();
+
+        stop_expected_for_exit(&mut tracker, first_id).unwrap();
+        let state = snapshot(&tracker).unwrap();
+        assert!(state.active.is_none());
+        assert_eq!(state.entries[0].id, first_id);
+    }
+
+    #[test]
     fn clock_discrepancy_preserves_entry_for_manual_recovery() {
         let mut tracker = seeded();
         close_active(&mut tracker, &now(), Some(1)).unwrap();
@@ -835,3 +891,4 @@ mod tests {
         assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'projects')", [], |r| r.get::<_, bool>(0)).unwrap());
     }
 }
+
