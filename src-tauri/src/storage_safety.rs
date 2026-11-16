@@ -369,6 +369,7 @@ mod tests {
         source.execute("UPDATE clients SET name='Changed after preview' WHERE id=1", []).unwrap();
         let mut dest = Connection::open(&dest_path).unwrap();
         crate::initialise(&mut dest).unwrap();
+        dest.pragma_update(None, "journal_mode", "WAL").unwrap();
         dest.execute("INSERT INTO clients VALUES(1,'Current client')", []).unwrap();
         let safety = restore_prepared(&mut dest, &prepared, &dir).unwrap();
         assert_eq!(dest.query_row("SELECT name FROM clients WHERE id=1", [], |r| r.get::<_,String>(0)).unwrap(), "Backup client");
@@ -378,6 +379,10 @@ mod tests {
         let previous = Connection::open_with_flags(&safety, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(previous.query_row("SELECT name FROM clients WHERE id=1", [], |r| r.get::<_,String>(0)).unwrap(), "Current client");
         preflight_existing(&safety).unwrap();
+        let tracker = crate::Tracker { db: dest, running_since: None, restored: false };
+        let restored = crate::snapshot(&tracker).unwrap();
+        assert!(restored.active.unwrap().recovered);
+        assert!(restored.entries.is_empty());
     }
 
     #[test]
@@ -403,6 +408,19 @@ mod tests {
         assert!(restore_prepared(&mut dest, &prepared, &dir).is_err());
         assert_eq!(dest.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
         assert!(!dir.join("backups").exists());
+    }
+
+    #[test]
+    fn prepare_restore_migrates_legacy_copy_without_changing_source() {
+        let path = test_path("restore-legacy");
+        let _cleanup = Cleanup(path.clone());
+        let mut source = Connection::open(&path).unwrap();
+        crate::initialise(&mut source).unwrap();
+        source.execute_batch("INSERT INTO clients VALUES(1,'Legacy'); DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
+        let prepared = prepare_restore(&path).unwrap();
+        assert_eq!((prepared.health.schema_version, prepared.health.clients), (5, 1));
+        assert_eq!(source.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 3);
+        assert!(!source.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entry_revisions')", [], |r| r.get::<_,bool>(0)).unwrap());
     }
 
     #[test]
