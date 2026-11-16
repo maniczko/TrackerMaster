@@ -36,29 +36,29 @@ function Stop-TrackerProcess {
 }
 function Start-And-Probe([string]$label) {
   $script:process = Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -PassThru
-  Write-Host "$label: launched PID=$($script:process.Id)"
+  Write-Host "${label}: launched PID=$($script:process.Id)"
   $database = $null
   for ($i = 0; $i -lt $StartupSeconds; $i++) {
     Start-Sleep -Seconds 1
     $script:process.Refresh()
     if ($script:process.HasExited) {
-      throw "$label: application exited during startup (exit code $($script:process.ExitCode)); GUI session or WebView2 may be unavailable."
+      throw "${label}: application exited during startup (exit code $($script:process.ExitCode)); GUI session or WebView2 may be unavailable."
     }
     $dbs = @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter 'tracker.sqlite3' -ErrorAction SilentlyContinue)
     if ($dbs.Count -eq 1) { $database = $dbs[0].FullName; break }
-    if ($dbs.Count -gt 1) { throw "$label: unexpectedly created multiple databases." }
+    if ($dbs.Count -gt 1) { throw "${label}: unexpectedly created multiple databases." }
   }
   if ($null -eq $database) {
-    throw "$label: no tracker.sqlite3 was created within $StartupSeconds seconds."
+    throw "${label}: no tracker.sqlite3 was created within $StartupSeconds seconds."
   }
   $file = [IO.File]::Open($database, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
   try {
     $bytes = New-Object byte[] 16
-    if ($file.Read($bytes, 0, 16) -ne 16) { throw "$label: SQLite header too short." }
+    if ($file.Read($bytes, 0, 16) -ne 16) { throw "${label}: SQLite header too short." }
     $magic = [Text.Encoding]::ASCII.GetString($bytes, 0, 15)
-    if ($magic -ne 'SQLite format 3') { throw "$label: invalid SQLite header." }
+    if ($magic -ne 'SQLite format 3') { throw "${label}: invalid SQLite header." }
   } finally { $file.Dispose() }
-  Write-Host "$label: process running; isolated SQLite file has valid header."
+  Write-Host "${label}: process running; isolated SQLite file has valid header."
   return $database
 }
 
