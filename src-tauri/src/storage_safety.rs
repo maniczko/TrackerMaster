@@ -111,7 +111,7 @@ pub struct DatabaseHealth {
     pub projects: i64,
     pub tasks: i64,
     pub completed_entries: i64,
-    pub unresolved_entries: i64,
+    pub open_entries: i64,
 }
 
 /// Validate the full database and then return only aggregate counts.
@@ -127,7 +127,7 @@ pub fn diagnose_database(db: &Connection) -> Result<DatabaseHealth> {
         projects: count("SELECT COUNT(*) FROM projects")?,
         tasks: count("SELECT COUNT(*) FROM tasks")?,
         completed_entries: count("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NOT NULL")?,
-        unresolved_entries: count("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL")?,
+        open_entries: count("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL")?,
     })
 }
 
@@ -313,7 +313,7 @@ mod tests {
         let result = diagnose_database(&db).unwrap();
         assert_eq!(result, DatabaseHealth {
             schema_version: 3, clients: 1, projects: 1, tasks: 1,
-            completed_entries: 1, unresolved_entries: 1,
+            completed_entries: 1, open_entries: 1,
         });
         // No business strings in the exposed diagnostics model.
         assert!(!format!("{result:?}").contains("CONFIDENTIAL"));
