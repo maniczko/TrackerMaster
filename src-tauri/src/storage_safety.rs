@@ -2,6 +2,7 @@
 //! The Node.js reference preview is intentionally not imported into production.
 
 use rusqlite::{params, Connection, Error, OpenFlags, Result};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,6 +100,35 @@ fn validate_database(db: &Connection) -> Result<()> {
         return Err(invalid());
     }
     Ok(())
+}
+
+/// Read-only health indicators. Never return client names, time-entry
+/// descriptions, paths, tokens or other business content to diagnostics.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DatabaseHealth {
+    pub schema_version: i64,
+    pub clients: i64,
+    pub projects: i64,
+    pub tasks: i64,
+    pub completed_entries: i64,
+    pub unresolved_entries: i64,
+}
+
+/// Validate the full database and then return only aggregate counts.
+/// Any integrity or relationship violation fails closed.
+pub fn diagnose_database(db: &Connection) -> Result<DatabaseHealth> {
+    validate_database(db)?;
+    let count = |query: &str| -> Result<i64> {
+        db.query_row(query, [], |row| row.get(0))
+    };
+    Ok(DatabaseHealth {
+        schema_version: db.pragma_query_value(None, "user_version", |row| row.get(0))?,
+        clients: count("SELECT COUNT(*) FROM clients")?,
+        projects: count("SELECT COUNT(*) FROM projects")?,
+        tasks: count("SELECT COUNT(*) FROM tasks")?,
+        completed_entries: count("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NOT NULL")?,
+        unresolved_entries: count("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL")?,
+    })
 }
 
 /// Consistent SQLite snapshot, including changes in WAL, without copying
@@ -265,6 +295,43 @@ mod tests {
         db.execute_batch("INSERT INTO projects(id,client_id,name) VALUES(99,999,'Orphan');").unwrap();
         drop(db);
         assert!(preflight_existing(&path).is_err());
+    }
+
+    #[test]
+    fn diagnostics_return_only_aggregates_and_do_not_modify_entries() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("
+          INSERT INTO clients(id,name) VALUES(1,'CONFIDENTIAL CUSTOMER');
+          INSERT INTO projects(id,client_id,name) VALUES(1,1,'CONFIDENTIAL PROJECT');
+          INSERT INTO tasks(id,project_id,name) VALUES(1,1,'CONFIDENTIAL TASK');
+          INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds)
+             VALUES(1,'2026-11-16T09:00:00Z','2026-11-16T09:01:00Z',60);
+          INSERT INTO time_entries(task_id,started_at)
+             VALUES(1,'2026-11-16T09:02:00Z');
+        ").unwrap();
+        let result = diagnose_database(&db).unwrap();
+        assert_eq!(result, DatabaseHealth {
+            schema_version: 3, clients: 1, projects: 1, tasks: 1,
+            completed_entries: 1, unresolved_entries: 1,
+        });
+        // No business strings in the exposed diagnostics model.
+        assert!(!format!("{result:?}").contains("CONFIDENTIAL"));
+        assert_eq!(db.query_row(
+            "SELECT COUNT(*) FROM time_entries", [], |row| row.get::<_, i64>(0)
+        ).unwrap(), 2);
+        assert_eq!(db.query_row(
+            "SELECT name FROM clients WHERE id=1", [], |row| row.get::<_, String>(0)
+        ).unwrap(), "CONFIDENTIAL CUSTOMER");
+    }
+
+    #[test]
+    fn diagnostics_fail_closed_for_broken_foreign_keys() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        db.execute_batch("INSERT INTO projects(id,client_id,name) VALUES(77,999,'Orphan');").unwrap();
+        assert!(diagnose_database(&db).is_err());
     }
 
     #[test]
