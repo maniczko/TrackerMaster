@@ -453,6 +453,13 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
             tracker.running_since = None;
             return Err("Wykryto zmianę zegara lub przerwę w pracy systemu. Pomiar wymaga weryfikacji; nie został zakończony.".into());
         }
+        if end_dt > start_dt {
+            if let Err(error) = ensure_no_overlap(&tx, start_dt.with_timezone(&Utc), end_dt.with_timezone(&Utc), Some(id)) {
+                drop(tx);
+                tracker.running_since = None;
+                return Err(format!("{error} Pomiar wymaga weryfikacji; nie został zakończony."));
+            }
+        }
         tx.execute("UPDATE time_entries SET ended_at=?1,duration_seconds=?2 WHERE id=?3 AND ended_at IS NULL",params![end,seconds,id]).map_err(db_err)?;
     } else if next_task.is_none() {
         return Err("Nie ma aktywnego pomiaru.".into());
@@ -461,6 +468,8 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
         if !tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?1 AND p.archived=0 AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=p.client_id))", [task_id], |r|r.get::<_,bool>(0)).map_err(db_err)? {
             return Err("Wybierz istniejące zadanie w niezarchiwizowanym projekcie.".into());
         }
+        let start = DateTime::parse_from_rfc3339(end).map_err(|_| "Niepoprawny czas systemowy.")?.with_timezone(&Utc);
+        ensure_no_overlap(&tx, start, DateTime::<Utc>::MAX_UTC, None).map_err(|_| "Nie można rozpocząć pomiaru: inny wpis trwa teraz lub znajduje się w przyszłości. Sprawdź zegar i historię.".to_string())?;
         tx.execute("INSERT INTO time_entries(task_id,started_at) VALUES(?1,?2)",params![task_id,end]).map_err(db_err)?;
     }
     let next_clock = if next_task.is_some() { Some(RunningClock { since: Instant::now(), power: power_sample()? }) } else { None };
@@ -535,6 +544,7 @@ fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -
     let (id, start) = active.ok_or("Nie ma pomiaru do odzyskania.")?;
     let start = DateTime::parse_from_rfc3339(&start).map_err(|_| "Niepoprawny zapis czasu w bazie.")?.with_timezone(&Utc);
     if end < start { return Err("Zakończenie nie może być przed rozpoczęciem pomiaru.".into()); }
+    if end > start { ensure_no_overlap(&tx, start, end, Some(id))?; }
     tx.execute("UPDATE time_entries SET ended_at=?1,duration_seconds=?2,manually_resolved=1 WHERE id=?3 AND ended_at IS NULL", params![end.to_rfc3339_opts(SecondsFormat::Millis, true), (end - start).num_seconds(), id]).map_err(db_err)?;
     tx.commit().map_err(db_err)
 }
@@ -920,6 +930,32 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn recovery_rejects_overlapping_history_and_allows_touching_end() {
+        let mut tracker = seeded();
+        tracker.db.execute_batch("INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600); INSERT INTO time_entries(id,task_id,started_at) VALUES(2,2,'2026-01-01T09:00:00Z');").unwrap();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(resolve_recovered(&mut tracker, "2026-01-01T10:30:00Z", current).is_err());
+        assert!(snapshot(&tracker).unwrap().active.is_some());
+        assert_eq!(snapshot(&tracker).unwrap().entries[0].duration_seconds, 3600);
+        resolve_recovered(&mut tracker, "2026-01-01T10:00:00Z", current).unwrap();
+        assert!(snapshot(&tracker).unwrap().active.is_none());
+        assert_eq!(snapshot(&tracker).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn timer_start_rejects_existing_future_entry_without_modifying_it() {
+        let mut tracker = seeded();
+        let start = Utc::now() + chrono::Duration::minutes(30);
+        let end = start + chrono::Duration::minutes(30);
+        tracker.db.execute("INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) VALUES(1,?1,?2,1800)", params![start.to_rfc3339(),end.to_rfc3339()]).unwrap();
+        assert!(close_active(&mut tracker, &now(), Some(2)).is_err());
+        let state = snapshot(&tracker).unwrap();
+        assert!(state.active.is_none());
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].duration_seconds, 1800);
     }
 
     #[test]
