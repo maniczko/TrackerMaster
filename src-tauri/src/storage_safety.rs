@@ -198,6 +198,7 @@ mod tests {
         let dir = path.with_extension("dir");
         let mut db = Connection::open(&path).unwrap();
         crate::initialise(&mut db).unwrap();
+        db.pragma_update(None, "journal_mode", "WAL").unwrap();
         db.execute_batch("
             INSERT INTO clients(id,name) VALUES(1,'Client');
             INSERT INTO projects(id,client_id,name) VALUES(1,1,'Project');
