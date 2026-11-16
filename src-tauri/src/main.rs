@@ -368,6 +368,28 @@ fn create_task(state: State<'_, Shared>, project_id: i64, name: String) -> Cmd<i
     Ok(tracker.db.last_insert_rowid())
 }
 
+// Rename only the existing entity: relationships and historical entries keep
+// their IDs. Compare the displayed name so stale windows cannot overwrite it.
+fn rename_entity(db: &Connection, kind: &str, id: i64, expected: &str, name: &str) -> Cmd<()> {
+    let name = valid_name(name)?;
+    let sql = match kind {
+        "client" => "UPDATE clients SET name=?1 WHERE id=?2 AND name=?3",
+        "project" => "UPDATE projects SET name=?1 WHERE id=?2 AND name=?3",
+        "task" => "UPDATE tasks SET name=?1 WHERE id=?2 AND name=?3",
+        _ => return Err("Nieznany rodzaj pozycji.".into()),
+    };
+    if db.execute(sql, params![name, id, expected]).map_err(db_err)? != 1 {
+        return Err("Pozycja zmieniła się lub już nie istnieje. Odśwież dane i spróbuj ponownie.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_item(state: State<'_, Shared>, kind: String, id: i64, expected_name: String, name: String) -> Cmd<()> {
+    let tracker = locked(&state)?;
+    rename_entity(&tracker.db, &kind, id, &expected_name, &name)
+}
+
 fn set_project_archived(db: &mut Connection, project_id: i64, archived: bool) -> Cmd<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     if archived && tx.query_row("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN tasks t ON t.id=e.task_id WHERE t.project_id=?1 AND e.ended_at IS NULL)", [project_id], |r| r.get::<_, bool>(0)).map_err(db_err)? {
@@ -836,7 +858,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,rename_item,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -868,6 +890,31 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn renaming_keeps_relationships_and_history_and_rejects_stale_updates() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let entry = add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        set_project_archived(&mut tracker.db, 1, true).unwrap();
+        rename_entity(&tracker.db, "client", 1, "A", " Nowy klient ").unwrap();
+        rename_entity(&tracker.db, "project", 1, "P", "Nowy projekt").unwrap();
+        rename_entity(&tracker.db, "task", 1, "T1", "Nowe zadanie").unwrap();
+        assert!(rename_entity(&tracker.db, "client", 1, "A", "Stara zmiana").is_err());
+        assert!(rename_entity(&tracker.db, "task", 1, "Nowe zadanie", "  ").is_err());
+        assert!(rename_entity(&tracker.db, "invalid", 1, "x", "y").is_err());
+        let s = snapshot(&tracker).unwrap();
+        assert_eq!(s.clients[0].name, "Nowy klient");
+        assert_eq!(s.projects[0].name, "Nowy projekt");
+        assert!(s.projects[0].archived);
+        let task = s.tasks.iter().find(|task| task.id == 1).unwrap();
+        assert_eq!(task.name, "Nowe zadanie");
+        assert_eq!(task.project_id, 1);
+        assert_eq!(s.entries[0].id, entry);
+        assert_eq!(s.entries[0].task_id, 1);
+        assert_eq!(s.entries[0].duration_seconds, 3600);
+        rename_entity(&tracker.db, "client", 1, "Nowy klient", "Poprawiona nazwa").unwrap();
     }
 
     #[test]

@@ -58,6 +58,7 @@ export default function App() {
   const [showArchived, setShowArchived] = useState(false);
   const [taskId, setTaskId] = useState('');
   const [names, setNames] = useState({ client: '', project: '', task: '' });
+  const [rename, setRename] = useState<{ kind: 'client' | 'project' | 'task'; id: Id; expected: string; name: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -97,6 +98,8 @@ export default function App() {
 
   const projects = data.projects.filter(p => same(p.client_id, clientId) && (showArchived || !p.archived));
   const selectedProject = data.projects.find(p => same(p.id, projectId));
+  const selectedClient = data.clients.find(c => same(c.id, clientId));
+  const selectedTask = data.tasks.find(t => same(t.id, taskId));
   const tasks = data.tasks.filter(t => same(t.project_id, projectId));
   const activeTask = data.tasks.find(t => same(t.id, data.active?.task_id));
   const activeProject = data.projects.find(p => same(p.id, activeTask?.project_id));
@@ -201,6 +204,9 @@ export default function App() {
         </section>
         <aside className="card setup"><div className="section-top"><div><p className="section-kicker">UPORZĄDKUJ PRACĘ</p><h2>Twoja struktura</h2></div><span className="outline-icon">＋</span></div><p className="muted">Dodaj klienta, a następnie utwórz projekt i zadanie.</p>
           {(['client', 'project', 'task'] as const).map((kind, index) => { const namesPL = { client: 'Klient', project: 'Projekt', task: 'Zadanie' }; const disabled = busy || !loaded || (kind === 'project' && !clientId) || (kind === 'task' && (!projectId || selectedProject?.archived)); return <form key={kind} className="create-form" onSubmit={create(kind)}><div className="form-label"><span className="step">0{index + 1}</span><label htmlFor={`new-${kind}`}>{namesPL[kind]}</label></div><div className="input-row"><input id={`new-${kind}`} value={names[kind]} disabled={disabled} onChange={e => setNames(old => ({ ...old, [kind]: e.target.value }))} placeholder={`Nazwa: ${namesPL[kind].toLowerCase()}`} maxLength={200} /><button disabled={disabled || !names[kind].trim()} aria-label={`Dodaj ${namesPL[kind].toLowerCase()}`}>＋</button></div>{kind === 'project' && !clientId && <small>Najpierw wybierz klienta</small>}{kind === 'task' && !projectId && <small>Najpierw wybierz projekt</small>}</form>; })}
+          <details><summary>Zmień nazwę</summary><p className="muted">Wybierz klienta, projekt lub zadanie w timerze, a następnie popraw jego nazwę. Historia pomiarów zostanie zachowana.</p><div className="actions">{([{ kind: 'client', item: selectedClient, label: 'Klient' }, { kind: 'project', item: selectedProject, label: 'Projekt' }, { kind: 'task', item: selectedTask, label: 'Zadanie' }] as const).map(({ kind, item, label }) => <button type="button" className="secondary" key={kind} disabled={busy || !loaded || !item} onClick={() => item && setRename({ kind, id: item.id, expected: item.name, name: item.name })}>{label}</button>)}</div>
+            {rename && <form className="create-form" onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('rename_item', { kind: rename.kind, id: Number(rename.id), expectedName: rename.expected, name: rename.name }); setRename(null); }, 'Nazwa została zmieniona.'); }}><label htmlFor="rename-item">Nowa nazwa dla: {rename.expected}</label><input id="rename-item" value={rename.name} maxLength={200} onChange={e => setRename({ ...rename, name: e.target.value })} /><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded || !rename.name.trim()}>Zapisz nazwę</button><button className="secondary" type="button" disabled={busy} onClick={() => setRename(null)}>Anuluj</button></div></form>}
+          </details>
         </aside>
       </div>
       <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} />
