@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 
 type Id = number | string;
-type DatabaseHealth = { schema_version: number; clients: number; projects: number; tasks: number; completed_entries: number; unresolved_entries: number };
+type DatabaseHealth = { schema_version: number; clients: number; projects: number; tasks: number; completed_entries: number; open_entries: number };
 type Client = { id: Id; name: string };
 type Project = { id: Id; client_id: Id; name: string; archived: boolean };
 type Task = { id: Id; project_id: Id; name: string };
@@ -111,7 +111,7 @@ export default function App() {
         </form></div>}
       {notice && <div role="status" className="alert success">{notice}</div>}
       {lastBackup && <div role="status" className="alert success">Lokalna kopia: <code>{lastBackup}</code>. Plik zawiera dane klientów i nie jest szyfrowany — przechowuj go bezpiecznie.</div>}
-      {dbHealth && <div role="status" className="alert success">Kontrola integralności: poprawna (schemat v{dbHealth.schema_version}). Klienci: {dbHealth.clients}, projekty: {dbHealth.projects}, zadania: {dbHealth.tasks}, zakończone wpisy: {dbHealth.completed_entries}, nierozstrzygnięte pomiary: {dbHealth.unresolved_entries}. Diagnostyka nie pokazuje nazw ani opisów klientów.</div>}
+      {dbHealth && <div role="status" className="alert success">Kontrola integralności: poprawna (schemat v{dbHealth.schema_version}). Klienci: {dbHealth.clients}, projekty: {dbHealth.projects}, zadania: {dbHealth.tasks}, zakończone wpisy: {dbHealth.completed_entries}, otwarte pomiary: {dbHealth.open_entries}. Diagnostyka nie pokazuje nazw ani opisów klientów.</div>}
       <div className="grid">
         <section className="timer card" aria-label="Pomiar czasu">
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered ? 'running' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
