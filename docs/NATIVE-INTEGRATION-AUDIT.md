@@ -66,3 +66,5 @@ Repo ma workflow `.github/workflows/windows-build.yml` wykonujący te kontrole n
 - `src/App.tsx`: przycisk **Sprawdź bazę**, wynik wyświetlany po pomyślnej kontroli. Wymagane są testy rzeczywistego GUI.
 - Testy Rust: poprawne agregaty i brak mutacji wpisów oraz odmowa wyniku przy złamanych kluczach obcych. Nie należy uznawać ich za PASS bez sprawdzenia odpowiadającego commitu w CI.
 - Powiązanie: DEV-14 (ochrona i diagnostyka); jest to częściowa implementacja, a nie odbiór wszystkich warunków DEV-14.
+
+Uściślenie semantyki: `open_entries` / „otwarte pomiary” oznacza wszystkie wpisy z `ended_at IS NULL` (zarówno aktywne, jak i wymagające odzyskania po restarcie); nie należy przedstawiać ich wszystkich jako błędne lub nierozstrzygnięte.
