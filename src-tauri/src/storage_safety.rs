@@ -2,6 +2,7 @@
 //! The Node.js reference preview is intentionally not imported into production.
 
 use rusqlite::{params, Connection, Error, OpenFlags, Result};
+use rusqlite::backup::{Backup, StepResult};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -174,6 +175,46 @@ pub fn create_backup(db: &Connection, app_data_dir: &Path) -> Result<PathBuf> {
     Ok(destination)
 }
 
+/// A frozen, validated copy of the selected file. The live database is not
+/// touched while the user inspects the prospective restore.
+pub struct PreparedRestore {
+    staged: Connection,
+    pub health: DatabaseHealth,
+}
+
+fn copy_database(source: &Connection, destination: &mut Connection) -> Result<()> {
+    let backup = Backup::new(source, destination)?;
+    // A single SQLite backup step holds a consistent read snapshot. If it
+    // cannot finish, dropping the handle rolls back the destination write.
+    if !matches!(backup.step(-1)?, StepResult::Done) { return Err(invalid()); }
+    Ok(())
+}
+
+pub fn prepare_restore(path: &Path) -> Result<PreparedRestore> {
+    if !path.is_file() { return Err(Error::InvalidPath(path.to_path_buf())); }
+    let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut staged = Connection::open_in_memory()?;
+    copy_database(&source, &mut staged)?;
+    validate_database(&staged)?;
+    // Migrate only the isolated copy, never the selected source file.
+    crate::initialise(&mut staged)?;
+    let health = diagnose_database(&staged)?;
+    Ok(PreparedRestore { staged, health })
+}
+
+/// The caller must hold the tracker lock and obtain explicit confirmation.
+/// SQLite rolls back an incomplete backup into the destination. A verified
+/// safety copy of the current data is created before replacement begins.
+pub fn restore_prepared(db: &mut Connection, prepared: &PreparedRestore, app_data_dir: &Path) -> Result<PathBuf> {
+    validate_database(db)?;
+    validate_database(&prepared.staged)?;
+    let running = db.query_row("SELECT EXISTS(SELECT 1 FROM time_entries WHERE ended_at IS NULL)", [], |row| row.get::<_, bool>(0))?;
+    if running { return Err(invalid()); }
+    let safety_copy = create_backup(db, app_data_dir)?;
+    copy_database(&prepared.staged, db)?;
+    Ok(safety_copy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +352,72 @@ mod tests {
         db.execute_batch("DROP TABLE entry_deletions;").unwrap();
         assert!(create_backup(&db, &dir).is_err());
         assert!(!dir.join("backups").exists());
+    }
+
+    #[test]
+    fn restore_uses_frozen_validated_copy_and_saves_previous_data() {
+        let source_path = test_path("restore-source");
+        let dest_path = test_path("restore-destination");
+        let _source_cleanup = Cleanup(source_path.clone());
+        let _dest_cleanup = Cleanup(dest_path.clone());
+        let dir = dest_path.with_extension("dir");
+        let mut source = Connection::open(&source_path).unwrap();
+        crate::initialise(&mut source).unwrap();
+        source.execute_batch("INSERT INTO clients VALUES(1,'Backup client'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO tasks VALUES(1,1,'T'); INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(1,'2026-01-02T00:00:00Z','2026-01-01T08:00:00Z','2026-01-01T09:00:00Z',3600,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_deletions VALUES(1,'2026-01-03T00:00:00Z'); INSERT INTO time_entries(id,task_id,started_at) VALUES(2,1,'2026-01-04T10:00:00Z');").unwrap();
+        let prepared = prepare_restore(&source_path).unwrap();
+        assert_eq!((prepared.health.clients, prepared.health.completed_entries, prepared.health.open_entries), (1, 0, 1));
+        source.execute("UPDATE clients SET name='Changed after preview' WHERE id=1", []).unwrap();
+        let mut dest = Connection::open(&dest_path).unwrap();
+        crate::initialise(&mut dest).unwrap();
+        dest.execute("INSERT INTO clients VALUES(1,'Current client')", []).unwrap();
+        let safety = restore_prepared(&mut dest, &prepared, &dir).unwrap();
+        assert_eq!(dest.query_row("SELECT name FROM clients WHERE id=1", [], |r| r.get::<_,String>(0)).unwrap(), "Backup client");
+        assert_eq!(dest.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(dest.query_row("SELECT COUNT(*) FROM entry_deletions", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(dest.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        let previous = Connection::open_with_flags(&safety, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(previous.query_row("SELECT name FROM clients WHERE id=1", [], |r| r.get::<_,String>(0)).unwrap(), "Current client");
+        preflight_existing(&safety).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_or_newer_files_and_active_destination() {
+        let source_path = test_path("restore-valid");
+        let dest_path = test_path("restore-active");
+        let invalid_path = test_path("restore-invalid");
+        let _source_cleanup = Cleanup(source_path.clone());
+        let _dest_cleanup = Cleanup(dest_path.clone());
+        let _invalid_cleanup = Cleanup(invalid_path.clone());
+        let dir = dest_path.with_extension("dir");
+        std::fs::write(&invalid_path, b"not a database").unwrap();
+        assert!(prepare_restore(&invalid_path).is_err());
+        let mut source = Connection::open(&source_path).unwrap();
+        crate::initialise(&mut source).unwrap();
+        source.pragma_update(None, "user_version", 6).unwrap();
+        assert!(prepare_restore(&source_path).is_err());
+        source.pragma_update(None, "user_version", 5).unwrap();
+        let prepared = prepare_restore(&source_path).unwrap();
+        let mut dest = Connection::open(&dest_path).unwrap();
+        crate::initialise(&mut dest).unwrap();
+        dest.execute_batch("INSERT INTO clients VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO tasks VALUES(1,1,'T'); INSERT INTO time_entries(task_id,started_at) VALUES(1,'2026-01-01T10:00:00Z');").unwrap();
+        assert!(restore_prepared(&mut dest, &prepared, &dir).is_err());
+        assert_eq!(dest.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        assert!(!dir.join("backups").exists());
+    }
+
+    #[test]
+    fn interrupted_sqlite_copy_rolls_back_destination() {
+        let source = Connection::open_in_memory().unwrap();
+        source.execute_batch("CREATE TABLE replacement(payload BLOB); INSERT INTO replacement VALUES(zeroblob(262144));").unwrap();
+        let mut destination = Connection::open_in_memory().unwrap();
+        destination.execute_batch("CREATE TABLE original(value TEXT); INSERT INTO original VALUES('kept');").unwrap();
+        {
+            let backup = Backup::new(&source, &mut destination).unwrap();
+            assert!(matches!(backup.step(1).unwrap(), StepResult::More));
+            // Dropping an unfinished operation must not publish partial pages.
+        }
+        assert_eq!(destination.query_row("SELECT value FROM original", [], |r| r.get::<_,String>(0)).unwrap(), "kept");
+        assert!(!destination.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='replacement')", [], |r| r.get::<_,bool>(0)).unwrap());
     }
 
     #[test]
