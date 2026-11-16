@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod storage_safety;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -112,6 +114,16 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
 fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
     let tracker = locked(&state)?;
     snapshot(&tracker)
+}
+
+#[tauri::command]
+fn create_backup(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<String> {
+    let data_dir = app.path().app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu danych aplikacji.".to_string())?;
+    let tracker = locked(&state)?;
+    storage_safety::create_backup(&tracker.db, &data_dir)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| "Nie udało się utworzyć ani zweryfikować kopii bazy danych.".into())
 }
 
 #[tauri::command]
@@ -441,7 +453,13 @@ fn main() {
                 })?;
                 app.manage(guard);
             }
-            let mut db = Connection::open(dir.join("tracker.sqlite3"))?;
+            let database_path = dir.join("tracker.sqlite3");
+            storage_safety::preflight_existing(&database_path).map_err(|err| {
+                #[cfg(windows)]
+                show_start_error("Baza danych nie przeszła kontroli integralności lub brakuje jej wymaganych tabel. Nie zmieniaj pliku; użyj sprawdzonej kopii.");
+                err
+            })?;
+            let mut db = Connection::open(&database_path)?;
             initialise(&mut db).map_err(|err| {
                 #[cfg(windows)]
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
@@ -498,7 +516,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,create_backup,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
