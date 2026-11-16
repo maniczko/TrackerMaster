@@ -23,6 +23,34 @@ pub fn preflight_existing(path: &Path) -> Result<()> {
     validate_database(&db)
 }
 
+/// The index name and UNIQUE/PARTIAL flags alone are insufficient:
+/// an index on task_id would allow multiple simultaneous active tasks.
+pub fn validate_timer_index(db: &Connection) -> Result<()> {
+    let (unique, partial, sql): (i64, i64, String) = db.query_row(
+        "SELECT il.\"unique\", il.partial, sm.sql
+         FROM pragma_index_list('time_entries') AS il
+         JOIN sqlite_master AS sm ON sm.name=il.name AND sm.type='index'
+         WHERE il.name='one_running_timer'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if unique != 1 || partial != 1 {
+        return Err(invalid());
+    }
+    // The native schema intentionally indexes a constant 1 for *all*
+    // unfinished entries; validate this actual definition rather than its name.
+    let normalized: String = sql.chars()
+        .filter(|c| !c.is_ascii_whitespace() && !matches!(*c, '"' | '`' | '[' | ']'))
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if !normalized.trim_end_matches(';')
+        .ends_with("ontime_entries((1))whereended_atisnull")
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn validate_database(db: &Connection) -> Result<()> {
     let integrity: String =
         db.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
@@ -49,14 +77,7 @@ fn validate_database(db: &Connection) -> Result<()> {
     }
     if version >= 3 {
         db.prepare("SELECT archived FROM projects LIMIT 0")?;
-        let index_ok: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_index_list('time_entries') WHERE name='one_running_timer' AND \"unique\"=1 AND partial=1)",
-            [],
-            |row| row.get(0),
-        )?;
-        if !index_ok {
-            return Err(invalid());
-        }
+        validate_timer_index(db)?;
     }
     // A PRAGMA integrity_check does not detect broken relationships, and
     // stored data may have been written with foreign_keys disabled.
@@ -216,6 +237,34 @@ mod tests {
         let running: i64 = copied.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |row| row.get(0)).unwrap();
         assert_eq!((entries, running), (2, 1));
         assert_eq!(copied.query_row("SELECT SUM(duration_seconds) FROM time_entries", [], |row| row.get::<_, i64>(0)).unwrap(), 3600);
+    }
+
+    #[test]
+    fn existing_current_schema_with_wrong_unique_index_is_rejected() {
+        let path = test_path("wrong-index");
+        let _cleanup = Cleanup(path.clone());
+        let mut db = Connection::open(&path).unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("
+            DROP INDEX one_running_timer;
+            CREATE UNIQUE INDEX one_running_timer ON time_entries(task_id)
+              WHERE ended_at IS NULL;
+        ").unwrap();
+        drop(db);
+        // A unique index on task_id is not a single-running-timer constraint.
+        assert!(preflight_existing(&path).is_err());
+    }
+
+    #[test]
+    fn existing_current_schema_with_orphaned_foreign_key_is_rejected() {
+        let path = test_path("bad-fk");
+        let _cleanup = Cleanup(path.clone());
+        let mut db = Connection::open(&path).unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        db.execute_batch("INSERT INTO projects(id,client_id,name) VALUES(99,999,'Orphan');").unwrap();
+        drop(db);
+        assert!(preflight_existing(&path).is_err());
     }
 
     #[test]
