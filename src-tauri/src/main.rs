@@ -94,6 +94,10 @@ struct DeletedEntry { id: i64, task_id: i64, started_at: String, ended_at: Strin
 struct EntryRevision { id: i64, changed_at: String, before_start: String, before_end: String, before_seconds: i64, after_start: String, after_end: String, after_seconds: i64 }
 #[derive(Serialize)]
 struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>, active: Option<Active>, entries: Vec<Entry> }
+#[derive(Serialize)]
+struct ReportActive { id: i64, task_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool }
+#[derive(Serialize)]
+struct ReportData { entries: Vec<Entry>, active: Option<ReportActive> }
 
 fn now() -> String { Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true) }
 fn valid_name(name: &str) -> Cmd<&str> {
@@ -138,6 +142,40 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
 fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
     let tracker = locked(&state)?;
     snapshot(&tracker)
+}
+
+// Unlike the history preview, a report must include every non-deleted entry.
+// The active interval is only a provisional projection and is withheld whenever
+// sleep, a clock change, a restart, or an unavailable power sample is detected.
+fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample>) -> Cmd<ReportData> {
+    ensure_available(tracker)?;
+    let entries = tracker.db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id").map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)? })).map_err(db_err)?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let row: Option<(i64, i64, String)> = tracker.db.query_row("SELECT id,task_id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(db_err)?;
+    let active = row.map(|(id, task_id, started_at)| {
+        let projection = tracker.running_since.as_ref().and_then(|clock| {
+            let power = power.as_ref().ok()?;
+            if sleep_or_invalid(clock.power, *power) { return None; }
+            let start = DateTime::parse_from_rfc3339(&started_at).ok()?;
+            let wall_ms = current.timestamp_millis().checked_sub(start.timestamp_millis())?;
+            if wall_ms < 0 { return None; }
+            let wall = wall_ms / 1_000;
+            let elapsed = i64::try_from(clock.since.elapsed().as_secs()).ok()?;
+            if wall < 0 || (wall - elapsed).abs() > 2 { return None; }
+            Some((current.to_rfc3339_opts(SecondsFormat::Millis, true), wall))
+        });
+        let unresolved = projection.is_none();
+        let (ended_at, duration_seconds) = match projection { Some((end, duration)) => (Some(end), Some(duration)), None => (None, None) };
+        ReportActive { id, task_id, started_at, ended_at, duration_seconds, unresolved }
+    });
+    Ok(ReportData { entries, active })
+}
+
+#[tauri::command]
+fn get_report_data(state: State<'_, Shared>) -> Cmd<ReportData> {
+    let tracker = locked(&state)?;
+    report_data(&tracker, Utc::now(), power_sample())
 }
 
 #[tauri::command]
@@ -759,7 +797,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,archive_project,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -791,6 +829,37 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn reports_include_full_history_but_exclude_deleted_entries() {
+        let tracker = seeded();
+        tracker.db.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<501) INSERT INTO time_entries(task_id,started_at,ended_at,duration_seconds) SELECT 1,'2026-01-01T10:00:00Z','2026-01-01T10:01:00Z',60 FROM n; INSERT INTO entry_deletions(entry_id,deleted_at) VALUES(1,'2026-01-02T00:00:00Z');").unwrap();
+        let report = report_data(&tracker, Utc::now(), Err("no clock".into())).unwrap();
+        assert_eq!(report.entries.len(), 500);
+        assert!(report.entries.iter().all(|entry| entry.id != 1));
+        assert_eq!(snapshot(&tracker).unwrap().entries.len(), 500);
+        tracker.db.execute("DELETE FROM entry_deletions WHERE entry_id=1", []).unwrap();
+        assert_eq!(report_data(&tracker, Utc::now(), Err("no clock".into())).unwrap().entries.len(), 501);
+        assert_eq!(snapshot(&tracker).unwrap().entries.len(), 500);
+    }
+
+    #[test]
+    fn reports_withhold_active_projection_after_sleep_or_restart() {
+        let mut tracker = seeded();
+        let current = Utc::now();
+        let start = current.to_rfc3339_opts(SecondsFormat::Millis, true);
+        tracker.db.execute("INSERT INTO time_entries(task_id,started_at) VALUES(1,?1)", [&start]).unwrap();
+        let base = PowerSample { total_ms: 10_000, awake_ms: 8_000 };
+        let recovered = report_data(&tracker, current, Ok(base)).unwrap().active.unwrap();
+        assert!(recovered.unresolved && recovered.duration_seconds.is_none());
+        tracker.running_since = Some(RunningClock { since: Instant::now(), power: base });
+        let live = report_data(&tracker, current, Ok(base)).unwrap().active.unwrap();
+        assert!(!live.unresolved && live.duration_seconds == Some(0));
+        let slept = report_data(&tracker, current, Ok(PowerSample { total_ms: 15_000, awake_ms: 8_000 })).unwrap().active.unwrap();
+        assert!(slept.unresolved && slept.ended_at.is_none());
+        assert!(report_data(&tracker, current, Err("clock".into())).unwrap().active.unwrap().unresolved);
+        assert!(report_data(&tracker, current + chrono::Duration::hours(1), Ok(base)).unwrap().active.unwrap().unresolved);
     }
 
     #[test]

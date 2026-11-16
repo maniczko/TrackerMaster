@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
+import Report from './Report';
 
 type Id = number | string;
 type Client = { id: Id; name: string };
@@ -202,6 +203,7 @@ export default function App() {
           {(['client', 'project', 'task'] as const).map((kind, index) => { const namesPL = { client: 'Klient', project: 'Projekt', task: 'Zadanie' }; const disabled = busy || !loaded || (kind === 'project' && !clientId) || (kind === 'task' && (!projectId || selectedProject?.archived)); return <form key={kind} className="create-form" onSubmit={create(kind)}><div className="form-label"><span className="step">0{index + 1}</span><label htmlFor={`new-${kind}`}>{namesPL[kind]}</label></div><div className="input-row"><input id={`new-${kind}`} value={names[kind]} disabled={disabled} onChange={e => setNames(old => ({ ...old, [kind]: e.target.value }))} placeholder={`Nazwa: ${namesPL[kind].toLowerCase()}`} maxLength={200} /><button disabled={disabled || !names[kind].trim()} aria-label={`Dodaj ${namesPL[kind].toLowerCase()}`}>＋</button></div>{kind === 'project' && !clientId && <small>Najpierw wybierz klienta</small>}{kind === 'task' && !projectId && <small>Najpierw wybierz projekt</small>}</form>; })}
         </aside>
       </div>
+      <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} />
       <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta, projekt i zadanie powyżej, a następnie podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
           <form onSubmit={e => { e.preventDefault(); const start = parseLocalDate(manualStart); const end = parseLocalDate(manualEnd); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('create_manual_entry', { taskId: Number(taskId), startedAt: start.toISOString(), endedAt: end.toISOString() }); setManualStart(''); setManualEnd(''); }, 'Wpis czasu został dodany.'); }}>

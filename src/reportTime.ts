@@ -45,9 +45,22 @@ export function reportByWarsawDay(entries: ReportEntry[], from: string, through:
     const hasOffsets = /(?:Z|[+-]\d\d:\d\d)$/i.test(entry.started_at) && /(?:Z|[+-]\d\d:\d\d)$/i.test(entry.ended_at);
     // Bounds avoid ambiguous historical calendar transitions and excessive work.
     if (!hasOffsets || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start ||
-        end - start > 3660 * 86400_000 || !Number.isSafeInteger(entry.duration_seconds) ||
-        entry.duration_seconds < 0 || Math.floor((end - start) / 1000) !== entry.duration_seconds) {
+        end - start > 3660 * 86400_000 || !Number.isSafeInteger(entry.duration_seconds) || entry.duration_seconds < 0) {
       excludedEntryIds.push(entry.id);
+      continue;
+    }
+    const firstDay = localDate(start);
+    const lastDay = localDate(Math.max(start, end - 1));
+    if (lastDay < from || firstDay > through) continue;
+    const difference = Math.abs(Math.floor((end - start) / 1000) - entry.duration_seconds);
+    if (difference !== 0) {
+      // A normal timer uses a monotonic clock and can differ by up to two
+      // seconds from wall time. Within one day its destination is unambiguous.
+      if (difference <= 2 && end > start && firstDay === lastDay) {
+        if (entry.duration_seconds > 0) totals.set(firstDay, (totals.get(firstDay) ?? 0) + entry.duration_seconds);
+      } else {
+        excludedEntryIds.push(entry.id);
+      }
       continue;
     }
     let cursor = start;

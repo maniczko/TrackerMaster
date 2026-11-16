@@ -34,9 +34,17 @@ test('averages only days with recorded work, including weekends', () => {
 });
 
 test('excludes inconsistent, malformed and timezone-free records', () => {
-  const data = [entry(1, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 3599), entry(2, 'bad', '2026-01-01T11:00:00Z', 0), entry(3, '2026-01-01T10:00:00', '2026-01-01T11:00:00', 3600)];
+  const data = [entry(1, '2026-01-01T22:50:00Z', '2026-01-01T23:10:00Z', 1199), entry(2, 'bad', '2026-01-01T11:00:00Z', 0), entry(3, '2026-01-01T10:00:00', '2026-01-01T11:00:00', 3600)];
   assert.deepEqual(range(data).excludedEntryIds, [1, 2, 3]);
   assert.equal(range(data).totalSeconds, 0);
+});
+
+test('uses measured duration for small single-day clock differences and ignores other months', () => {
+  const data = [entry(1, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 3599), entry(2, '2026-02-01T22:50:00Z', '2026-02-01T23:10:00Z', 1199)];
+  const result = range(data, '2026-01-01', '2026-01-31');
+  assert.equal(result.totalSeconds, 3599);
+  assert.deepEqual(result.excludedEntryIds, []);
+  assert.deepEqual(range(data, '2026-02-01', '2026-02-02').excludedEntryIds, [2]);
 });
 
 test('rejects invalid dates and duplicate source entries', () => {
