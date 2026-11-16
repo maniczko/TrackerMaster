@@ -58,3 +58,11 @@ Repo ma workflow `.github/workflows/windows-build.yml` wykonujący te kontrole n
 - Sama obecność indeksu `one_running_timer` z oznaczeniem UNIQUE/PARTIAL nie wystarcza do ochrony. Nowy walidator weryfikuje jego rzeczywistą definicję `ON time_entries((1)) WHERE ended_at IS NULL`; indeks `ON time_entries(task_id) WHERE ended_at IS NULL` musi być odrzucony.
 - Dodano testy Rust: błędna definicja indeksu, osierocony projekt naruszający FK oraz regresja w `initialise`. Stan w repo to **kod i testy do uruchomienia**; nie przyznawano PASS bez wyniku `cargo test`.
 - GitHub PR #1 pozostaje wersją roboczą. W chwili aktualizacji odczyt przez konektor nie zwrócił potwierdzonych wyników workflow/checks dla najnowszej gałęzi. Sprawdzenie testów w GitHub Actions i niezależny odbiór Windows pozostają obowiązkowe.
+
+## Natywna diagnostyka danych — 16.11.2026
+
+- `src-tauri/src/storage_safety.rs`: `diagnose_database` najpierw wywołuje pełną walidację `integrity_check`, relacji i wersji schematu, a następnie zwraca **wyłącznie agregaty**: liczba klientów, projektów, zadań, wpisów zakończonych i wpisów wymagających rozstrzygnięcia. Funkcja nie modyfikuje wpisów.
+- `src-tauri/src/main.rs`: nowa komenda IPC `diagnose_database` ze zwięzłym komunikatem błędu (bez ujawniania nazwy klienta).
+- `src/App.tsx`: przycisk **Sprawdź bazę**, wynik wyświetlany po pomyślnej kontroli. Wymagane są testy rzeczywistego GUI.
+- Testy Rust: poprawne agregaty i brak mutacji wpisów oraz odmowa wyniku przy złamanych kluczach obcych. Nie należy uznawać ich za PASS bez sprawdzenia odpowiadającego commitu w CI.
+- Powiązanie: DEV-14 (ochrona i diagnostyka); jest to częściowa implementacja, a nie odbiór wszystkich warunków DEV-14.
