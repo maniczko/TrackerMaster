@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
 import ShortcutSettings from './ShortcutSettings';
+import { parseLocalDate } from './localDateTime';
 
 type Id = number | string;
 type Client = { id: Id; name: string; archived: boolean };
@@ -36,22 +37,6 @@ const localInputValue = (value: string) => {
 const formatPreciseDate = (value: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'medium' });
-};
-const parseLocalDate = (value: string) => {
-  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
-  if (!parts) return null;
-  const date = new Date(value);
-  const expected = parts.slice(1).map(part => Number(part || 0));
-  const actual = [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()];
-  if (Number.isNaN(date.getTime()) || actual.some((part, index) => part !== expected[index])) return null;
-  // A repeated local time at the end of daylight saving does not identify one instant.
-  for (let minutes = -180; minutes <= 180; minutes++) {
-    if (minutes === 0) continue;
-    const other = new Date(date.getTime() + minutes * 60_000);
-    const components = [other.getFullYear(), other.getMonth() + 1, other.getDate(), other.getHours(), other.getMinutes(), other.getSeconds()];
-    if (components.every((part, index) => part === expected[index])) return null;
-  }
-  return date;
 };
 
 export default function App() {
@@ -191,7 +176,7 @@ export default function App() {
       {error && <div role="alert" className="alert error">{error}</div>}
       {!loaded && <div role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie przed wykonaniem kolejnej operacji. <button type="button" disabled={busy} onClick={retryRefresh}>Ponów odczyt</button></div>}
       {loaded && data.active?.recovered && <div role="alert" className="alert error"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto: {formatDate(data.active.started_at)}. Podaj faktyczny czas zakończenia. Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.
-        <form onSubmit={e => { e.preventDefault(); const end = new Date(recoveryEnd); if (!recoveryEnd || Number.isNaN(end.getTime())) { setError('Podaj poprawną datę zakończenia.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
+        <form onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
           <label>Data i godzina zakończenia <input type="datetime-local" step="1" required value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
           <button type="submit" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
         </form></div>}
