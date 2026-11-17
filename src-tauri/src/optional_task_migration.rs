@@ -3,6 +3,55 @@
 //! The caller must create and verify a backup before calling this for an
 //! existing database. The transaction preserves entry IDs and all references.
 use rusqlite::{params, Connection, Error, OptionalExtension, Result, TransactionBehavior};
+use chrono::{DateTime, Utc};
+use std::time::Instant;
+
+pub enum TimerAction<'a> {
+    Stop,
+    Start { project_id: i64, task_id: Option<i64>, description: &'a str },
+    Resume { entry_id: i64 },
+}
+
+/// Change the single running timer, including taskless project timers, in one
+/// transaction. A stale UI, archived target, overlapping time or failed write
+/// leaves the prior persisted timer intact.
+pub fn transition(tracker: &mut crate::Tracker, expected: Option<i64>, at: &str, action: TimerAction<'_>) -> std::result::Result<(), String> {
+    crate::ensure_available(tracker)?;
+    let elapsed = tracker.running_since.as_ref().map(|clock| clock.since.elapsed().as_secs() as i64);
+    let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(crate::db_err)?;
+    let active: Option<(i64, i64, Option<i64>, String)> = tx.query_row("SELECT id,project_id,task_id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(crate::db_err)?;
+    if active.as_ref().map(|a| a.0) != expected { return Err("Pomiar zmienił się w innym oknie. Odśwież dane i spróbuj ponownie.".into()); }
+    let resume = matches!(action, TimerAction::Resume { .. });
+    let target: Option<(i64, Option<i64>, String, Option<bool>)> = match action {
+        TimerAction::Stop => None,
+        TimerAction::Start { project_id, task_id, description } => Some((project_id,task_id,description.to_string(),None)),
+        TimerAction::Resume { entry_id } => Some(tx.query_row("SELECT project_id,task_id,COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=e.id),''),EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e WHERE e.id=?1 AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,Some(r.get(3)?)))).optional().map_err(crate::db_err)?.ok_or("Wpis do wznowienia nie istnieje lub został usunięty.")?),
+    };
+    if let Some((project_id,task_id,description,_)) = &target { crate::valid_description(description)?; target_billing(&tx,*project_id,*task_id)?; }
+    if let Some((id, active_project, active_task, started)) = active {
+        let seconds = elapsed.ok_or("Pomiar wymaga ręcznego ustalenia czasu zakończenia.")?;
+        let uncertain = match crate::power_sample() { Ok(end_power) => crate::sleep_or_invalid(tracker.running_since.as_ref().unwrap().power,end_power), Err(_) => true };
+        if uncertain { drop(tx); tracker.running_since=None; return Err("Wykryto przerwę w pracy systemu lub błąd zegara. Pomiar wymaga weryfikacji; nie został zakończony.".into()); }
+        if !resume && target.as_ref().is_some_and(|t| t.0==active_project && t.1==active_task) { return Ok(()); }
+        let start = DateTime::parse_from_rfc3339(&started).map_err(|_| "Niepoprawny zapis czasu w bazie.")?;
+        let end = DateTime::parse_from_rfc3339(at).map_err(|_| "Niepoprawny czas systemowy.")?;
+        let wall = end.signed_duration_since(start).num_seconds();
+        if wall < 0 || (wall-seconds).abs()>2 { drop(tx); tracker.running_since=None; return Err("Wykryto zmianę zegara lub przerwę w pracy systemu. Pomiar wymaga weryfikacji; nie został zakończony.".into()); }
+        if end>start {
+            if let Err(error)=crate::ensure_no_overlap(&tx,start.with_timezone(&Utc),end.with_timezone(&Utc),Some(id)) { drop(tx); tracker.running_since=None; return Err(format!("{error} Pomiar wymaga weryfikacji; nie został zakończony.")); }
+        }
+        tx.execute("UPDATE time_entries SET ended_at=?1,duration_seconds=?2 WHERE id=?3 AND ended_at IS NULL",params![at,seconds,id]).map_err(crate::db_err)?;
+    } else if target.is_none() { return Err("Nie ma aktywnego pomiaru.".into()); }
+    if let Some((project_id,task_id,description,billable)) = &target {
+        let start=DateTime::parse_from_rfc3339(at).map_err(|_| "Niepoprawny czas systemowy.")?.with_timezone(&Utc);
+        crate::ensure_no_overlap(&tx,start,DateTime::<Utc>::MAX_UTC,None).map_err(|_| "Nie można rozpocząć pomiaru: inny wpis trwa teraz lub znajduje się w przyszłości. Sprawdź zegar i historię.".to_string())?;
+        insert_running(&tx,*project_id,*task_id,at,description,*billable)?;
+    }
+    let next_clock = if target.is_some() { Some(crate::RunningClock { since: Instant::now(), power: crate::power_sample()? }) } else { None };
+    tx.commit().map_err(crate::db_err)?;
+    tracker.running_since = next_clock;
+    Ok(())
+}
 
 /// Validate the user's explicit project and optional task inside the same write
 /// transaction as a timer start. Return the project's current billing default.
@@ -186,5 +235,33 @@ mod tests {
         let id = { let tx = db.transaction().unwrap(); let id = insert_running(&tx,1,None,"2026-01-01T10:00:00Z","Opis",None).unwrap(); tx.commit().unwrap(); id };
         let row: (i64,Option<i64>,String,bool) = db.query_row("SELECT project_id,task_id,(SELECT description FROM entry_descriptions WHERE entry_id=time_entries.id),EXISTS(SELECT 1 FROM billable_entries WHERE entry_id=time_entries.id) FROM time_entries WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(row,(1,None,"Opis".to_string(),true));
+    }
+
+    #[test]
+    fn project_timer_switch_resume_and_stale_state_are_atomic() {
+        let mut db=Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'),(2,1,'Inny'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO billable_projects VALUES(1);").unwrap();
+        migrate(&mut db).unwrap();
+        let mut tracker=crate::Tracker { db, running_since:None, restored:false };
+        transition(&mut tracker,None,&crate::now(),TimerAction::Start { project_id:1,task_id:None,description:"Bez zadania" }).unwrap();
+        let id:i64=tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get(0)).unwrap();
+        assert!(transition(&mut tracker,None,&crate::now(),TimerAction::Start { project_id:2,task_id:None,description:"Błędny stan" }).is_err());
+        assert!(transition(&mut tracker,Some(id),&crate::now(),TimerAction::Start { project_id:2,task_id:Some(1),description:"Zły projekt" }).is_err());
+        assert_eq!(tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),id);
+        tracker.db.execute_batch("CREATE TRIGGER reject_entry BEFORE INSERT ON time_entries BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+        assert!(transition(&mut tracker,Some(id),&crate::now(),TimerAction::Start { project_id:2,task_id:None,description:"Nowy" }).is_err());
+        assert_eq!(tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),id);
+        assert!(tracker.running_since.is_some());
+        tracker.db.execute_batch("DROP TRIGGER reject_entry;").unwrap();
+        transition(&mut tracker,Some(id),&crate::now(),TimerAction::Start { project_id:2,task_id:None,description:"Nowy" }).unwrap();
+        let second:i64=tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get(0)).unwrap();
+        transition(&mut tracker,Some(second),&crate::now(),TimerAction::Resume { entry_id:id }).unwrap();
+        let restored:(i64,Option<i64>,String,bool)=tracker.db.query_row("SELECT project_id,task_id,(SELECT description FROM entry_descriptions WHERE entry_id=e.id),EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e WHERE ended_at IS NULL",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(restored,(1,None,"Bez zadania".into(),true));
+        let third:i64=tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get(0)).unwrap();
+        transition(&mut tracker,Some(third),&crate::now(),TimerAction::Stop).unwrap();
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries",[],|r|r.get::<_,i64>(0)).unwrap(),3);
     }
 }
