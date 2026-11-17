@@ -1220,6 +1220,23 @@ fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: 
     initialise(db)
 }
 
+// Reuse the same schema capabilities for global shortcuts as normal project
+// starts. v12 adds sleep-period storage without removing v11 project timers.
+fn start_project_from_shortcut(tracker: &mut Tracker, project_id: i64, task_id: Option<i64>, at: &str) -> Cmd<()> {
+    let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    match version {
+        11 | 12 => optional_task_migration::transition(
+            tracker, None, at,
+            optional_task_migration::TimerAction::Start { project_id, task_id, description: "" },
+        ),
+        10 => match task_id {
+            Some(task_id) => close_active(tracker, at, Some(task_id)),
+            None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()),
+        },
+        _ => Err("Nie można odczytać wersji bazy danych.".into()),
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| {
@@ -1240,11 +1257,7 @@ fn main() {
             let result = match snapshot(&tracker) {
                 Ok(current) if current.active.is_some() => close_active(&mut tracker, &now(), None),
                 Ok(_) => match (hotkey.project_id,hotkey.task_id) {
-                    (Some(project_id),task_id) => match tracker.db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)) {
-                        Ok(11) => optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id,task_id,description:"" }),
-                        Ok(10) => match task_id { Some(task_id) => close_active(&mut tracker,&now(),Some(task_id)), None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()) },
-                        _ => Err("Nie można odczytać wersji bazy danych.".into()),
-                    },
+                    (Some(project_id), task_id) => start_project_from_shortcut(&mut tracker, project_id, task_id, &now()),
                     (None,Some(task_id)) => close_active(&mut tracker, &now(), Some(task_id)),
                     (None,None) => Err("Wybierz projekt w mini timerze przed użyciem skrótu.".into()),
                 },
@@ -1387,6 +1400,23 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_shortcut_starts_project_after_v12_sleep_migration() {
+        for task_id in [None, Some(1)] {
+            let mut tracker = seeded();
+            initialise(&mut tracker.db).unwrap();
+            let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+            assert_eq!(version, 12);
+            start_project_from_shortcut(&mut tracker, 1, task_id, &now()).unwrap();
+            let active = snapshot(&tracker).unwrap().active.expect("Shortcut should create one running entry");
+            assert_eq!(active.project_id, 1);
+            assert_eq!(active.task_id, task_id);
+            let number: i64 = tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).unwrap();
+            assert_eq!(number, 1);
+        }
     }
 
     #[test]
