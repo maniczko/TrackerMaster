@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeExportRows, exportCsv, spreadsheetText, formatDuration } from '../src/reportCsv.ts';
+import { makeExportRows, makeClientExportRows, exportCsv, spreadsheetText, formatDuration } from '../src/reportCsv.ts';
 
 const entry = { id: 7, client: 'Klient', project: 'Projekt', task: '', description: 'Zażółć; "tekst"\nlinia', started_at: '2026-01-31T23:30:00Z', ended_at: '2026-02-01T00:30:00Z', duration_seconds: 3600, billable: true };
 
@@ -27,4 +27,24 @@ test('refuses inconsistent records rather than silently exporting a partial repo
   assert.throws(() => makeExportRows([{ ...entry, duration_seconds: 100 }], '2026-01-01', '2026-02-01', 'UTC'));
   const zero = { ...entry, started_at: '2026-02-01T01:00:00Z', ended_at: '2026-02-01T01:00:00Z', duration_seconds: 0 };
   assert.equal(makeExportRows([zero], '2026-02-01', '2026-02-01', 'UTC').length, 1);
+});
+
+test('fails closed on duplicate or invalid IDs, preventing double-counting in CSV', () => {
+  const dateFrom = '2026-01-01', dateTo = '2026-02-01', zone = 'UTC';
+  assert.throws(() => makeExportRows([entry, { ...entry, duration_seconds: 3600 }], dateFrom, dateTo, zone), /powtórzony identyfikator/);
+  assert.throws(() => makeExportRows([{ ...entry, id: 0 }], dateFrom, dateTo, zone), /identyfikator/);
+  assert.throws(() => makeExportRows([{ ...entry, id: Number.NaN }], dateFrom, dateTo, zone), /identyfikator/);
+  // A duplicate outside the selected period is also rejected, rather than
+  // silently trusting a malformed response for this client's export.
+  assert.throws(() => makeExportRows([entry, { ...entry, started_at: '2025-12-01T00:00:00Z', ended_at: '2025-12-01T01:00:00Z' }], dateFrom, dateTo, zone));
+});
+
+test('refuses to mix clients in the selected client CSV preview', () => {
+  const other = { ...entry, id: 8, client: 'Inny klient' };
+  assert.throws(() => makeClientExportRows([entry, other], 'Klient', '2026-01-01', '2026-02-01', 'UTC'), /innego klienta/);
+  assert.throws(() => makeClientExportRows([entry], '', '2026-01-01', '2026-02-01', 'UTC'), /innego klienta/);
+  assert.deepEqual(makeClientExportRows([entry], 'Klient', '2026-01-01', '2026-02-01', 'UTC'),
+    makeExportRows([entry], '2026-01-01', '2026-02-01', 'UTC'));
+  // No mutation of source records when rejecting the response.
+  assert.equal(other.client, 'Inny klient');
 });
