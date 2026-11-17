@@ -16,9 +16,9 @@ export function makeExportRows(entries: ExportEntry[], from: string, through: st
     ids.add(entry.id);
   }
   return entries.flatMap(source => {
-    if (source.sleep_periods?.some(period => period.decision === 'pending')) throw new Error(`Wpis #${source.id} zawiera nierozstrzygnięty czas uśpienia.`);
     const result = reportByDay([source], from, through, zone);
     if (result.excludedEntryIds.length) throw new Error(`Wpis #${source.id} wymaga poprawienia przed eksportem.`);
+    if (source.sleep_periods?.some(period => period.decision === 'pending')) return [];
     const zeroLengthDate = Date.parse(source.started_at) === Date.parse(source.ended_at) && source.duration_seconds === 0
       ? dateInZone(Date.parse(source.started_at), zone) : null;
     return result.totalSeconds > 0 || (zeroLengthDate !== null && zeroLengthDate >= from && zeroLengthDate <= through)

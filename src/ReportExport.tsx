@@ -38,7 +38,7 @@ export default function ReportExport({ client, from, through, zone }: { client: 
 
   return <section className="report-export" aria-label="Eksport CSV">
     <h3>Eksport CSV klienta</h3>
-    <p className="muted">Wybierz jednego klienta i zakres raportu, a następnie sprawdź podgląd. Aktywny pomiar nie jest eksportowany.</p>
+    <p className="muted">Wybierz jednego klienta i zakres raportu, a następnie sprawdź podgląd. Plik obejmuje zakończone wpisy z rozstrzygniętymi przerwami.</p>
     <button type="button" className="secondary report-button" disabled={!client || !zone || busy} onClick={() => void prepare()}>{busy ? 'Przygotowywanie…' : 'Przygotuj podgląd CSV'}</button>
     {error && <div role="alert" className="alert error">{error}</div>}
     {current && <div className="export-preview">

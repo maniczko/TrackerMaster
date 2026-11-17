@@ -53,7 +53,11 @@ test('does not export entries with pending sleep and preserves one row after a d
   const start = Date.parse(entry.started_at);
   const sleep = { id:1, entryId:entry.id, startedMs:start+600000, endedMs:start+1200000, decision:'pending' as const };
   const pending = {...entry, duration_seconds:3000, sleep_periods:[sleep]};
-  assert.throws(() => makeExportRows([pending], '2026-01-01', '2026-02-01', 'UTC'), /nierozstrzygnięty/);
+  assert.deepEqual(makeExportRows([pending], '2026-01-01', '2026-02-01', 'UTC'), []);
+  const completed = { ...entry, id: entry.id + 1 };
+  const mixed = makeExportRows([pending, completed], '2026-01-01', '2026-02-01', 'UTC');
+  assert.deepEqual(mixed.map(row => row.source.id), [completed.id]);
+  assert.equal(mixed[0].contribution, 3600);
   const excluded = {...pending, sleep_periods:[{...sleep,decision:'excluded' as const}]};
   const rows = makeExportRows([excluded], '2026-01-01', '2026-02-01', 'UTC');
   assert.equal(rows.length, 1);
