@@ -38,7 +38,7 @@ export default function Widget() {
   const choices = useMemo(() => (data?.tasks ?? []).flatMap(task => {
     const project = data?.projects.find(item => same(item.id, task.project_id));
     const client = data?.clients.find(item => same(item.id, project?.client_id));
-    return project && !project.archived && client && !client.archived ? [{ task, project, client }] : [];
+    return project && !project.archived && client && !client.archived && !task.archived ? [{ task, project, client }] : [];
   }), [data]);
   const latest = data?.active?.task_id ?? data?.entries[0]?.task_id;
   const choiceId = selected || (choices.some(item => same(item.task.id, latest)) ? String(latest) : '');
