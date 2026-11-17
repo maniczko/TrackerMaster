@@ -541,6 +541,79 @@ mod tests {
     }
 
     #[test]
+    fn transfer_to_another_machine_replaces_not_merges_and_preserves_rollback() {
+        // Independent application installations with distinct SQLite files and
+        // independent app-data directories; no production paths or accounts.
+        let a_path = test_path("machine-a");
+        let b_path = test_path("machine-b");
+        let transfer = test_path("usb-transfer");
+        let corrupt_transfer = test_path("corrupt-transfer");
+        let _a_cleanup = Cleanup(a_path.clone());
+        let _b_cleanup = Cleanup(b_path.clone());
+        let _transfer_cleanup = Cleanup(transfer.clone());
+        let _corrupt_cleanup = Cleanup(corrupt_transfer.clone());
+        let a_data = a_path.with_extension("dir");
+        let b_data = b_path.with_extension("dir");
+
+        let mut a = Connection::open(&a_path).unwrap();
+        crate::initialise(&mut a).unwrap();
+        a.pragma_update(None, "journal_mode", "WAL").unwrap();
+        a.execute_batch("
+            INSERT INTO clients(id,name) VALUES(1,'Client A'),(2,'Client B');
+            INSERT INTO projects(id,client_id,name) VALUES(11,1,'Same project'),(22,2,'Same project');
+            INSERT INTO tasks(id,project_id,name) VALUES(111,11,'Task A'),(222,22,'Task B');
+            INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds)
+              VALUES(1001,111,11,'2026-11-16T09:00:00Z','2026-11-16T10:00:00Z',3600);
+            INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds)
+              VALUES(2002,222,22,'2026-11-16T10:00:00Z','2026-11-16T10:30:00Z',1800);
+            INSERT INTO entry_descriptions(entry_id,description) VALUES(1001,'Preserved text');
+            INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds)
+              VALUES(1001,'2026-11-16T12:00:00Z','2026-11-16T08:00:00Z','2026-11-16T09:00:00Z',3600,'2026-11-16T09:00:00Z','2026-11-16T10:00:00Z',3600);
+            INSERT INTO billable_entries(entry_id) VALUES(1001);
+        ").unwrap();
+        let backup_a = create_backup(&a, &a_data).unwrap();
+        assert_eq!(std::fs::copy(&backup_a, &transfer).unwrap(), std::fs::metadata(&backup_a).unwrap().len());
+        // A's later changes must not leak into the frozen, transported backup.
+        a.execute("INSERT INTO clients(id,name) VALUES(3,'Created after export')", []).unwrap();
+        let preview = prepare_restore(&transfer).unwrap();
+        assert_eq!((preview.health.clients, preview.health.projects, preview.health.completed_entries, preview.health.open_entries), (2, 2, 2, 0));
+
+        let mut b = Connection::open(&b_path).unwrap();
+        crate::initialise(&mut b).unwrap();
+        b.pragma_update(None, "journal_mode", "WAL").unwrap();
+        b.execute_batch("
+            INSERT INTO clients(id,name) VALUES(77,'Only on destination');
+            INSERT INTO projects(id,client_id,name) VALUES(77,77,'Local project');
+            INSERT INTO tasks(id,project_id,name) VALUES(77,77,'Local task');
+            INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds)
+              VALUES(777,77,77,'2026-11-15T10:00:00Z','2026-11-15T10:15:00Z',900);
+        ").unwrap();
+        // A corrupted transfer is refused before replacing B's valid data.
+        std::fs::write(&corrupt_transfer, b"corrupted transfer").unwrap();
+        assert!(prepare_restore(&corrupt_transfer).is_err());
+        assert_eq!(b.query_row("SELECT name FROM clients WHERE id=77", [], |r| r.get::<_, String>(0)).unwrap(), "Only on destination");
+
+        let rollback_b = restore_prepared(&mut b, &preview, &b_data).unwrap();
+        preflight_existing(&rollback_b).unwrap();
+        assert_eq!(diagnose_database(&b).unwrap().clients, 2);
+        assert_eq!(b.query_row("SELECT COUNT(*) FROM clients WHERE name='Created after export'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(b.query_row("SELECT COUNT(*) FROM clients WHERE name='Only on destination'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(b.query_row("SELECT SUM(duration_seconds) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 5400);
+        assert_eq!(b.query_row("SELECT COUNT(*) FROM entry_revisions WHERE entry_id=1001", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(b.query_row("SELECT description FROM entry_descriptions WHERE entry_id=1001", [], |r| r.get::<_, String>(0)).unwrap(), "Preserved text");
+        assert_eq!(b.query_row("SELECT COUNT(*) FROM billable_entries WHERE entry_id=1001", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+
+        // B's previous history is not merged, but the safety copy permits
+        // explicit recovery of the exact old data after replacement.
+        let old_b = prepare_restore(&rollback_b).unwrap();
+        assert_eq!((old_b.health.clients, old_b.health.completed_entries), (1, 1));
+        let rollback_db = &old_b.staged;
+        assert_eq!(rollback_db.query_row("SELECT name FROM clients WHERE id=77", [], |r| r.get::<_, String>(0)).unwrap(), "Only on destination");
+        assert_eq!(rollback_db.query_row("SELECT duration_seconds FROM time_entries WHERE id=777", [], |r| r.get::<_, i64>(0)).unwrap(), 900);
+        assert_eq!(a.query_row("SELECT COUNT(*) FROM clients", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+    }
+
+    #[test]
     fn backup_refuses_invalid_source_without_publishing_file() {
         let path = test_path("invalid-source");
         let _cleanup = Cleanup(path.clone());
