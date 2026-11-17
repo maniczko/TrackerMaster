@@ -6,6 +6,7 @@ import type { Snapshot } from './App';
 export default function Widget() {
   const [data, setData] = useState<Snapshot | null>(null);
   const [selected, setSelected] = useState('');
+  const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [onTop, setOnTop] = useState(false);
@@ -67,11 +68,11 @@ export default function Widget() {
     setBusy(true); setError('');
     try {
       if (data.active) await invoke('widget_stop', { entryId: Number(data.active.id) });
-      else await invoke('widget_start', { taskId: Number(choice!.task.id) });
+      else { await invoke('widget_start', { taskId: Number(choice!.task.id), description: draft }); setDraft(''); }
       await refresh();
     } catch (e) { await refresh(); setError(`Nie udało się wykonać operacji: ${String(e)}`); }
     finally { setBusy(false); }
-  }, [busy, data, choice, refresh]);
+  }, [busy, data, choice, draft, refresh]);
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       if (!shortcut.registered && event.ctrlKey && event.shiftKey && !event.altKey && event.code === 'Space' && !event.repeat) { event.preventDefault(); void toggle(); }
@@ -89,7 +90,7 @@ export default function Widget() {
     <div className="mini-bar">
       <button className="mini-drag" title="Przeciągnij widget" aria-label="Przeciągnij widget" onMouseDown={e => { if (e.button === 0) void invoke('widget_drag'); }}>⠿</button>
       <div className="mini-details">
-        <div className="mini-title" title={choice?.task.name}>{choice?.task.name || 'Nad czym pracujesz?'}</div>
+        <input className="mini-title mini-description" aria-label="Opis pomiaru" placeholder="Nad czym pracujesz?" maxLength={2000} value={data?.active ? data.active.description : draft} readOnly={!!data?.active} disabled={!data || busy} onChange={e => setDraft(e.target.value)} title={data?.active ? 'Opis zmienisz w pełnej aplikacji' : 'Opcjonalny opis pomiaru'} />
         <button className="mini-project" disabled={!data || !!data.active} onClick={() => void setPanel(!open)} aria-expanded={open} title={data?.active ? 'Zatrzymaj pomiar, aby zmienić zadanie' : choice ? `${choice.client.name} / ${choice.project.name}` : 'Wybierz projekt lub zadanie'}><span className="mini-plus">＋</span><span>{choice ? `${choice.client.name} / ${choice.project.name}` : 'Projekt lub zadanie'}</span></button>
       </div>
       <span className="mini-time" title={data?.active?.recovered ? 'Pomiar wymaga weryfikacji w aplikacji' : 'Czas bieżącego pomiaru'}>{!data || data.active?.recovered ? '—:—:—' : formatDuration(Number.isFinite(elapsed) ? elapsed : 0)}</span>
