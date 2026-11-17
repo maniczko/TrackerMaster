@@ -48,3 +48,15 @@ test('refuses to mix clients in the selected client CSV preview', () => {
   // No mutation of source records when rejecting the response.
   assert.equal(other.client, 'Inny klient');
 });
+
+test('does not export entries with pending sleep and preserves one row after a decision', () => {
+  const start = Date.parse(entry.started_at);
+  const sleep = { id:1, entryId:entry.id, startedMs:start+600000, endedMs:start+1200000, decision:'pending' as const };
+  const pending = {...entry, duration_seconds:3000, sleep_periods:[sleep]};
+  assert.throws(() => makeExportRows([pending], '2026-01-01', '2026-02-01', 'UTC'), /nierozstrzygnięty/);
+  const excluded = {...pending, sleep_periods:[{...sleep,decision:'excluded' as const}]};
+  const rows = makeExportRows([excluded], '2026-01-01', '2026-02-01', 'UTC');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].contribution, 3000);
+  assert.equal(rows[0].source.id, entry.id);
+});

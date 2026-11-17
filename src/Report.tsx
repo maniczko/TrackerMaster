@@ -13,7 +13,7 @@ type Id = number | string;
 type Client = { id: Id; name: string };
 type Project = { id: Id; client_id: Id; name: string };
 type Completed = ReportEntry & { task_id: number | null; project_id: number; billable: boolean };
-type Active = { id: number; task_id: number | null; project_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean; billable: boolean };
+type Active = { sleep_periods?: ReportEntry['sleep_periods']; id: number; task_id: number | null; project_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean; billable: boolean };
 type Data = { entries: Completed[]; active: Active | null; time_zone: string };
 
 function todayWarsaw() {
@@ -89,7 +89,7 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
       if (!validTimeZone(data.time_zone)) return { invalidZone: true as const };
       const completed = reportByDay(entries, range.from, range.through, data.time_zone);
       const activeEntry = active && !active.unresolved && active.ended_at !== null && active.duration_seconds !== null
-        ? { id: active.id, started_at: active.started_at, ended_at: active.ended_at, duration_seconds: active.duration_seconds, billable: active.billable } : null;
+        ? { id: active.id, started_at: active.started_at, ended_at: active.ended_at, duration_seconds: active.duration_seconds, billable: active.billable, sleep_periods: active.sleep_periods } : null;
       const combined = reportByDay(activeEntry ? [...entries, activeEntry] : entries, range.from, range.through, data.time_zone);
       const billableSeconds = reportByDay([...entries.filter(entry => entry.billable), ...(activeEntry?.billable ? [activeEntry] : [])], range.from, range.through, data.time_zone).totalSeconds;
       const overlaps = reportOverlaps(activeEntry ? [...entries, activeEntry] : entries, range.from, range.through, data.time_zone);
@@ -115,6 +115,7 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
       {result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <>
         {(result.combined.excludedEntryIds.length > 0 || result.missingRelations) && <div role="alert" className="alert error"><strong>Raport jest niepełny.</strong> {result.combined.excludedEntryIds.length > 0 && <>Nie można bezpiecznie przypisać czasu do dni dla wpisów: {result.combined.excludedEntryIds.join(', ')}. Sprawdź je w historii. </>}{result.missingRelations && 'Brakuje powiązania części wpisów z klientem.'}</div>}
         {result.overlaps.entryIds.length > 0 && <div role="alert" className="alert error"><strong>Wykryto nakładające się pomiary.</strong> Suma może uwzględniać ten sam czas więcej niż raz. Sprawdź wpisy: {result.overlaps.entryIds.map(id => `#${id}`).join(', ')}{result.overlaps.truncated ? ' i być może kolejne' : ''}. <div className="actions">{data?.entries.filter(entry => result.overlaps.entryIds.includes(entry.id)).map(entry => <button type="button" className="secondary" key={entry.id} onClick={() => onEditEntry(entry)}>Popraw wpis #{entry.id}</button>)}</div>{result.active && result.overlaps.entryIds.includes(result.active.id) && <p>Zatrzymaj aktywny pomiar, aby go poprawić.</p>}</div>}
+        {result.combined.pendingSeconds > 0 && <div role="status" className="alert"><strong>Uśpienie do rozstrzygnięcia: {duration(result.combined.pendingSeconds)}.</strong> Ten czas nie jest uwzględniony w pracy ani rozliczeniach.</div>}
         {result.active?.unresolved && <div role="alert" className="alert error">Aktywny pomiar wymaga weryfikacji lub sprawdzenia zegara. Nie jest doliczany do raportu.</div>}
         <div className="report-summary"><div><small>Łącznie{result.combined.excludedEntryIds.length || result.missingRelations ? ' — niepełne' : ''}</small><strong>{duration(result.combined.totalSeconds)}</strong></div><div><small>Średnio na dzień z pracą</small><strong>{result.combined.averageSeconds === null ? 'Brak danych' : duration(result.combined.averageSeconds)}</strong></div><div><small>Czas rozliczalny</small><strong>{duration(result.billableSeconds)}</strong><small>{result.combined.totalSeconds ? `${new Intl.NumberFormat('pl-PL', { maximumFractionDigits: 1 }).format(100 * result.billableSeconds / result.combined.totalSeconds)}% czasu` : 'Brak danych'}</small></div><div><small>W tym aktywny pomiar · orientacyjnie</small><strong>{duration(result.activeSeconds)}</strong></div></div>
         {result.active && !result.active.unresolved && <p className="muted">Aktywny pomiar jest tymczasowy i aktualizuje się co kilka sekund.</p>}
