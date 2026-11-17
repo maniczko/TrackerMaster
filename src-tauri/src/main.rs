@@ -144,7 +144,7 @@ fn entry_project_sql(db: &Connection, alias: &str) -> Cmd<String> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     match version {
         10 => Ok(format!("(SELECT project_id FROM tasks WHERE id={alias}.task_id)")),
-        11 => Ok(format!("{alias}.project_id")),
+        11 | 12 => Ok(format!("{alias}.project_id")),
         _ => Err("Nieobsługiwana wersja bazy danych.".into()),
     }
 }
@@ -569,7 +569,7 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
 
 fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Option<i64>, description: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
-    if version == 11 {
+    if version == 11 || version == 12 {
         let active: Option<i64> = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r|r.get(0)).optional().map_err(db_err)?;
         let action = match next_task {
             Some(task_id) => {
@@ -651,7 +651,7 @@ fn change_timer(tracker: &mut Tracker, end: &str, next_task: Option<i64>, descri
 
 fn resume_saved_entry(tracker: &mut Tracker, source_id: i64, expected_active_id: Option<i64>, at: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r|r.get(0)).map_err(db_err)?;
-    if version == 11 { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
+    if version == 11 || version == 12 { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
     if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != expected_active_id { return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into()); }
     change_timer(tracker, at, None, "", Some(source_id))
 }
@@ -863,7 +863,7 @@ fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended
 
 fn add_manual_entry_with_description(tracker: &mut Tracker, task_id: i64, started_at: &str, ended_at: &str, current: DateTime<Utc>, description: &str) -> Cmd<i64> {
     let version: i64=tracker.db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(db_err)?;
-    if version == 11 {
+    if version == 11 || version == 12 {
         let project_id: Option<i64>=tracker.db.query_row("SELECT project_id FROM tasks WHERE id=?1",[task_id],|r|r.get(0)).optional().map_err(db_err)?;
         return optional_task_migration::insert_manual(tracker,project_id.ok_or("Nie znaleziono zadania.")?,Some(task_id),started_at,ended_at,current,description);
     }
@@ -1126,11 +1126,14 @@ fn initialise_v10(db: &mut Connection) -> rusqlite::Result<()> {
 fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = db.pragma_query_value(None,"user_version",|r|r.get(0))?;
-    if version > 11 { return Err(rusqlite::Error::InvalidQuery); }
+    if version > 12 { return Err(rusqlite::Error::InvalidQuery); }
     if version <= 10 {
         initialise_v10(db)?;
         optional_task_migration::migrate(db)?;
     }
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version == 11 { sleep_periods::migrate(db)?; }
+    sleep_periods::validate(db)?;
     validate_schema(db)?;
     validate_revisions_schema(db)?;
     validate_deletions_schema(db)?;
@@ -1147,7 +1150,7 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
 // A failed backup prevents migration; a new installation needs no backup.
 fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: bool) -> rusqlite::Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if existing && (0..11).contains(&version) {
+    if existing && (0..12).contains(&version) {
         storage_safety::create_backup(db, dir)?;
     }
     initialise(db)
@@ -1688,7 +1691,7 @@ mod tests {
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         initialise_with_backup(&mut tracker.db, &dir, true).unwrap();
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 12);
         let backups: Vec<_> = std::fs::read_dir(dir.join("backups")).unwrap().map(|entry| entry.unwrap().path()).collect();
         assert_eq!(backups.len(), 1);
         storage_safety::preflight_existing(&backups[0]).unwrap();

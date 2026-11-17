@@ -1,4 +1,4 @@
--- Storage foundation for D4. Not installed into existing databases yet.
+-- D4 sleep periods. Installed only after a verified backup of existing data.
 -- Times are UTC Unix milliseconds; intervals are half-open [start, end).
 CREATE TABLE sleep_periods (
     id INTEGER PRIMARY KEY,

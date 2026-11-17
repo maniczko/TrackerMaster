@@ -1,5 +1,5 @@
-//! Storage operations for sleep decisions. Not yet wired into application startup
-//! or Windows power notifications; existing databases are not modified by this module.
+//! Storage operations and schema migration for sleep decisions.
+//! Windows power notifications and user decisions are not yet wired.
 
 use chrono::DateTime;
 use rusqlite::{params, Connection, Error, OptionalExtension, Result, TransactionBehavior};
@@ -39,7 +39,7 @@ pub fn validate(db: &Connection) -> Result<()> {
 
 /// Migrate a verified v11 database in one transaction. The caller must create
 /// and verify a backup of an existing database before invoking this function.
-/// It is deliberately not connected to app startup until native tests pass.
+/// The result requires native migration and backup tests before release.
 pub fn migrate(db: &mut Connection) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
