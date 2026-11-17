@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatDuration, same } from './App';
 import type { Snapshot } from './App';
+import { defaultShortcut, matchesShortcut, shortcutLabel } from './shortcut';
 
 const taskCountLabel = (count: number) => count === 1 ? 'zadanie' : count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 12 || count % 100 > 14) ? 'zadania' : 'zadań';
 
@@ -13,7 +14,7 @@ export default function Widget() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [onTop, setOnTop] = useState(false);
-  const [shortcut, setShortcut] = useState({ registered: false, message: '' });
+  const [shortcut, setShortcut] = useState({ registered: false, message: '', shortcut: defaultShortcut });
   const [now, setNow] = useState(Date.now());
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -53,7 +54,7 @@ export default function Widget() {
   const choice = choices.find(item => item.key === choiceKey);
   useEffect(() => { void invoke('set_shortcut_task', { projectId: choice ? Number(choice.project.id) : null, taskId: choice?.task ? Number(choice.task.id) : null }); }, [choice?.project.id, choice?.task?.id]);
   useEffect(() => {
-    const check = () => { void invoke<{ registered: boolean; message: string }>('shortcut_status').then(setShortcut).catch(() => {}); };
+    const check = () => { void invoke<{ registered: boolean; message: string; shortcut: string }>('shortcut_status').then(next => setShortcut({ ...next, shortcut: next.shortcut || defaultShortcut })).catch(() => {}); };
     check(); const timer = window.setInterval(check, 1500); return () => window.clearInterval(timer);
   }, []);
   const elapsed = data?.active ? (now - new Date(data.active.started_at).getTime()) / 1000 : 0;
@@ -94,11 +95,17 @@ export default function Widget() {
   }, []);
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
-      if (!shortcut.registered && event.ctrlKey && event.shiftKey && !event.altKey && event.code === 'Space' && !event.repeat) { event.preventDefault(); void toggle(); }
+      if (!shortcut.registered && matchesShortcut(event, shortcut.shortcut)) {
+        event.preventDefault();
+        void invoke<{ registered: boolean; message: string; shortcut: string }>('shortcut_status').then(next => {
+          setShortcut({ ...next, shortcut: next.shortcut || defaultShortcut });
+          if (!next.registered && next.shortcut === shortcut.shortcut) void toggleRef.current();
+        }).catch(() => setError('Nie udało się sprawdzić skrótu. Użyj przycisku Start / Stop.'));
+      }
       if (event.key === 'Escape' && open) { event.preventDefault(); void setPanel(false); }
     };
     window.addEventListener('keydown', handleKey); return () => window.removeEventListener('keydown', handleKey);
-  }, [toggle, open, setPanel, shortcut.registered]);
+  }, [toggle, open, setPanel, shortcut.registered, shortcut.shortcut]);
   async function changePin() {
     try { await invoke('set_widget_on_top', { onTop: !onTop }); setOnTop(!onTop); localStorage.setItem('widget-on-top', String(!onTop)); }
     catch { setError('Nie udało się zmienić przypięcia okna.'); }
@@ -113,7 +120,7 @@ export default function Widget() {
         <button className="mini-project" disabled={!data || !!data.active} onClick={() => void setPanel(!open)} aria-expanded={open} title={data?.active ? 'Zatrzymaj pomiar, aby zmienić zadanie' : choice ? `${choice.client.name} / ${choice.project.name}` : 'Wybierz projekt lub zadanie'}><span className="mini-plus">＋</span><span>{choice ? `${choice.client.name} / ${choice.project.name}` : 'Projekt lub zadanie'}</span></button>
       </div>
       <span className="mini-time" title={data?.active?.recovered ? 'Pomiar wymaga weryfikacji w aplikacji' : 'Czas bieżącego pomiaru'}>{!data || data.active?.recovered ? '—:—:—' : formatDuration(Number.isFinite(elapsed) ? elapsed : 0)}</span>
-      <button className={`mini-play ${data?.active ? 'is-running' : ''}`} aria-label={data?.active ? 'Zatrzymaj pomiar' : 'Rozpocznij pomiar'} title={shortcut.registered ? "Start / stop · Ctrl + Shift + Spacja globalnie" : "Start / stop · Ctrl + Shift + Spacja w tym oknie"} disabled={busy || !data || !!data.active?.recovered || (!data.active && !choice)} onClick={() => void toggle()}>{data?.active ? <span className="mini-stop-icon" /> : <span className="mini-play-icon" />}</button>
+      <button className={`mini-play ${data?.active ? 'is-running' : ''}`} aria-label={data?.active ? 'Zatrzymaj pomiar' : 'Rozpocznij pomiar'} title={`Start / stop · ${shortcutLabel(shortcut.shortcut)} ${shortcut.registered ? 'globalnie' : 'w tym oknie'}`} disabled={busy || !data || !!data.active?.recovered || (!data.active && !choice)} onClick={() => void toggle()}>{data?.active ? <span className="mini-stop-icon" /> : <span className="mini-play-icon" />}</button>
       <button className="mini-icon mini-expand" onClick={showApp} title="Otwórz pełną aplikację" aria-label="Otwórz pełną aplikację">⤢</button>
       <button className="mini-close" onClick={() => invoke('close_widget')} title="Zamknij widget" aria-label="Zamknij widget">×</button>
     </div>
