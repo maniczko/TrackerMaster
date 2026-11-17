@@ -321,4 +321,24 @@ mod tests {
         crate::initialise(&mut db).unwrap();
         assert_eq!(db.query_row("SELECT COUNT(*) FROM time_entries",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
+
+    #[test]
+    fn existing_v10_gets_verified_backup_before_v11_migration() {
+        use std::time::{SystemTime,UNIX_EPOCH};
+        let suffix=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir=std::env::temp_dir().join(format!("tracker-v11-migration-{}-{suffix}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut db=Connection::open(dir.join("live.sqlite3")).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(41,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_descriptions VALUES(41,'Zachowany opis');").unwrap();
+        crate::initialise_with_backup(&mut db,&dir,true).unwrap();
+        let backups:Vec<_>=std::fs::read_dir(dir.join("backups")).unwrap().map(|entry|entry.unwrap().path()).collect();
+        assert_eq!(backups.len(),1);
+        crate::storage_safety::preflight_existing(&backups[0]).unwrap();
+        let old=Connection::open_with_flags(&backups[0],rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(old.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),10);
+        assert_eq!(old.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(),"Zachowany opis");
+        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),11);
+        assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
 }
