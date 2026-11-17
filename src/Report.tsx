@@ -120,7 +120,7 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
         {result.active && !result.active.unresolved && <p className="muted">Aktywny pomiar jest tymczasowy i aktualizuje się co kilka sekund.</p>}
         {result.combined.days.length === 0 ? <p className="muted">Brak zakończonych lub aktywnych pomiarów w wybranym zakresie.</p> : <div className="table-wrap"><table><thead><tr><th>Dzień</th><th>Czas</th></tr></thead><tbody>{result.combined.days.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
       </>}
-      {data && result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <ReportExport client={client} from={range.from} through={range.through} zone={data.time_zone} />}
+      {data && result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <ReportExport key={JSON.stringify([client, range.from, range.through, data.time_zone])} client={client} from={range.from} through={range.through} zone={data.time_zone} />}
     </>}
   </section>;
 }
