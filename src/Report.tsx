@@ -57,10 +57,14 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   }, [open, loaded, refresh]);
 
   useEffect(() => {
-    if (!open || preset === 'custom') return;
-    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    const zone = data?.time_zone;
+    if (!open || preset === 'custom' || !zone || !validTimeZone(zone)) return;
+    const timer = window.setInterval(() => {
+      const current = Date.now();
+      setNow(previous => dateInZone(previous, zone) === dateInZone(current, zone) ? previous : current);
+    }, 1000);
     return () => window.clearInterval(timer);
-  }, [open, preset]);
+  }, [open, preset, data?.time_zone]);
 
   const range = useMemo(() => preset !== 'custom' && data && validTimeZone(data.time_zone)
     ? reportPresetRange(preset, now, data.time_zone) : { from, through }, [preset, now, data, from, through]);
