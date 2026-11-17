@@ -2,6 +2,8 @@ name: Windows test build
 
 on:
   push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -13,6 +15,36 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Reject tracked SQLite data files
+        shell: pwsh
+        run: |
+          $databaseFiles = @(git ls-files | Where-Object { $_ -match '(?i)\.(?:db|sqlite3?)(?:-(?:wal|shm|journal)|\.partial)?
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Check frontend
+        run: npm run build
+      - name: Check report calculations
+        run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts tests/reportPresets.test.ts tests/reportFilterStorage.test.ts tests/reportCsv.test.ts
+      - name: Run Rust tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build Windows executable
+        run: npm run tauri -- build --no-bundle
+      - name: Save unsigned test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackerMaster-Windows-unsigned-test
+          path: src-tauri/target/release/tracker-master.exe
+          if-no-files-found: error
+          retention-days: 7
+ })
+          if ($databaseFiles.Count -gt 0) {
+            $databaseFiles | ForEach-Object { Write-Host "Tracked database file: $_" }
+            throw 'Refusing to build a commit containing SQLite database files.'
+          }
       - uses: actions/setup-node@v4
         with:
           node-version: 24
