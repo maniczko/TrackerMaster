@@ -10,7 +10,7 @@ type Id = number | string;
 type Client = { id: Id; name: string; archived: boolean };
 type Project = { id: Id; client_id: Id; name: string; archived: boolean; billable: boolean };
 type Task = { id: Id; project_id: Id; name: string; archived: boolean };
-type Entry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null; recovered?: boolean; uncertain?: boolean; manually_resolved?: boolean; billable: boolean; description: string };
+type Entry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null; recovered?: boolean; uncertain?: boolean; excluded_sleep_ms?: number; manually_resolved?: boolean; billable: boolean; description: string };
 type DeletedEntry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string; duration_seconds: number; deleted_at: string };
 type Revision = { id: Id; changed_at: string; before_start: string; before_end: string; before_seconds: number; after_start: string; after_end: string; after_seconds: number };
 type BillingRevision = { id: Id; changed_at: string; before_billable: boolean; after_billable: boolean };
@@ -99,7 +99,7 @@ export default function App() {
   const activeTask = data.tasks.find(t => same(t.id, data.active?.task_id));
   const activeProject = data.projects.find(p => same(p.id, data.active?.project_id));
   const activeClient = data.clients.find(c => same(c.id, activeProject?.client_id));
-  const elapsed = data.active ? Math.max(0, (now - new Date(data.active.started_at).getTime()) / 1000) : 0;
+  const elapsed = data.active ? Math.max(0, (now - new Date(data.active.started_at).getTime() - (data.active.excluded_sleep_ms ?? 0)) / 1000) : 0;
   const displayElapsed = Number.isFinite(elapsed) ? elapsed : 0;
   const entries = useMemo(() => [...data.entries].sort((a, b) => b.started_at.localeCompare(a.started_at)), [data.entries]);
 
@@ -176,7 +176,7 @@ export default function App() {
       <div className="heading"><div><p className="eyebrow">TWÓJ DZIEŃ PRACY</p><h1>Rejestracja czasu</h1><p className="subtitle">Wybierz projekt i skup się na pracy. Resztą zajmie się licznik.</p></div><div className="date">{new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())}</div></div>
       {error && <div role="alert" className="alert error">{error}</div>}
       {!loaded && <div role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie przed wykonaniem kolejnej operacji. <button type="button" disabled={busy} onClick={retryRefresh}>Ponów odczyt</button></div>}
-      {loaded && data.active?.uncertain && !data.active.recovered && <div role="alert" className="alert error"><strong>Nie można wiarygodnie wyświetlić czasu pomiaru.</strong> Przyczyną mogło być uśpienie komputera lub zmiana zegara. Po zatrzymaniu pomiar będzie wymagał ręcznej weryfikacji; obecna wersja nie rozlicza automatycznie okresu uśpienia.</div>}
+      {loaded && data.active?.uncertain && !data.active.recovered && <div role="alert" className="alert error"><strong>Nie można wiarygodnie wyświetlić czasu pomiaru.</strong> Przyczyną mogło być uśpienie komputera lub zmiana zegara. Sprawdź okresy uśpienia i zegar przed rozliczeniem pomiaru.</div>}
       {loaded && data.active?.recovered && <div role="alert" className="alert error"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto: {formatDate(data.active.started_at)}. Podaj faktyczny czas zakończenia. Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.
         <form onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
           <label>Data i godzina zakończenia <input type="datetime-local" step="1" required value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}

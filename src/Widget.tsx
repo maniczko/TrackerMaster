@@ -57,7 +57,7 @@ export default function Widget() {
     const check = () => { void invoke<{ registered: boolean; message: string; shortcut: string }>('shortcut_status').then(next => setShortcut({ ...next, shortcut: next.shortcut || defaultShortcut })).catch(() => {}); };
     check(); const timer = window.setInterval(check, 1500); return () => window.clearInterval(timer);
   }, []);
-  const elapsed = data?.active ? (now - new Date(data.active.started_at).getTime()) / 1000 : 0;
+  const elapsed = data?.active ? (now - new Date(data.active.started_at).getTime() - (data.active.excluded_sleep_ms ?? 0)) / 1000 : 0;
   const filtered = choices.filter(({ task, project, client }) => `${task?.name ?? 'Bez zadania'} ${project.name} ${client.name}`.toLocaleLowerCase('pl').includes(query.trim().toLocaleLowerCase('pl')));
   const groups = filtered.reduce<{ id: string; name: string; client: string; items: typeof choices }[]>((all, item) => {
     let group = all.find(g => g.id === String(item.project.id));

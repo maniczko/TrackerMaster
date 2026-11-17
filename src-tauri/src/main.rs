@@ -92,7 +92,7 @@ struct Project { id: i64, client_id: i64, name: String, archived: bool, billable
 #[derive(Serialize)]
 struct Task { id: i64, project_id: i64, name: String, archived: bool }
 #[derive(Serialize)]
-struct Active { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, recovered: bool, uncertain: bool, billable: bool, description: String }
+struct Active { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, recovered: bool, uncertain: bool, excluded_sleep_ms: i64, billable: bool, description: String }
 #[derive(Serialize)]
 struct Entry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
@@ -106,7 +106,7 @@ struct DescriptionRevision { id: i64, changed_at: String, before_description: St
 #[derive(Serialize)]
 struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>, active: Option<Active>, entries: Vec<Entry> }
 #[derive(Serialize)]
-struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String }
+struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingSleep { id: i64, entry_id: i64, started_ms: i64, ended_ms: Option<i64>, client: String, project: String, task: Option<String> }
@@ -153,18 +153,37 @@ fn entry_project_sql(db: &Connection, alias: &str) -> Cmd<String> {
     }
 }
 
-// Check display projections without altering or resolving the underlying entry.
-fn active_projection(tracker: &Tracker, started_at: &str, current: DateTime<Utc>, power: &Cmd<PowerSample>) -> Option<(String, i64)> {
-    let clock = tracker.running_since.as_ref()?;
-    let power = power.as_ref().ok()?;
-    if sleep_or_invalid(clock.power, *power) { return None; }
+// A projection is displayed or finalised only if wall and monotonic clocks
+// agree and every detected sleep interval is accounted for, without mutation.
+struct ActiveProjection { end: String, seconds: i64, excluded_sleep_ms: i64, periods: Option<Vec<sleep_periods::SleepPeriod>> }
+fn active_projection(db: &Connection, clock: Option<&RunningClock>, id: i64, started_at: &str, current: DateTime<Utc>, power: &Cmd<PowerSample>) -> Option<ActiveProjection> {
+    let clock = clock?;
+    let power = *power.as_ref().ok()?;
     let start = DateTime::parse_from_rfc3339(started_at).ok()?;
     let wall_ms = current.timestamp_millis().checked_sub(start.timestamp_millis())?;
     if wall_ms < 0 { return None; }
+    let end = current.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).ok()?;
+    let sleep = if version >= 12 { sleep_periods::completed_periods(db,id,started_at,&end).ok()? } else { None };
+    if let Some((seconds, periods)) = sleep {
+        let total = power.total_ms.checked_sub(clock.power.total_ms)?;
+        let awake = power.awake_ms.checked_sub(clock.power.awake_ms)?;
+        if (wall_ms as u64).abs_diff(total) > 2_000 || awake > total.saturating_add(2_000) { return None; }
+        let mut known = 0u64;
+        let mut excluded = 0i64;
+        for period in &periods {
+            let duration = period.ended_ms?.checked_sub(period.started_ms)?;
+            known = known.checked_add(u64::try_from(duration).ok()?)?;
+            if period.decision != "included" { excluded = excluded.checked_add(duration)?; }
+        }
+        if known.abs_diff(total.saturating_sub(awake)) > 4_000 { return None; }
+        return Some(ActiveProjection { end, seconds, excluded_sleep_ms: excluded, periods: Some(periods) });
+    }
+    if sleep_or_invalid(clock.power, power) { return None; }
     let wall = wall_ms / 1_000;
     let elapsed = i64::try_from(clock.since.elapsed().as_secs()).ok()?;
     if wall.abs_diff(elapsed) > 2 { return None; }
-    Some((current.to_rfc3339_opts(SecondsFormat::Millis, true), wall))
+    Some(ActiveProjection { end, seconds: wall, excluded_sleep_ms: 0, periods: None })
 }
 
 fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
@@ -180,10 +199,13 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
         .query_map([], |r| Ok(Task { id:r.get(0)?, project_id:r.get(1)?, name:r.get(2)?, archived:r.get(3)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     let active = db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| {
+        let id: i64 = r.get(0)?;
         let started_at: String = r.get(2)?;
         let recovered = tracker.running_since.is_none();
-        let uncertain = !recovered && active_projection(tracker, &started_at, Utc::now(), &power_sample()).is_none();
-        Ok(Active { id:r.get(0)?, task_id:r.get(1)?, started_at, recovered, uncertain, billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)? })
+        let projection = active_projection(db, tracker.running_since.as_ref(), id, &started_at, Utc::now(), &power_sample());
+        let uncertain = !recovered && projection.is_none();
+        let excluded_sleep_ms = projection.map(|p| p.excluded_sleep_ms).unwrap_or(0);
+        Ok(Active { id, task_id:r.get(1)?, started_at, recovered, uncertain, excluded_sleep_ms, billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)? })
     }).optional().map_err(db_err)?;
     let entries = db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500")).map_err(db_err)?
         .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
@@ -238,10 +260,10 @@ fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample
     enrich_entries_with_sleep(&tracker.db, &mut entries)?;
     let row: Option<(i64, Option<i64>, String, bool, String, i64)> = tracker.db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_err)?;
     let active = row.map(|(id, task_id, started_at, billable, description, project_id)| {
-        let projection = active_projection(tracker, &started_at, current, &power);
+        let projection = active_projection(&tracker.db, tracker.running_since.as_ref(), id, &started_at, current, &power);
         let unresolved = projection.is_none();
-        let (ended_at, duration_seconds) = match projection { Some((end, duration)) => (Some(end), Some(duration)), None => (None, None) };
-        ReportActive { id, task_id, project_id, started_at, ended_at, duration_seconds, unresolved, billable, description }
+        let (ended_at, duration_seconds, sleep_periods) = match projection { Some(p) => (Some(p.end), Some(p.seconds), p.periods), None => (None, None, None) };
+        ReportActive { id, task_id, project_id, started_at, ended_at, duration_seconds, unresolved, billable, description, sleep_periods }
     });
     let time_zone = tracker.db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
     Ok(ReportData { entries, active, time_zone })
