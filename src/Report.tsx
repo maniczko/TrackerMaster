@@ -5,6 +5,8 @@ import type { ReportEntry } from './reportTime';
 import { filterByClient } from './reportClientFilter';
 import { reportPresetRange } from './reportPresets';
 import type { ReportPreset } from './reportPresets';
+import { readReportFilter, saveReportFilter, validReportFilter } from './reportFilterStorage';
+import type { SavedReportFilter } from './reportFilterStorage';
 
 type Id = number | string;
 type Client = { id: Id; name: string };
@@ -25,9 +27,11 @@ function duration(value: number) {
 
 export default function Report({ clients, projects, loaded, onEditEntry }: { clients: Client[]; projects: Project[]; loaded: boolean; onEditEntry: (entry: Completed) => void }) {
   const [open, setOpen] = useState(false);
-  const [from, setFrom] = useState(() => todayWarsaw().slice(0, 8) + '01');
-  const [through, setThrough] = useState(todayWarsaw);
-  const [preset, setPreset] = useState<ReportPreset | 'custom'>('custom');
+  const [initialFilter] = useState(() => { try { return readReportFilter(window.localStorage); } catch { return { filter: null, problem: true }; } });
+  const [from, setFrom] = useState(() => initialFilter.filter?.kind === 'custom' ? initialFilter.filter.from : todayWarsaw().slice(0, 8) + '01');
+  const [through, setThrough] = useState(() => initialFilter.filter?.kind === 'custom' ? initialFilter.filter.through : todayWarsaw());
+  const [preset, setPreset] = useState<ReportPreset | 'custom'>(() => initialFilter.filter?.kind ?? 'custom');
+  const [filterStorageProblem, setFilterStorageProblem] = useState(initialFilter.problem);
   const [now, setNow] = useState(Date.now);
   const [client, setClient] = useState('');
   const [data, setData] = useState<Data | null>(null);
@@ -37,6 +41,14 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   const [zoneError, setZoneError] = useState('');
   const [zoneSaving, setZoneSaving] = useState(false);
   const zoneInitialised = useRef(false);
+  const hasUserChoice = useRef(initialFilter.filter !== null);
+
+  function rememberFilter(filter: SavedReportFilter) {
+    hasUserChoice.current = true;
+    if (!validReportFilter(filter)) return;
+    try { setFilterStorageProblem(!saveReportFilter(window.localStorage, filter)); }
+    catch { setFilterStorageProblem(true); }
+  }
 
   useEffect(() => {
     if (!open || !loaded) { setData(null); return; }
@@ -45,7 +57,7 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
     async function update() {
       try {
         const next = await invoke<Data>('get_report_data');
-        if (!cancelled) { setData(next); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
+        if (!cancelled) { setData(next); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
       } catch (e) {
         if (!cancelled) { setData(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
       } finally {
@@ -91,8 +103,9 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
     {open && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
       {data && <details className="report-zone"><summary>Zmień strefę raportowania</summary><p className="muted">Podaj nazwę strefy IANA, np. Europe/Warsaw, Europe/London lub America/New_York. Zmiana przeliczy przypisanie wcześniejszych pomiarów do dni, bez zmiany zapisanych pomiarów.</p><label>Strefa raportowania<input value={zoneDraft} disabled={zoneSaving} list="report-time-zones" onChange={e => { setZoneDraft(e.target.value); setZoneError(''); }} /></label><datalist id="report-time-zones"><option value="Europe/Warsaw" /><option value="Europe/London" /><option value="Europe/Berlin" /><option value="America/New_York" /><option value="UTC" /></datalist>{' '}<button className="secondary report-button" type="button" disabled={zoneSaving || !loaded} onClick={() => { if (!validTimeZone(zoneDraft)) { setZoneError('Podaj poprawną nazwę strefy IANA, np. Europe/Warsaw.'); return; } setZoneSaving(true); setZoneError(''); void invoke('set_report_timezone', { expectedTimeZone: data.time_zone, timeZone: zoneDraft }).then(() => { setNow(Date.now()); setRefresh(n => n + 1); }).catch(e => { setZoneError(`Nie udało się zapisać strefy: ${String(e)}`); setRefresh(n => n + 1); }).finally(() => setZoneSaving(false)); }}>Zapisz strefę</button>{zoneError && <div role="alert" className="alert error">{zoneError}</div>}</details>}
-      <div className="report-presets" aria-label="Szybki wybór zakresu"><button type="button" className="secondary report-button" aria-pressed={preset === 'today'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('today'); }}>Dzisiaj</button><button type="button" className="secondary report-button" aria-pressed={preset === 'week'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('week'); }}>Ten tydzień</button></div>
-      <div className="selectors report-filters"><label>Od<input type="date" value={range.from} onChange={e => { setFrom(e.target.value); setThrough(range.through); setPreset('custom'); }} /></label><label>Do<input type="date" value={range.through} onChange={e => { setFrom(range.from); setThrough(e.target.value); setPreset('custom'); }} /></label><label>Klient<select value={client} onChange={e => setClient(e.target.value)}><option value="">Wszyscy klienci</option>{clients.map(c => <option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></label></div>
+      <div className="report-presets" aria-label="Szybki wybór zakresu"><button type="button" className="secondary report-button" aria-pressed={preset === 'today'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('today'); rememberFilter({ kind: 'today' }); }}>Dzisiaj</button><button type="button" className="secondary report-button" aria-pressed={preset === 'week'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('week'); rememberFilter({ kind: 'week' }); }}>Ten tydzień</button></div>
+      <div className="selectors report-filters"><label>Od<input type="date" value={range.from} onChange={e => { const value = e.target.value; setFrom(value); setThrough(range.through); setPreset('custom'); rememberFilter({ kind: 'custom', from: value, through: range.through }); }} /></label><label>Do<input type="date" value={range.through} onChange={e => { const value = e.target.value; setFrom(range.from); setThrough(value); setPreset('custom'); rememberFilter({ kind: 'custom', from: range.from, through: value }); }} /></label><label>Klient<select value={client} onChange={e => setClient(e.target.value)}><option value="">Wszyscy klienci</option>{clients.map(c => <option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></label></div>
+      {filterStorageProblem && <div role="alert" className="alert error">Nie udało się odczytać lub zapisać zakresu raportu. Możesz nadal korzystać z raportu, ale wybór może nie zostać zapamiętany po zamknięciu aplikacji.</div>}
       {!loaded && <p role="status">Odśwież dane aplikacji, aby wyświetlić raport.</p>}
       {error && <div role="alert" className="alert error">{error} <button type="button" onClick={() => setRefresh(n => n + 1)}>Ponów</button></div>}
       {loaded && !data && !error && <p role="status">Wczytywanie raportu…</p>}
