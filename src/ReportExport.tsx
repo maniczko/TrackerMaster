@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useState } from 'react';
-import { exportCsv, formatDuration, localTimestamp, makeExportRows, spreadsheetText } from './reportCsv';
+import { exportCsv, formatDuration, localTimestamp, makeClientExportRows, spreadsheetText } from './reportCsv';
 import type { ExportEntry, ExportRow } from './reportCsv';
 
 type ExportData = { client_id: number; client: string; time_zone: string; entries: ExportEntry[] };
@@ -18,7 +18,7 @@ export default function ReportExport({ client, from, through, zone }: { client: 
     try {
       const data = await invoke<ExportData>('get_client_export_data', { clientId: Number(client) });
       if (String(data.client_id) !== client || data.time_zone !== zone) throw new Error('Klient lub strefa raportu uległy zmianie. Odśwież raport i przygotuj podgląd ponownie.');
-      const rows = makeExportRows(data.entries, from, through, zone);
+      const rows = makeClientExportRows(data.entries, data.client, from, through, zone);
       setPreview({ key, client: data.client, from, through, zone, rows, csv: exportCsv(rows, zone), total: rows.reduce((sum, row) => sum + row.contribution, 0) });
     } catch (e) { setError(`Nie udało się przygotować eksportu: ${String(e)}`); }
     finally { setBusy(false); }

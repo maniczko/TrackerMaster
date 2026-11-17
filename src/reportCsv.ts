@@ -5,6 +5,15 @@ export type ExportEntry = { id: number; client: string; project: string; task: s
 export type ExportRow = { source: ExportEntry; contribution: number };
 
 export function makeExportRows(entries: ExportEntry[], from: string, through: string, zone: string): ExportRow[] {
+  // reportByDay rejects duplicate IDs within one call. Since export computes
+  // each row independently, enforce the same invariant across the full export.
+  const ids = new Set<number>();
+  for (const entry of entries) {
+    if (!Number.isSafeInteger(entry.id) || entry.id <= 0 || ids.has(entry.id)) {
+      throw new Error('Dane eksportu zawierają nieprawidłowy lub powtórzony identyfikator wpisu.');
+    }
+    ids.add(entry.id);
+  }
   return entries.flatMap(source => {
     const result = reportByDay([source], from, through, zone);
     if (result.excludedEntryIds.length) throw new Error(`Wpis #${source.id} wymaga poprawienia przed eksportem.`);
@@ -13,6 +22,17 @@ export function makeExportRows(entries: ExportEntry[], from: string, through: st
     return result.totalSeconds > 0 || (zeroLengthDate !== null && zeroLengthDate >= from && zeroLengthDate <= through)
       ? [{ source, contribution: result.totalSeconds }] : [];
   });
+}
+
+
+/** Fail closed if the backend returns entries for a different client.
+ * This is defense-in-depth: the SQLite query must still filter by client_id.
+ */
+export function makeClientExportRows(entries: ExportEntry[], clientName: string, from: string, through: string, zone: string): ExportRow[] {
+  if (!clientName || entries.some(entry => entry.client !== clientName)) {
+    throw new Error('Dane eksportu zawierają wpisy innego klienta.');
+  }
+  return makeExportRows(entries, from, through, zone);
 }
 
 export function formatDuration(seconds: number): string {
