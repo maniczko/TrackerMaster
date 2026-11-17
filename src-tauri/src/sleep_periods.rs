@@ -19,10 +19,35 @@ pub struct SleepPeriod {
 
 fn valid_ms(value: i64) -> bool { (0..=MAX_TIMESTAMP_MS).contains(&value) }
 
-/// Must only be called within an explicit, backed-up schema migration.
-pub fn install(db: &mut Connection) -> Result<()> {
+/// Validate the exact sleep schema as well as persisted rows. This is used by
+/// preflight and backup validation once v12 is enabled; it never repairs data.
+pub fn validate(db: &Connection) -> Result<()> {
+    // Compare definitions against this build's canonical schema, including
+    // protective triggers and partial indexes, without modifying the live DB.
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch("CREATE TABLE time_entries(id INTEGER PRIMARY KEY);")?;
+    canonical.execute_batch(include_str!("sleep_periods.sql"))?;
+    for name in ["sleep_periods", "sleep_periods_pending", "sleep_periods_one_open", "sleep_periods_initial_pending", "sleep_periods_no_overlap_insert", "sleep_periods_no_overlap_update", "sleep_periods_immutable", "sleep_periods_no_delete"] {
+        let expected: String = canonical.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |r| r.get(0))?;
+        let actual: String = db.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |r| r.get(0))?;
+        if actual != expected { return Err(Error::InvalidQuery); }
+    }
+    let bad: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods s LEFT JOIN time_entries e ON e.id=s.entry_id WHERE e.id IS NULL OR s.id<=0 OR typeof(s.started_ms)!='integer' OR s.started_ms<0 OR s.started_ms>8640000000000000 OR (s.ended_ms IS NOT NULL AND (typeof(s.ended_ms)!='integer' OR s.ended_ms<=s.started_ms OR s.ended_ms>8640000000000000)) OR s.decision NOT IN ('pending','included','excluded') OR (s.decision='pending' AND s.decided_ms IS NOT NULL) OR (s.decision IN ('included','excluded') AND (s.ended_ms IS NULL OR typeof(s.decided_ms)!='integer' OR s.decided_ms<0 OR s.decided_ms>8640000000000000))) OR EXISTS(SELECT 1 FROM sleep_periods a JOIN sleep_periods b ON a.entry_id=b.entry_id AND a.id<b.id WHERE (b.ended_ms IS NULL OR a.started_ms<b.ended_ms) AND (a.ended_ms IS NULL OR b.started_ms<a.ended_ms))", [], |r| r.get(0))?;
+    if bad { return Err(Error::InvalidQuery); }
+    Ok(())
+}
+
+/// Migrate a verified v11 database in one transaction. The caller must create
+/// and verify a backup of an existing database before invoking this function.
+/// It is deliberately not connected to app startup until native tests pass.
+pub fn migrate(db: &mut Connection) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let foreign_keys: i64 = tx.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    if version != 11 || foreign_keys != 1 { return Err(Error::InvalidQuery); }
     tx.execute_batch(include_str!("sleep_periods.sql"))?;
+    validate(&tx)?;
+    tx.pragma_update(None, "user_version", 12)?;
     tx.commit()
 }
 
@@ -80,7 +105,8 @@ mod tests {
     fn fixture() -> Connection {
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE time_entries(id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT); INSERT INTO time_entries VALUES(1,'2026-01-01T10:00:00Z',NULL), (2,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z');").unwrap();
-        install(&mut db).unwrap();
+        db.pragma_update(None, "user_version", 11).unwrap();
+        migrate(&mut db).unwrap();
         db
     }
     #[test]
@@ -108,4 +134,19 @@ mod tests {
         assert!(record_suspend(&mut db, 2, before + 10000000).is_err());
         assert!(list_for_entry(&db, 1).unwrap().is_empty());
     }
+    #[test]
+    fn migration_is_atomic_and_validator_refuses_missing_trigger() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE time_entries(id INTEGER PRIMARY KEY, started_at TEXT, ended_at TEXT); INSERT INTO time_entries VALUES(1,'2026-01-01T10:00:00Z',NULL); CREATE TABLE sleep_periods(id INTEGER); PRAGMA user_version=11;").unwrap();
+        assert!(migrate(&mut db).is_err());
+        assert_eq!(db.pragma_query_value(None,"user_version",|r| r.get::<_,i64>(0)).unwrap(),11);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM time_entries",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        db.execute_batch("DROP TABLE sleep_periods;").unwrap();
+        migrate(&mut db).unwrap();
+        assert_eq!(db.pragma_query_value(None,"user_version",|r| r.get::<_,i64>(0)).unwrap(),12);
+        assert!(validate(&db).is_ok());
+        db.execute_batch("DROP TRIGGER sleep_periods_immutable;").unwrap();
+        assert!(validate(&db).is_err());
+    }
+
 }

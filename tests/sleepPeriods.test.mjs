@@ -55,3 +55,29 @@ test('keeps pending and decided periods across closing and reopening a separate 
   } finally { rmSync(dir, {recursive:true, force:true}); }
 });
 
+
+test('a failed migration rolls back, and a verified pre-migration backup keeps the original entries', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tracker-sleep-migration-'));
+  try {
+    const path = join(dir, 'live.sqlite'), backupPath = join(dir, 'before.sqlite');
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA foreign_keys=ON; CREATE TABLE time_entries(id INTEGER PRIMARY KEY, note TEXT); INSERT INTO time_entries VALUES(41,'oryginalny wpis'); PRAGMA user_version=11;");
+    db.prepare('VACUUM INTO ?').run(backupPath);
+    const backup = new DatabaseSync(backupPath, { readOnly:true });
+    assert.equal(backup.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+    assert.equal(backup.prepare('PRAGMA user_version').get().user_version, 11);
+    assert.equal(backup.prepare('SELECT note FROM time_entries WHERE id=41').get().note, 'oryginalny wpis');
+    db.exec('CREATE TABLE sleep_periods(id INTEGER PRIMARY KEY); BEGIN IMMEDIATE;');
+    assert.throws(() => db.exec(schema));
+    db.exec('ROLLBACK;');
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 11);
+    assert.equal(db.prepare('SELECT note FROM time_entries WHERE id=41').get().note, 'oryginalny wpis');
+    db.exec('DROP TABLE sleep_periods; BEGIN IMMEDIATE;');
+    db.exec(schema);
+    db.exec('PRAGMA user_version=12; COMMIT;');
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 12);
+    assert.equal(db.prepare('SELECT note FROM time_entries WHERE id=41').get().note, 'oryginalny wpis');
+    assert.equal(backup.prepare('PRAGMA user_version').get().user_version, 11);
+    backup.close(); db.close();
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+});
