@@ -2,6 +2,8 @@ name: Windows test build
 
 on:
   push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -13,6 +15,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Reject tracked SQLite data files
+        shell: pwsh
+        run: |
+          $databaseFiles = @(git ls-files | Where-Object { $_ -match '(?i)\.(?:db|sqlite3?)(?:-(?:wal|shm|journal)|\.partial)?$' })
+          if ($databaseFiles.Count -gt 0) {
+            $databaseFiles | ForEach-Object { Write-Host "Tracked database file: $_" }
+            throw 'Refusing to build a commit containing SQLite database files.'
+          }
       - uses: actions/setup-node@v4
         with:
           node-version: 24
