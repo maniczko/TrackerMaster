@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn migrates_actual_v10_schema_with_all_entry_dependents() {
         let mut db = Connection::open_in_memory().unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
             INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');
             INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie');
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn project_target_checks_parent_task_and_billing() {
         let mut db = Connection::open_in_memory().unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'),(2,1,'Inny'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO billable_projects VALUES(1);").unwrap();
         assert_eq!(target_billing(&db, 1, None).unwrap(), true);
         assert_eq!(target_billing(&db, 1, Some(1)).unwrap(), true);
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn inserts_project_timer_and_rolls_back_metadata_failure() {
         let mut db = Connection::open_in_memory().unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO billable_projects VALUES(1);").unwrap();
         migrate(&mut db).unwrap();
         assert!(insert_running(&db, 1, None, "2026-01-01T10:00:00Z", "Opis", None).is_err());
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn project_timer_switch_resume_and_stale_state_are_atomic() {
         let mut db=Connection::open_in_memory().unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'),(2,1,'Inny'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO billable_projects VALUES(1);").unwrap();
         migrate(&mut db).unwrap();
         let mut tracker=crate::Tracker { db, running_since:None, restored:false };
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn manual_project_entry_inherits_billing_and_rejects_overlaps() {
         let mut db=Connection::open_in_memory().unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO billable_projects VALUES(1);").unwrap();
         migrate(&mut db).unwrap();
         let mut tracker=crate::Tracker { db, running_since:None, restored:false };
@@ -307,5 +307,18 @@ mod tests {
         assert_eq!(result.entries[0].description,"Ręczny");
         assert!(insert_manual(&mut tracker,1,None,"2026-01-01T09:30:00Z","2026-01-01T10:30:00Z",now,"").is_err());
         assert_eq!(crate::snapshot(&tracker).unwrap().entries.len(),1);
+    }
+
+    #[test]
+    fn application_initialisation_migrates_v10_and_reopens_v11() {
+        let mut db=Connection::open_in_memory().unwrap();
+        crate::initialise_v10(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(41,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_descriptions VALUES(41,'Zachowany opis');").unwrap();
+        crate::initialise(&mut db).unwrap();
+        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),11);
+        assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(db.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(),"Zachowany opis");
+        crate::initialise(&mut db).unwrap();
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM time_entries",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 }

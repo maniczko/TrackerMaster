@@ -290,7 +290,7 @@ mod tests {
         drop(db);
         preflight_existing(&path).unwrap();
         let mut db = Connection::open(&path).unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         assert_eq!(db.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
     }
 
@@ -300,7 +300,7 @@ mod tests {
         let _cleanup = Cleanup(path.clone());
         let dir = path.with_extension("dir");
         let mut db = Connection::open(&path).unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.pragma_update(None, "journal_mode", "WAL").unwrap();
         db.execute_batch("
             INSERT INTO clients(id,name) VALUES(1,'Client');
@@ -327,7 +327,7 @@ mod tests {
         let _cleanup = Cleanup(path.clone());
         let dir = path.with_extension("dir");
         let mut db = Connection::open(&path).unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.pragma_update(None, "journal_mode", "WAL").unwrap();
         db.execute_batch("
             INSERT INTO clients(id,name) VALUES(1,'Client');
@@ -354,7 +354,7 @@ mod tests {
         let _cleanup = Cleanup(path.clone());
         let dir = path.with_extension("dir");
         let mut db = Connection::open(&path).unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("DROP TABLE entry_deletions;").unwrap();
         assert!(create_backup(&db, &dir).is_err());
         assert!(!dir.join("backups").exists());
@@ -368,7 +368,7 @@ mod tests {
         let _dest_cleanup = Cleanup(dest_path.clone());
         let dir = dest_path.with_extension("dir");
         let mut source = Connection::open(&source_path).unwrap();
-        crate::initialise(&mut source).unwrap();
+        crate::initialise_v10(&mut source).unwrap();
         crate::update_report_timezone(&source, "Europe/Warsaw", "Europe/London").unwrap();
         source.execute_batch("INSERT INTO clients VALUES(1,'Backup client'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO tasks VALUES(1,1,'T'); INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(1,'2026-01-02T00:00:00Z','2026-01-01T08:00:00Z','2026-01-01T09:00:00Z',3600,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_deletions VALUES(1,'2026-01-03T00:00:00Z'); INSERT INTO time_entries(id,task_id,started_at) VALUES(2,1,'2026-01-04T10:00:00Z');").unwrap();
         source.execute_batch("INSERT INTO billable_projects VALUES(1); INSERT INTO billable_entries VALUES(1); INSERT INTO billing_revisions(entry_id,changed_at,before_billable,after_billable) VALUES(1,'2026-01-02T00:00:00Z',0,1);").unwrap();
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!((prepared.health.clients, prepared.health.completed_entries, prepared.health.open_entries), (1, 0, 1));
         source.execute("UPDATE clients SET name='Changed after preview' WHERE id=1", []).unwrap();
         let mut dest = Connection::open(&dest_path).unwrap();
-        crate::initialise(&mut dest).unwrap();
+        crate::initialise_v10(&mut dest).unwrap();
         dest.pragma_update(None, "journal_mode", "WAL").unwrap();
         dest.execute("INSERT INTO clients VALUES(1,'Current client')", []).unwrap();
         let safety = restore_prepared(&mut dest, &prepared, &dir).unwrap();
@@ -414,13 +414,13 @@ mod tests {
         std::fs::write(&invalid_path, b"not a database").unwrap();
         assert!(prepare_restore(&invalid_path).is_err());
         let mut source = Connection::open(&source_path).unwrap();
-        crate::initialise(&mut source).unwrap();
+        crate::initialise_v10(&mut source).unwrap();
         source.pragma_update(None, "user_version", 12).unwrap();
         assert!(prepare_restore(&source_path).is_err());
         source.pragma_update(None, "user_version", 10).unwrap();
         let prepared = prepare_restore(&source_path).unwrap();
         let mut dest = Connection::open(&dest_path).unwrap();
-        crate::initialise(&mut dest).unwrap();
+        crate::initialise_v10(&mut dest).unwrap();
         dest.execute_batch("INSERT INTO clients VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO tasks VALUES(1,1,'T'); INSERT INTO time_entries(task_id,started_at) VALUES(1,'2026-01-01T10:00:00Z');").unwrap();
         assert!(restore_prepared(&mut dest, &prepared, &dir).is_err());
         assert_eq!(dest.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
@@ -432,10 +432,10 @@ mod tests {
         let path = test_path("restore-legacy");
         let _cleanup = Cleanup(path.clone());
         let mut source = Connection::open(&path).unwrap();
-        crate::initialise(&mut source).unwrap();
+        crate::initialise_v10(&mut source).unwrap();
         source.execute_batch("INSERT INTO clients VALUES(1,'Legacy'); DROP TABLE description_revisions; DROP TABLE entry_descriptions; DROP TABLE task_archives; DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
         let prepared = prepare_restore(&path).unwrap();
-        assert_eq!((prepared.health.schema_version, prepared.health.clients), (10, 1));
+        assert_eq!((prepared.health.schema_version, prepared.health.clients), (11, 1));
         assert_eq!(source.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 3);
         assert!(!source.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entry_revisions')", [], |r| r.get::<_,bool>(0)).unwrap());
     }
@@ -460,7 +460,7 @@ mod tests {
         let path = test_path("wrong-index");
         let _cleanup = Cleanup(path.clone());
         let mut db = Connection::open(&path).unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("
             DROP INDEX one_running_timer;
             CREATE UNIQUE INDEX one_running_timer ON time_entries(task_id)
@@ -476,7 +476,7 @@ mod tests {
         let path = test_path("bad-fk");
         let _cleanup = Cleanup(path.clone());
         let mut db = Connection::open(&path).unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.pragma_update(None, "foreign_keys", false).unwrap();
         db.execute_batch("INSERT INTO projects(id,client_id,name) VALUES(99,999,'Orphan');").unwrap();
         drop(db);
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn diagnostics_return_only_aggregates_and_do_not_modify_entries() {
         let mut db = Connection::open_in_memory().unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("
           INSERT INTO clients(id,name) VALUES(1,'CONFIDENTIAL CUSTOMER');
           INSERT INTO projects(id,client_id,name) VALUES(1,1,'CONFIDENTIAL PROJECT');
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn diagnostics_fail_closed_for_broken_foreign_keys() {
         let mut db = Connection::open_in_memory().unwrap();
-        crate::initialise(&mut db).unwrap();
+        crate::initialise_v10(&mut db).unwrap();
         db.pragma_update(None, "foreign_keys", false).unwrap();
         db.execute_batch("INSERT INTO projects(id,client_id,name) VALUES(77,999,'Orphan');").unwrap();
         assert!(diagnose_database(&db).is_err());
