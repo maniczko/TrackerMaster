@@ -2,12 +2,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
+import ShortcutSettings from './ShortcutSettings';
+import SleepPending from './SleepPending';
+import { parseLocalDate } from './localDateTime';
 
 type Id = number | string;
 type Client = { id: Id; name: string; archived: boolean };
 type Project = { id: Id; client_id: Id; name: string; archived: boolean; billable: boolean };
 type Task = { id: Id; project_id: Id; name: string; archived: boolean };
-type Entry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null; recovered?: boolean; manually_resolved?: boolean; billable: boolean; description: string };
+type Entry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null; recovered?: boolean; uncertain?: boolean; manually_resolved?: boolean; billable: boolean; description: string };
 type DeletedEntry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string; duration_seconds: number; deleted_at: string };
 type Revision = { id: Id; changed_at: string; before_start: string; before_end: string; before_seconds: number; after_start: string; after_end: string; after_seconds: number };
 type BillingRevision = { id: Id; changed_at: string; before_billable: boolean; after_billable: boolean };
@@ -35,22 +38,6 @@ const localInputValue = (value: string) => {
 const formatPreciseDate = (value: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'medium' });
-};
-const parseLocalDate = (value: string) => {
-  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
-  if (!parts) return null;
-  const date = new Date(value);
-  const expected = parts.slice(1).map(part => Number(part || 0));
-  const actual = [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()];
-  if (Number.isNaN(date.getTime()) || actual.some((part, index) => part !== expected[index])) return null;
-  // A repeated local time at the end of daylight saving does not identify one instant.
-  for (let minutes = -180; minutes <= 180; minutes++) {
-    if (minutes === 0) continue;
-    const other = new Date(date.getTime() + minutes * 60_000);
-    const components = [other.getFullYear(), other.getMonth() + 1, other.getDate(), other.getHours(), other.getMinutes(), other.getSeconds()];
-    if (components.every((part, index) => part === expected[index])) return null;
-  }
-  return date;
 };
 
 export default function App() {
@@ -189,16 +176,18 @@ export default function App() {
       <div className="heading"><div><p className="eyebrow">TWÓJ DZIEŃ PRACY</p><h1>Rejestracja czasu</h1><p className="subtitle">Wybierz projekt i skup się na pracy. Resztą zajmie się licznik.</p></div><div className="date">{new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())}</div></div>
       {error && <div role="alert" className="alert error">{error}</div>}
       {!loaded && <div role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie przed wykonaniem kolejnej operacji. <button type="button" disabled={busy} onClick={retryRefresh}>Ponów odczyt</button></div>}
+      {loaded && data.active?.uncertain && !data.active.recovered && <div role="alert" className="alert error"><strong>Nie można wiarygodnie wyświetlić czasu pomiaru.</strong> Przyczyną mogło być uśpienie komputera lub zmiana zegara. Po zatrzymaniu pomiar będzie wymagał ręcznej weryfikacji; obecna wersja nie rozlicza automatycznie okresu uśpienia.</div>}
       {loaded && data.active?.recovered && <div role="alert" className="alert error"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto: {formatDate(data.active.started_at)}. Podaj faktyczny czas zakończenia. Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.
-        <form onSubmit={e => { e.preventDefault(); const end = new Date(recoveryEnd); if (!recoveryEnd || Number.isNaN(end.getTime())) { setError('Podaj poprawną datę zakończenia.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
+        <form onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
           <label>Data i godzina zakończenia <input type="datetime-local" step="1" required value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
           <button type="submit" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
         </form></div>}
       {notice && <div role="status" className="alert success">{notice}</div>}
+      <SleepPending loaded={loaded} onResolved={refresh} />
       <div className="grid">
         <section className="timer card" aria-label="Pomiar czasu">
-          <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered ? 'running' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
-          <div className="clock" aria-live="off">{!loaded || data.active?.recovered ? '—:—:—' : formatDuration(displayElapsed)}</div><p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered ? 'Pomiar wymaga weryfikacji' : data.active ? 'Czas na ekranie jest orientacyjny' : 'Wybierz klienta i projekt, aby rozpocząć'}</p>
+          <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered && !data.active.uncertain ? 'running' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered || data.active?.uncertain ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
+          <div className="clock" aria-live="off">{!loaded || data.active?.recovered || data.active?.uncertain ? '—:—:—' : formatDuration(displayElapsed)}</div><p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered || data.active?.uncertain ? 'Pomiar wymaga weryfikacji' : data.active ? 'Czas na ekranie jest orientacyjny' : 'Wybierz klienta i projekt, aby rozpocząć'}</p>
           {loaded && data.active && <div className="active-info"><span>AKTYWNY POMIAR</span><strong>{data.active.task_id === null ? 'Bez zadania' : activeTask?.name || 'Nieznane zadanie'}</strong><small>{activeClient?.name || '—'} / {activeProject?.name || '—'}</small><small>{data.active.description || 'Bez opisu'}</small><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe({ id: data.active!.id, expected: data.active!.description, value: data.active!.description })}>Zmień opis</button></div>}
           <div className="selectors">
             <label>Klient<select value={clientId} disabled={busy || !loaded} onChange={e => { setClientId(e.target.value); setProjectId(''); setTaskId(''); }}><option value="">Wybierz klienta</option>{data.clients.filter(c => showArchived || !c.archived).map(c => <option key={c.id} value={c.id}>{c.name}{c.archived ? ' (archiwum)' : ''}</option>)}</select></label>
@@ -244,6 +233,7 @@ export default function App() {
         <details onToggle={e => { if (e.currentTarget.open) void loadDeleted(); }}><summary>Usunięte wpisy</summary><p className="muted">Te wpisy nie są uwzględniane w aktywnej historii. Zachowano je wraz z historią zmian.</p><button type="button" className="secondary" onClick={() => void loadDeleted()}>Odśwież listę</button>{deleted === null ? <p className="muted">Odczytywanie lub brak dostępu do listy.</p> : deleted.length === 0 ? <p className="muted">Brak usuniętych wpisów.</p> : <ul>{deleted.map(entry => <li key={entry.id}><strong>{entry.task_id === null ? 'Bez zadania' : data.tasks.find(task => same(task.id, entry.task_id))?.name || 'Nieznane zadanie'}</strong> · {formatPreciseDate(entry.started_at)} – {formatPreciseDate(entry.ended_at)} · {formatDuration(entry.duration_seconds)} · usunięto {formatPreciseDate(entry.deleted_at)}{' '}<button type="button" className="secondary" onClick={() => void showRevisions(entry.id)}>Historia zmian</button></li>)}</ul>}{deleted?.length === 500 && <p className="muted">Wyświetlono ostatnie 500 usuniętych wpisów.</p>}</details>
         {revisions && <section aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
       </section>
+      <ShortcutSettings />
       <section className="card" aria-label="Bezpieczeństwo danych"><div className="section-top"><div><p className="section-kicker">TWOJE DANE</p><h2>Kopia zapasowa</h2></div></div><p className="muted">Utwórz lokalną kopię bazy danych, również podczas trwającego pomiaru.</p><div className="actions"><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setLastBackup(await invoke<string>('create_backup')); }, 'Kopia została utworzona i sprawdzona.')}>Utwórz kopię</button><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setDatabaseHealth(await invoke<DatabaseHealth>('diagnose_database')); }, 'Sprawdzono bazę danych.')}>Sprawdź bazę</button></div>{lastBackup && <p role="status">Kopia została zapisana: <code>{lastBackup}</code>. Zawiera dane klientów i nie jest szyfrowana.</p>}{databaseHealth && <p role="status">Baza poprawna · Klienci: {databaseHealth.clients} · Projekty: {databaseHealth.projects} · Zadania: {databaseHealth.tasks} · Zakończone wpisy: {databaseHealth.completed_entries} · Otwarte pomiary: {databaseHealth.open_entries}</p>}
         <details><summary>Przywróć kopię</summary><p className="muted">Podaj pełną ścieżkę do pliku kopii. Przed przywróceniem aplikacja sprawdzi plik i utworzy kopię obecnych danych. Zakończ aktywny pomiar.</p><label>Ścieżka do kopii <input type="text" value={restorePath} disabled={busy || !!restorePreview} onChange={e => setRestorePath(e.target.value)} placeholder="C:\\...\\kopia.sqlite3" /></label>{' '}{!restorePreview && <button className="secondary" type="button" disabled={busy || !restorePath.trim()} onClick={() => void prepareRestore()}>Sprawdź kopię</button>}
           {restorePreview && <div><p role="status">Kopia zawiera: klientów {restorePreview.health.clients}, projektów {restorePreview.health.projects}, zadań {restorePreview.health.tasks}, zakończonych wpisów {restorePreview.health.completed_entries}, otwartych pomiarów {restorePreview.health.open_entries}.</p><p>Uwaga: przywrócenie zastąpi CAŁĄ obecną bazę danych tego komputera. Wpisy, klienci i projekty z obu komputerów NIE ZOSTANĄ SCALONE. Przed zastąpieniem powstanie lokalna kopia bezpieczeństwa dotychczasowych danych; po przywróceniu konieczny będzie restart aplikacji.</p>{restorePreview.health.open_entries > 0 && <p>Otwarty pomiar z kopii będzie wymagał weryfikacji po ponownym uruchomieniu.</p>}<label><input type="checkbox" checked={restoreConfirmed} onChange={e => setRestoreConfirmed(e.target.checked)} /> Rozumiem, że dane tego komputera zostaną zastąpione, a historie obu komputerów nie będą łączone.</label><div className="actions"><button className="primary" type="button" disabled={busy || !loaded || !!data.active || !restoreConfirmed} onClick={() => void applyRestore()}>Przywróć kopię</button><button className="secondary" type="button" disabled={busy} onClick={() => void cancelRestore()}>Anuluj</button></div>{data.active && <p className="muted">Zakończ lub rozlicz aktywny pomiar przed przywróceniem.</p>}</div>}

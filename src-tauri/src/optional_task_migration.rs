@@ -29,6 +29,7 @@ pub fn transition(tracker: &mut crate::Tracker, expected: Option<i64>, at: &str,
     };
     if let Some((project_id,task_id,description,_)) = &target { crate::valid_description(description)?; target_billing(&tx,*project_id,*task_id)?; }
     if let Some((id, active_project, active_task, started)) = active {
+        crate::ensure_no_sleep_periods(&tx, id)?;
         let seconds = elapsed.ok_or("Pomiar wymaga ręcznego ustalenia czasu zakończenia.")?;
         let uncertain = match crate::power_sample() { Ok(end_power) => crate::sleep_or_invalid(tracker.running_since.as_ref().unwrap().power,end_power), Err(_) => true };
         if uncertain { drop(tx); tracker.running_since=None; return Err("Wykryto przerwę w pracy systemu lub błąd zegara. Pomiar wymaga weryfikacji; nie został zakończony.".into()); }
@@ -315,7 +316,7 @@ mod tests {
         crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(41,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_descriptions VALUES(41,'Zachowany opis');").unwrap();
         crate::initialise(&mut db).unwrap();
-        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),11);
+        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),12);
         assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(db.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(),"Zachowany opis");
         crate::initialise(&mut db).unwrap();
@@ -338,7 +339,7 @@ mod tests {
         let old=Connection::open_with_flags(&backups[0],rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(old.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),10);
         assert_eq!(old.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(),"Zachowany opis");
-        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),11);
+        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),12);
         assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 }

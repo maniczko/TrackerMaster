@@ -1,7 +1,8 @@
 import { Temporal } from '@js-temporal/polyfill';
+import type { SleepPeriod } from './sleepTime.ts';
 import { dateInZone, reportByDay } from './reportTime.ts';
 
-export type ExportEntry = { id: number; client: string; project: string; task: string; description: string; started_at: string; ended_at: string; duration_seconds: number; billable: boolean };
+export type ExportEntry = { id: number; client: string; project: string; task: string; description: string; started_at: string; ended_at: string; duration_seconds: number; billable: boolean; sleep_periods?: readonly SleepPeriod[] };
 export type ExportRow = { source: ExportEntry; contribution: number };
 
 export function makeExportRows(entries: ExportEntry[], from: string, through: string, zone: string): ExportRow[] {
@@ -15,6 +16,7 @@ export function makeExportRows(entries: ExportEntry[], from: string, through: st
     ids.add(entry.id);
   }
   return entries.flatMap(source => {
+    if (source.sleep_periods?.some(period => period.decision === 'pending')) throw new Error(`Wpis #${source.id} zawiera nierozstrzygnięty czas uśpienia.`);
     const result = reportByDay([source], from, through, zone);
     if (result.excludedEntryIds.length) throw new Error(`Wpis #${source.id} wymaga poprawienia przed eksportem.`);
     const zeroLengthDate = Date.parse(source.started_at) === Date.parse(source.ended_at) && source.duration_seconds === 0

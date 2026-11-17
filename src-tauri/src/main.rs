@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod storage_safety;
+mod sleep_periods;
 mod optional_task_migration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -10,7 +11,7 @@ use std::{sync::Mutex, time::Instant};
 use tauri::{Emitter, Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 struct RunningClock { since: Instant, power: PowerSample }
 #[derive(Clone, Copy)]
@@ -71,9 +72,13 @@ fn confirm_stop_and_exit() -> bool {
     unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), 0x4 | 0x20 | 0x100) == 6 }
 }
 type Shared = Mutex<Tracker>;
-#[derive(Default)]
-struct HotkeyState { project_id: Option<i64>, task_id: Option<i64>, registered: bool, widget_ready: bool, message: String }
+const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
+struct HotkeyState { project_id: Option<i64>, task_id: Option<i64>, registered: bool, widget_ready: bool, message: String, shortcut: String }
+impl Default for HotkeyState {
+    fn default() -> Self { Self { project_id: None, task_id: None, registered: false, widget_ready: false, message: String::new(), shortcut: DEFAULT_SHORTCUT.into() } }
+}
 type Hotkey = Mutex<HotkeyState>;
+struct HotkeyChange(Mutex<()>);
 #[derive(Default)]
 struct RestoreState { sequence: u64, pending: Option<storage_safety::PreparedRestore> }
 type Restore = Mutex<RestoreState>;
@@ -86,9 +91,9 @@ struct Project { id: i64, client_id: i64, name: String, archived: bool, billable
 #[derive(Serialize)]
 struct Task { id: i64, project_id: i64, name: String, archived: bool }
 #[derive(Serialize)]
-struct Active { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, recovered: bool, billable: bool, description: String }
+struct Active { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, recovered: bool, uncertain: bool, billable: bool, description: String }
 #[derive(Serialize)]
-struct Entry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String }
+struct Entry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 struct DeletedEntry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, deleted_at: String }
 #[derive(Serialize)]
@@ -102,9 +107,12 @@ struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>
 #[derive(Serialize)]
 struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String }
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingSleep { id: i64, entry_id: i64, started_ms: i64, ended_ms: Option<i64>, client: String, project: String, task: Option<String> }
+#[derive(Serialize)]
 struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
 #[derive(Serialize)]
-struct ExportEntry { id: i64, client: String, project: String, task: String, description: String, started_at: String, ended_at: String, duration_seconds: i64, billable: bool }
+struct ExportEntry { id: i64, client: String, project: String, task: String, description: String, started_at: String, ended_at: String, duration_seconds: i64, billable: bool, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 struct ExportData { client_id: i64, client: String, time_zone: String, entries: Vec<ExportEntry> }
 
@@ -139,9 +147,23 @@ fn entry_project_sql(db: &Connection, alias: &str) -> Cmd<String> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     match version {
         10 => Ok(format!("(SELECT project_id FROM tasks WHERE id={alias}.task_id)")),
-        11 => Ok(format!("{alias}.project_id")),
+        11 | 12 => Ok(format!("{alias}.project_id")),
         _ => Err("Nieobsługiwana wersja bazy danych.".into()),
     }
+}
+
+// Check display projections without altering or resolving the underlying entry.
+fn active_projection(tracker: &Tracker, started_at: &str, current: DateTime<Utc>, power: &Cmd<PowerSample>) -> Option<(String, i64)> {
+    let clock = tracker.running_since.as_ref()?;
+    let power = power.as_ref().ok()?;
+    if sleep_or_invalid(clock.power, *power) { return None; }
+    let start = DateTime::parse_from_rfc3339(started_at).ok()?;
+    let wall_ms = current.timestamp_millis().checked_sub(start.timestamp_millis())?;
+    if wall_ms < 0 { return None; }
+    let wall = wall_ms / 1_000;
+    let elapsed = i64::try_from(clock.since.elapsed().as_secs()).ok()?;
+    if wall.abs_diff(elapsed) > 2 { return None; }
+    Some((current.to_rfc3339_opts(SecondsFormat::Millis, true), wall))
 }
 
 fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
@@ -156,12 +178,17 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
     let tasks = db.prepare("SELECT id,project_id,name,EXISTS(SELECT 1 FROM task_archives a WHERE a.task_id=tasks.id) FROM tasks ORDER BY name COLLATE NOCASE,id").map_err(db_err)?
         .query_map([], |r| Ok(Task { id:r.get(0)?, project_id:r.get(1)?, name:r.get(2)?, archived:r.get(3)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    let active = db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| Ok(Active {
-        id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, recovered:tracker.running_since.is_none(), billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)?
-    })).optional().map_err(db_err)?;
+    let active = db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| {
+        let started_at: String = r.get(2)?;
+        let recovered = tracker.running_since.is_none();
+        let uncertain = !recovered && active_projection(tracker, &started_at, Utc::now(), &power_sample()).is_none();
+        Ok(Active { id:r.get(0)?, task_id:r.get(1)?, started_at, recovered, uncertain, billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)? })
+    }).optional().map_err(db_err)?;
     let entries = db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500")).map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    enrich_entries_with_sleep(db, &mut entries)?;
     Ok(Snapshot { clients, projects, tasks, active, entries })
 }
 
@@ -171,6 +198,32 @@ fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
     snapshot(&tracker)
 }
 
+// Apply stored sleep decisions only to the entry that owns them. Any corrupt
+// or unfinished boundaries fail closed rather than silently adding work.
+fn ensure_no_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<()> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version >= 12 {
+        let found: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods WHERE entry_id=?1)", [entry_id], |r| r.get(0)).map_err(db_err)?;
+        if found { return Err("Wpis zawiera okresy uśpienia. Jego zmiana wymaga pełnej obsługi tych okresów.".into()); }
+    }
+    Ok(())
+}
+fn completed_sleep(db: &Connection, id: i64, start: &str, end: &str) -> Cmd<Option<(i64, Vec<sleep_periods::SleepPeriod>)>> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(None); }
+    sleep_periods::completed_periods(db, id, start, end)
+        .map_err(|_| "Nie można bezpiecznie rozliczyć zapisanych okresów uśpienia. Sprawdź dane i kopię.".into())
+}
+fn enrich_entries_with_sleep(db: &Connection, entries: &mut [Entry]) -> Cmd<()> {
+    for entry in entries {
+        if let Some((duration, periods)) = completed_sleep(db, entry.id, &entry.started_at, &entry.ended_at)? {
+            entry.duration_seconds = duration;
+            entry.sleep_periods = Some(periods);
+        }
+    }
+    Ok(())
+}
+
 // Unlike the history preview, a report must include every non-deleted entry.
 // The active interval is only a provisional projection and is withheld whenever
 // sleep, a clock change, a restart, or an unavailable power sample is detected.
@@ -178,27 +231,40 @@ fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample
     ensure_available(tracker)?;
     let project = entry_project_sql(&tracker.db, "time_entries")?;
     let entries = tracker.db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id")).map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    enrich_entries_with_sleep(&tracker.db, &mut entries)?;
     let row: Option<(i64, Option<i64>, String, bool, String, i64)> = tracker.db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_err)?;
     let active = row.map(|(id, task_id, started_at, billable, description, project_id)| {
-        let projection = tracker.running_since.as_ref().and_then(|clock| {
-            let power = power.as_ref().ok()?;
-            if sleep_or_invalid(clock.power, *power) { return None; }
-            let start = DateTime::parse_from_rfc3339(&started_at).ok()?;
-            let wall_ms = current.timestamp_millis().checked_sub(start.timestamp_millis())?;
-            if wall_ms < 0 { return None; }
-            let wall = wall_ms / 1_000;
-            let elapsed = i64::try_from(clock.since.elapsed().as_secs()).ok()?;
-            if wall < 0 || (wall - elapsed).abs() > 2 { return None; }
-            Some((current.to_rfc3339_opts(SecondsFormat::Millis, true), wall))
-        });
+        let projection = active_projection(tracker, &started_at, current, &power);
         let unresolved = projection.is_none();
         let (ended_at, duration_seconds) = match projection { Some((end, duration)) => (Some(end), Some(duration)), None => (None, None) };
         ReportActive { id, task_id, project_id, started_at, ended_at, duration_seconds, unresolved, billable, description }
     });
     let time_zone = tracker.db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
     Ok(ReportData { entries, active, time_zone })
+}
+
+fn pending_sleep(db: &Connection) -> Cmd<Vec<PendingSleep>> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(Vec::new()); }
+    let mut stmt = db.prepare("SELECT s.id,s.entry_id,s.started_ms,s.ended_ms,c.name,p.name,t.name FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id WHERE s.decision='pending' AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id) ORDER BY s.started_ms,s.id").map_err(db_err)?;
+    let rows = stmt.query_map([], |r| Ok(PendingSleep { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, client:r.get(4)?, project:r.get(5)?, task:r.get(6)? })).map_err(db_err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+}
+
+#[tauri::command]
+fn get_pending_sleep(state: State<'_, Shared>) -> Cmd<Vec<PendingSleep>> {
+    let tracker = locked(&state)?;
+    pending_sleep(&tracker.db)
+}
+
+#[tauri::command]
+fn resolve_sleep_period(state: State<'_, Shared>, entry_id: i64, period_id: i64, include: bool) -> Cmd<()> {
+    let mut tracker = locked(&state)?;
+    sleep_periods::resolve(&mut tracker.db, entry_id, period_id, include, Utc::now().timestamp_millis())
+        .map_err(|_| "Nie można zapisać decyzji. Odśwież listę i spróbuj ponownie.".into())
 }
 
 #[tauri::command]
@@ -218,7 +284,14 @@ fn client_export_data(db: &Connection, client_id: i64) -> Cmd<ExportData> {
     let mismatch: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id={project} LEFT JOIN tasks t ON t.id=e.task_id WHERE p.client_id=?1 AND e.task_id IS NOT NULL AND (t.id IS NULL OR t.project_id<>p.id) AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id))"), [client_id], |r| r.get(0)).map_err(db_err)?;
     if mismatch { return Err("Nie można wyeksportować danych: zadanie nie pasuje do projektu. Sprawdź bazę danych.".into()); }
     let sql = format!("SELECT e.id,c.name,p.name,COALESCE(t.name,''),COALESCE(d.description,''),e.started_at,e.ended_at,e.duration_seconds,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e JOIN projects p ON p.id={project} JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id LEFT JOIN entry_descriptions d ON d.entry_id=e.id WHERE p.client_id=?1 AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id");
-    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)?, sleep_periods:None })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    for entry in &mut entries {
+        if let Some((duration, periods)) = completed_sleep(db, entry.id, &entry.started_at, &entry.ended_at)? {
+            entry.duration_seconds = duration;
+            entry.sleep_periods = Some(periods);
+        }
+    }
     Ok(ExportData { client_id, client, time_zone, entries })
 }
 
@@ -557,7 +630,7 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
 
 fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Option<i64>, description: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
-    if version == 11 {
+    if version == 11 || version == 12 {
         let active: Option<i64> = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r|r.get(0)).optional().map_err(db_err)?;
         let action = match next_task {
             Some(task_id) => {
@@ -639,7 +712,7 @@ fn change_timer(tracker: &mut Tracker, end: &str, next_task: Option<i64>, descri
 
 fn resume_saved_entry(tracker: &mut Tracker, source_id: i64, expected_active_id: Option<i64>, at: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r|r.get(0)).map_err(db_err)?;
-    if version == 11 { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
+    if version == 11 || version == 12 { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
     if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != expected_active_id { return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into()); }
     change_timer(tracker, at, None, "", Some(source_id))
 }
@@ -700,11 +773,71 @@ fn widget_shortcut_ready(state: State<'_, Hotkey>) -> Cmd<()> {
     Ok(())
 }
 #[derive(Serialize)]
-struct ShortcutStatus { registered: bool, message: String }
+struct ShortcutStatus { registered: bool, message: String, shortcut: String }
 #[tauri::command]
 fn shortcut_status(state: State<'_, Hotkey>) -> Cmd<ShortcutStatus> {
     let hotkey = state.lock().map_err(|_| "Błąd skrótu.".to_string())?;
-    Ok(ShortcutStatus { registered: hotkey.registered, message: hotkey.message.clone() })
+    Ok(ShortcutStatus { registered: hotkey.registered, message: hotkey.message.clone(), shortcut: hotkey.shortcut.clone() })
+}
+
+fn valid_shortcut(value: &str) -> bool {
+    let key = value.strip_prefix("Ctrl+Shift+").or_else(|| value.strip_prefix("Ctrl+Alt+"));
+    let Some(key) = key else { return false; };
+    let valid_key = key == "Space" || (key.len() == 1 && key.as_bytes()[0].is_ascii_uppercase()) ||
+        key.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n) && key == format!("F{n}"));
+    valid_key && value.parse::<Shortcut>().is_ok()
+}
+
+fn save_shortcut_preference(dir: &std::path::Path, value: &str) -> Cmd<()> {
+    use std::io::Write;
+    if !valid_shortcut(value) { return Err("Nieprawidłowy skrót.".into()); }
+    let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "Błąd zegara ustawień.")?.as_nanos();
+    let temp = dir.join(format!("shortcut-{}-{suffix}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(value.as_bytes())?; file.sync_all()?; drop(file);
+        std::fs::rename(&temp, dir.join("shortcut.txt"))
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    result.map_err(|_| "Nie udało się zapisać ustawienia skrótu.".into())
+}
+
+fn replace_shortcut<R, P, U>(old: &str, new: &str, registered: bool, mut register: R, mut persist: P, mut unregister: U) -> Cmd<()>
+where R: FnMut(&str) -> Cmd<()>, P: FnMut(&str) -> Cmd<()>, U: FnMut(&str) -> Cmd<()> {
+    register(new).map_err(|_| "Ten skrót jest niedostępny lub zajęty. Poprzedni skrót pozostaje bez zmian.".to_string())?;
+    if let Err(err) = persist(new) {
+        if unregister(new).is_err() { return Err("Nie udało się zapisać ustawienia ani zwolnić nowego skrótu. Uruchom aplikację ponownie i sprawdź ustawienia.".into()); }
+        return Err(err);
+    }
+    if registered && old != new && unregister(old).is_err() {
+        let restored = persist(old).is_ok();
+        let removed = unregister(new).is_ok();
+        return Err(if restored && removed { "Nie udało się zmienić skrótu. Poprzedni pozostał aktywny." } else { "Nie udało się w pełni przywrócić ustawienia skrótu. Uruchom aplikację ponownie i sprawdź ustawienia." }.into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_global_shortcut(app: tauri::AppHandle, shortcut: String, expected: String) -> Cmd<ShortcutStatus> {
+    if !valid_shortcut(&shortcut) { return Err("Wybierz poprawną kombinację klawiszy.".into()); }
+    let change = app.state::<HotkeyChange>();
+    let _change = change.0.lock().map_err(|_| "Błąd ustawień skrótu.")?;
+    let (old, registered) = {
+        let state = app.state::<Hotkey>();
+        let hotkey = state.lock().map_err(|_| "Błąd skrótu.")?;
+        if hotkey.shortcut != expected { return Err("Ustawienie zmieniło się w innym oknie. Odśwież i spróbuj ponownie.".into()); }
+        (hotkey.shortcut.clone(), hotkey.registered)
+    };
+    if old == shortcut && registered { return shortcut_status(app.state::<Hotkey>()); }
+    let dir = app.path().app_data_dir().map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    replace_shortcut(&old, &shortcut, registered,
+        |value| app.global_shortcut().register(value).map_err(|_| "Błąd rejestracji.".into()),
+        |value| save_shortcut_preference(&dir, value),
+        |value| app.global_shortcut().unregister(value).map_err(|_| "Błąd wyrejestrowania.".into()))?;
+    let state = app.state::<Hotkey>();
+    let mut hotkey = state.lock().map_err(|_| "Błąd skrótu.")?;
+    hotkey.shortcut = shortcut; hotkey.registered = true; hotkey.message.clear();
+    Ok(ShortcutStatus { registered: true, message: String::new(), shortcut: hotkey.shortcut.clone() })
 }
 
 #[tauri::command]
@@ -739,6 +872,7 @@ fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let active: Option<(i64, String)> = tx.query_row("SELECT id, started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_err)?;
     let (id, start) = active.ok_or("Nie ma pomiaru do odzyskania.")?;
+    ensure_no_sleep_periods(&tx, id)?;
     let start = DateTime::parse_from_rfc3339(&start).map_err(|_| "Niepoprawny zapis czasu w bazie.")?.with_timezone(&Utc);
     if end < start { return Err("Zakończenie nie może być przed rozpoczęciem pomiaru.".into()); }
     if end > start { ensure_no_overlap(&tx, start, end, Some(id))?; }
@@ -791,7 +925,7 @@ fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended
 
 fn add_manual_entry_with_description(tracker: &mut Tracker, task_id: i64, started_at: &str, ended_at: &str, current: DateTime<Utc>, description: &str) -> Cmd<i64> {
     let version: i64=tracker.db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(db_err)?;
-    if version == 11 {
+    if version == 11 || version == 12 {
         let project_id: Option<i64>=tracker.db.query_row("SELECT project_id FROM tasks WHERE id=?1",[task_id],|r|r.get(0)).optional().map_err(db_err)?;
         return optional_task_migration::insert_manual(tracker,project_id.ok_or("Nie znaleziono zadania.")?,Some(task_id),started_at,ended_at,current,description);
     }
@@ -816,6 +950,7 @@ fn correct_entry(tracker: &mut Tracker, entry_id: i64, expected_start: &str, exp
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let previous: Option<(String, String, i64)> = tx.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
     let (old_start, old_end, old_seconds) = previous.ok_or("Nie znaleziono zakończonego wpisu.")?;
+    ensure_no_sleep_periods(&tx, entry_id)?;
     if old_start != expected_start || old_end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed korektą.".into()); }
     ensure_no_overlap(&tx, start, end, Some(entry_id))?;
     let new_start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -862,6 +997,7 @@ fn mark_entry_deleted(tracker: &mut Tracker, entry_id: i64, expected_start: &str
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let entry: Option<(String, String)> = tx.query_row("SELECT started_at,ended_at FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_err)?;
     let (start, end) = entry.ok_or("Nie znaleziono zakończonego wpisu lub wpis został już usunięty.")?;
+    ensure_no_sleep_periods(&tx, entry_id)?;
     if start != expected_start || end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed usunięciem.".into()); }
     tx.execute("INSERT INTO entry_deletions(entry_id,deleted_at) VALUES(?1,?2)", params![entry_id,deleted_at]).map_err(db_err)?;
     tx.commit().map_err(db_err)
@@ -1054,11 +1190,14 @@ fn initialise_v10(db: &mut Connection) -> rusqlite::Result<()> {
 fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = db.pragma_query_value(None,"user_version",|r|r.get(0))?;
-    if version > 11 { return Err(rusqlite::Error::InvalidQuery); }
+    if version > 12 { return Err(rusqlite::Error::InvalidQuery); }
     if version <= 10 {
         initialise_v10(db)?;
         optional_task_migration::migrate(db)?;
     }
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version == 11 { sleep_periods::migrate(db)?; }
+    sleep_periods::validate(db)?;
     validate_schema(db)?;
     validate_revisions_schema(db)?;
     validate_deletions_schema(db)?;
@@ -1075,18 +1214,36 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
 // A failed backup prevents migration; a new installation needs no backup.
 fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: bool) -> rusqlite::Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if existing && (0..11).contains(&version) {
+    if existing && (0..12).contains(&version) {
         storage_safety::create_backup(db, dir)?;
     }
     initialise(db)
 }
 
+// Reuse the same schema capabilities for global shortcuts as normal project
+// starts. v12 adds sleep-period storage without removing v11 project timers.
+fn start_project_from_shortcut(tracker: &mut Tracker, project_id: i64, task_id: Option<i64>, at: &str) -> Cmd<()> {
+    let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    match version {
+        11 | 12 => optional_task_migration::transition(
+            tracker, None, at,
+            optional_task_migration::TimerAction::Start { project_id, task_id, description: "" },
+        ),
+        10 => match task_id {
+            Some(task_id) => close_active(tracker, at, Some(task_id)),
+            None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()),
+        },
+        _ => Err("Nie można odczytać wersji bazy danych.".into()),
+    }
+}
+
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
+        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| {
             if event.state() != ShortcutState::Pressed { return; }
             let hotkey = app.state::<Hotkey>();
             let Ok(mut hotkey) = hotkey.lock() else { return; };
+            if !hotkey.registered || hotkey.shortcut.parse::<Shortcut>().map(|active| active.id()).ok() != Some(shortcut.id()) { return; }
             if let Some(widget) = app.get_webview_window("widget") {
                 if !hotkey.widget_ready {
                     hotkey.message = "Mini timer nie jest jeszcze gotowy do obsługi skrótu.".into();
@@ -1100,11 +1257,7 @@ fn main() {
             let result = match snapshot(&tracker) {
                 Ok(current) if current.active.is_some() => close_active(&mut tracker, &now(), None),
                 Ok(_) => match (hotkey.project_id,hotkey.task_id) {
-                    (Some(project_id),task_id) => match tracker.db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)) {
-                        Ok(11) => optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id,task_id,description:"" }),
-                        Ok(10) => match task_id { Some(task_id) => close_active(&mut tracker,&now(),Some(task_id)), None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()) },
-                        _ => Err("Nie można odczytać wersji bazy danych.".into()),
-                    },
+                    (Some(project_id), task_id) => start_project_from_shortcut(&mut tracker, project_id, task_id, &now()),
                     (None,Some(task_id)) => close_active(&mut tracker, &now(), Some(task_id)),
                     (None,None) => Err("Wybierz projekt w mini timerze przed użyciem skrótu.".into()),
                 },
@@ -1143,11 +1296,14 @@ fn main() {
             })?;
             app.manage(Mutex::new(Tracker { db, running_since: None, restored: false }));
             app.manage(Mutex::new(HotkeyState::default()));
+            app.manage(HotkeyChange(Mutex::new(())));
             app.manage(Mutex::new(RestoreState::default()));
-            let registered = app.global_shortcut().register("Ctrl+Shift+Space");
+            let saved = std::fs::read_to_string(dir.join("shortcut.txt")).ok().filter(|value| valid_shortcut(value)).unwrap_or_else(|| DEFAULT_SHORTCUT.into());
+            let registered = app.global_shortcut().register(saved.as_str());
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
+                state.shortcut = saved;
                 state.registered = registered.is_ok();
-                if registered.is_err() { state.message = "Globalny skrót Ctrl+Shift+Spacja jest niedostępny lub zajęty. Działa tylko w oknie widgetu.".into(); }
+                if registered.is_err() { state.message = "Wybrany globalny skrót jest niedostępny lub zajęty. Możesz wybrać inny w ustawieniach.".into(); }
             }
             let show = MenuItem::with_id(app, "show", "Otwórz TrackerMaster", true, None::<&str>)?;
             let widget = MenuItem::with_id(app, "widget", "Otwórz mini timer", true, None::<&str>)?;
@@ -1212,7 +1368,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -1244,6 +1400,57 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_shortcut_starts_project_after_v12_sleep_migration() {
+        for task_id in [None, Some(1)] {
+            let mut tracker = seeded();
+            initialise(&mut tracker.db).unwrap();
+            let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+            assert_eq!(version, 12);
+            start_project_from_shortcut(&mut tracker, 1, task_id, &now()).unwrap();
+            let active = snapshot(&tracker).unwrap().active.expect("Shortcut should create one running entry");
+            assert_eq!(active.project_id, 1);
+            assert_eq!(active.task_id, task_id);
+            let number: i64 = tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).unwrap();
+            assert_eq!(number, 1);
+        }
+    }
+
+    #[test]
+    fn shortcut_validation_and_preference_survive_replacement() {
+        assert!(valid_shortcut("Ctrl+Shift+Space"));
+        assert!(valid_shortcut("Ctrl+Alt+Q"));
+        assert!(valid_shortcut("Ctrl+Shift+F12"));
+        for bad in ["Ctrl+S", "Ctrl+Shift+F13", "Ctrl+Alt+F01", "Ctrl+Alt+q", "Ctrl+Shift+Space\n"] { assert!(!valid_shortcut(bad)); }
+        let suffix=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir=std::env::temp_dir().join(format!("tracker-shortcut-{}-{suffix}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        save_shortcut_preference(&dir,"Ctrl+Shift+Space").unwrap();
+        save_shortcut_preference(&dir,"Ctrl+Alt+Q").unwrap();
+        assert!(save_shortcut_preference(&dir,"bad").is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("shortcut.txt")).unwrap(),"Ctrl+Alt+Q");
+        std::fs::remove_file(dir.join("shortcut.txt")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_shortcut_conflict_or_save_keeps_the_old_registration() {
+        use std::{cell::RefCell, collections::HashSet, rc::Rc};
+        let old="Ctrl+Shift+Space"; let new="Ctrl+Alt+Q";
+        let registered=Rc::new(RefCell::new(HashSet::from([old.to_string()])));
+        let saved=Rc::new(RefCell::new(old.to_string()));
+        let r=registered.clone(); let p=saved.clone(); let u=registered.clone();
+        assert!(replace_shortcut(old,new,true, move |_| Err("occupied".into()), move |v| { *p.borrow_mut()=v.into(); Ok(()) }, move |v| { u.borrow_mut().remove(v); Ok(()) }).is_err());
+        assert!(r.borrow().contains(old)); assert_eq!(&*saved.borrow(),old);
+        let r=registered.clone(); let u=registered.clone();
+        assert!(replace_shortcut(old,new,true, move |v| { r.borrow_mut().insert(v.into()); Ok(()) }, move |_| Err("disk".into()), move |v| { u.borrow_mut().remove(v); Ok(()) }).is_err());
+        assert!(registered.borrow().contains(old)); assert!(!registered.borrow().contains(new)); assert_eq!(&*saved.borrow(),old);
+        let r=registered.clone(); let p=saved.clone(); let u=registered.clone();
+        replace_shortcut(old,new,true, move |v| { r.borrow_mut().insert(v.into()); Ok(()) }, move |v| { *p.borrow_mut()=v.into(); Ok(()) }, move |v| { u.borrow_mut().remove(v); Ok(()) }).unwrap();
+        assert!(!registered.borrow().contains(old)); assert!(registered.borrow().contains(new)); assert_eq!(&*saved.borrow(),new);
     }
 
     #[test]
@@ -1578,7 +1785,7 @@ mod tests {
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         initialise_with_backup(&mut tracker.db, &dir, true).unwrap();
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 12);
         let backups: Vec<_> = std::fs::read_dir(dir.join("backups")).unwrap().map(|entry| entry.unwrap().path()).collect();
         assert_eq!(backups.len(), 1);
         storage_safety::preflight_existing(&backups[0]).unwrap();
@@ -2091,4 +2298,36 @@ mod tests {
         assert_eq!(version, 0);
         assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'projects')", [], |r| r.get::<_, bool>(0)).unwrap());
     }
+    #[test]
+    fn completed_sleep_is_separate_in_report_and_client_export() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'),(2,'B'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt A'),(2,2,'Projekt B'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',10800),(2,2,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',10800);").unwrap();
+        let start=DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(1,?1,?2)",params![start,start+7200000]).unwrap();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(2,?1,?2)",params![start,start+7200000]).unwrap();
+        let mut tracker=Tracker { db, running_since:None, restored:false };
+        let report=report_data(&tracker,Utc::now(),Err("unused".into())).unwrap();
+        let first=report.entries.iter().find(|entry|entry.id==1).unwrap();
+        assert_eq!(first.duration_seconds,3600);
+        assert_eq!(first.sleep_periods.as_ref().unwrap()[0].decision,"pending");
+        let client=client_export_data(&tracker.db,1).unwrap();
+        assert_eq!(client.entries.len(),1);
+        assert_eq!(client.entries[0].id,1);
+        assert_eq!(client.entries[0].duration_seconds,3600);
+        let pending=pending_sleep(&tracker.db).unwrap();
+        assert_eq!(pending.len(),2);
+        let period_id=client.entries[0].sleep_periods.as_ref().unwrap()[0].id;
+        let current=DateTime::parse_from_rfc3339("2026-01-02T10:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(correct_entry(&mut tracker,1,"2026-01-01T10:00:00Z","2026-01-01T13:00:00Z","2026-01-01T10:30:00Z","2026-01-01T13:00:00Z",current).is_err());
+        assert!(mark_entry_deleted(&mut tracker,1,"2026-01-01T10:00:00Z","2026-01-01T13:00:00Z","2026-01-02T10:00:00Z").is_err());
+        crate::sleep_periods::resolve(&mut tracker.db,1,period_id,true,start+7200001).unwrap();
+        let report=report_data(&tracker,Utc::now(),Err("unused".into())).unwrap();
+        assert_eq!(report.entries.iter().find(|entry|entry.id==1).unwrap().duration_seconds,10800);
+        assert_eq!(report.entries.iter().find(|entry|entry.id==2).unwrap().duration_seconds,3600);
+        let pending=pending_sleep(&tracker.db).unwrap();
+        assert_eq!(pending.len(),1);
+        assert_eq!(pending[0].entry_id,2);
+    }
+
 }
