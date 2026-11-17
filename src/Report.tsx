@@ -3,6 +3,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { dateInZone, reportByDay, reportOverlaps, validTimeZone } from './reportTime';
 import type { ReportEntry } from './reportTime';
 import { filterByClient } from './reportClientFilter';
+import { reportPresetRange } from './reportPresets';
+import type { ReportPreset } from './reportPresets';
 
 type Id = number | string;
 type Client = { id: Id; name: string };
@@ -25,6 +27,8 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   const [open, setOpen] = useState(false);
   const [from, setFrom] = useState(() => todayWarsaw().slice(0, 8) + '01');
   const [through, setThrough] = useState(todayWarsaw);
+  const [preset, setPreset] = useState<ReportPreset | 'custom'>('custom');
+  const [now, setNow] = useState(Date.now);
   const [client, setClient] = useState('');
   const [data, setData] = useState<Data | null>(null);
   const [error, setError] = useState('');
@@ -52,29 +56,39 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
     return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
   }, [open, loaded, refresh]);
 
+  useEffect(() => {
+    if (!open || preset === 'custom') return;
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, [open, preset]);
+
+  const range = useMemo(() => preset !== 'custom' && data && validTimeZone(data.time_zone)
+    ? reportPresetRange(preset, now, data.time_zone) : { from, through }, [preset, now, data, from, through]);
+
   const result = useMemo(() => {
     if (!data) return null;
     const { entries, active, missingRelations } = filterByClient(data.entries, data.active, projects, client);
     try {
       if (!validTimeZone(data.time_zone)) return { invalidZone: true as const };
-      const completed = reportByDay(entries, from, through, data.time_zone);
+      const completed = reportByDay(entries, range.from, range.through, data.time_zone);
       const activeEntry = active && !active.unresolved && active.ended_at !== null && active.duration_seconds !== null
         ? { id: active.id, started_at: active.started_at, ended_at: active.ended_at, duration_seconds: active.duration_seconds, billable: active.billable } : null;
-      const combined = reportByDay(activeEntry ? [...entries, activeEntry] : entries, from, through, data.time_zone);
-      const billableSeconds = reportByDay([...entries.filter(entry => entry.billable), ...(activeEntry?.billable ? [activeEntry] : [])], from, through, data.time_zone).totalSeconds;
-      const overlaps = reportOverlaps(activeEntry ? [...entries, activeEntry] : entries, from, through, data.time_zone);
+      const combined = reportByDay(activeEntry ? [...entries, activeEntry] : entries, range.from, range.through, data.time_zone);
+      const billableSeconds = reportByDay([...entries.filter(entry => entry.billable), ...(activeEntry?.billable ? [activeEntry] : [])], range.from, range.through, data.time_zone).totalSeconds;
+      const overlaps = reportOverlaps(activeEntry ? [...entries, activeEntry] : entries, range.from, range.through, data.time_zone);
       return { completed, combined, overlaps, active, activeSeconds: combined.totalSeconds - completed.totalSeconds, billableSeconds, missingRelations, invalidRange: false, invalidZone: false };
     } catch {
       return { invalidRange: true as const, invalidZone: false };
     }
-  }, [data, from, through, client, projects]);
+  }, [data, range.from, range.through, client, projects]);
 
   return <section className="card report" aria-label="Raport czasu">
     <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div><button type="button" className="secondary report-button" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
     {open && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
-      {data && <details className="report-zone"><summary>Zmień strefę raportowania</summary><p className="muted">Podaj nazwę strefy IANA, np. Europe/Warsaw, Europe/London lub America/New_York. Zmiana przeliczy przypisanie wcześniejszych pomiarów do dni, bez zmiany zapisanych pomiarów.</p><label>Strefa raportowania<input value={zoneDraft} list="report-time-zones" onChange={e => { setZoneDraft(e.target.value); setZoneError(''); }} /></label><datalist id="report-time-zones"><option value="Europe/Warsaw" /><option value="Europe/London" /><option value="Europe/Berlin" /><option value="America/New_York" /><option value="UTC" /></datalist>{' '}<button className="secondary report-button" type="button" disabled={zoneSaving || !loaded} onClick={() => { if (!validTimeZone(zoneDraft)) { setZoneError('Podaj poprawną nazwę strefy IANA, np. Europe/Warsaw.'); return; } setZoneSaving(true); setZoneError(''); void invoke('set_report_timezone', { expectedTimeZone: data.time_zone, timeZone: zoneDraft }).then(() => setRefresh(n => n + 1)).catch(e => { setZoneError(`Nie udało się zapisać strefy: ${String(e)}`); setRefresh(n => n + 1); }).finally(() => setZoneSaving(false)); }}>Zapisz strefę</button>{zoneError && <div role="alert" className="alert error">{zoneError}</div>}</details>}
-      <div className="selectors report-filters"><label>Od<input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label>Do<input type="date" value={through} onChange={e => setThrough(e.target.value)} /></label><label>Klient<select value={client} onChange={e => setClient(e.target.value)}><option value="">Wszyscy klienci</option>{clients.map(c => <option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></label></div>
+      {data && <details className="report-zone"><summary>Zmień strefę raportowania</summary><p className="muted">Podaj nazwę strefy IANA, np. Europe/Warsaw, Europe/London lub America/New_York. Zmiana przeliczy przypisanie wcześniejszych pomiarów do dni, bez zmiany zapisanych pomiarów.</p><label>Strefa raportowania<input value={zoneDraft} disabled={zoneSaving} list="report-time-zones" onChange={e => { setZoneDraft(e.target.value); setZoneError(''); }} /></label><datalist id="report-time-zones"><option value="Europe/Warsaw" /><option value="Europe/London" /><option value="Europe/Berlin" /><option value="America/New_York" /><option value="UTC" /></datalist>{' '}<button className="secondary report-button" type="button" disabled={zoneSaving || !loaded} onClick={() => { if (!validTimeZone(zoneDraft)) { setZoneError('Podaj poprawną nazwę strefy IANA, np. Europe/Warsaw.'); return; } setZoneSaving(true); setZoneError(''); void invoke('set_report_timezone', { expectedTimeZone: data.time_zone, timeZone: zoneDraft }).then(() => { setNow(Date.now()); setRefresh(n => n + 1); }).catch(e => { setZoneError(`Nie udało się zapisać strefy: ${String(e)}`); setRefresh(n => n + 1); }).finally(() => setZoneSaving(false)); }}>Zapisz strefę</button>{zoneError && <div role="alert" className="alert error">{zoneError}</div>}</details>}
+      <div className="report-presets" aria-label="Szybki wybór zakresu"><button type="button" className="secondary report-button" aria-pressed={preset === 'today'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('today'); }}>Dzisiaj</button><button type="button" className="secondary report-button" aria-pressed={preset === 'week'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('week'); }}>Ten tydzień</button></div>
+      <div className="selectors report-filters"><label>Od<input type="date" value={range.from} onChange={e => { setFrom(e.target.value); setThrough(range.through); setPreset('custom'); }} /></label><label>Do<input type="date" value={range.through} onChange={e => { setFrom(range.from); setThrough(e.target.value); setPreset('custom'); }} /></label><label>Klient<select value={client} onChange={e => setClient(e.target.value)}><option value="">Wszyscy klienci</option>{clients.map(c => <option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></label></div>
       {!loaded && <p role="status">Odśwież dane aplikacji, aby wyświetlić raport.</p>}
       {error && <div role="alert" className="alert error">{error} <button type="button" onClick={() => setRefresh(n => n + 1)}>Ponów</button></div>}
       {loaded && !data && !error && <p role="status">Wczytywanie raportu…</p>}

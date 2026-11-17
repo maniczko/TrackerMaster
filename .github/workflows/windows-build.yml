@@ -22,7 +22,7 @@ jobs:
       - name: Check frontend
         run: npm run build
       - name: Check report calculations
-        run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts
+        run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts tests/reportPresets.test.ts
       - name: Run Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build Windows executable
