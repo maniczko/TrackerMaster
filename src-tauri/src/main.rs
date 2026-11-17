@@ -498,21 +498,27 @@ fn set_widget_on_top(app: tauri::AppHandle, on_top: bool) -> Cmd<()> {
     app.get_webview_window("widget").ok_or("Nie znaleziono widgetu.")?
         .set_always_on_top(on_top).map_err(|e| e.to_string())
 }
+fn add_client(db: &Connection, name: &str) -> Cmd<i64> {
+    db.execute("INSERT INTO clients(name) VALUES(?1)", [valid_name(name)?]).map_err(db_err)?;
+    Ok(db.last_insert_rowid())
+}
 #[tauri::command]
 fn create_client(state: State<'_, Shared>, name: String) -> Cmd<i64> {
     let tracker = locked(&state)?;
-    tracker.db.execute("INSERT INTO clients(name) VALUES(?1)", [valid_name(&name)?]).map_err(db_err)?;
-    Ok(tracker.db.last_insert_rowid())
+    add_client(&tracker.db, &name)
+}
+fn add_project(db: &Connection, client_id: i64, name: &str) -> Cmd<i64> {
+    let name = valid_name(name)?;
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=clients.id))", [client_id], |r| r.get::<_, bool>(0)).map_err(db_err)? {
+        return Err("Wybierz istniejącego klienta.".into());
+    }
+    db.execute("INSERT INTO projects(client_id,name) VALUES(?1,?2)", params![client_id,name]).map_err(db_err)?;
+    Ok(db.last_insert_rowid())
 }
 #[tauri::command]
 fn create_project(state: State<'_, Shared>, client_id: i64, name: String) -> Cmd<i64> {
     let tracker = locked(&state)?;
-    let name = valid_name(&name)?;
-    if !tracker.db.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=clients.id))", [client_id], |r| r.get::<_, bool>(0)).map_err(db_err)? {
-        return Err("Wybierz istniejącego klienta.".into());
-    }
-    tracker.db.execute("INSERT INTO projects(client_id,name) VALUES(?1,?2)", params![client_id,name]).map_err(db_err)?;
-    Ok(tracker.db.last_insert_rowid())
+    add_project(&tracker.db, client_id, &name)
 }
 #[tauri::command]
 fn create_task(state: State<'_, Shared>, project_id: i64, name: String) -> Cmd<i64> {
@@ -1441,6 +1447,49 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_project_timer_and_export_survive_restart_on_isolated_file() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let suffix=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir=std::env::temp_dir().join(format!("trackermaster-journey-{}-{suffix}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path=dir.join("journey.sqlite3");
+        {
+            let mut db=Connection::open(&path).unwrap();
+            initialise(&mut db).unwrap();
+            assert!(add_client(&db,"   ").is_err());
+            let client=add_client(&db,"Klient testowy").unwrap();
+            assert!(add_project(&db,client+1000,"Brak klienta").is_err());
+            let project=add_project(&db,client,"Projekt testowy").unwrap();
+            let other_client=add_client(&db,"Drugi klient").unwrap();
+            let mut tracker=Tracker { db,running_since:None,restored:false };
+            optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id:project,task_id:None,description:"Fikcyjna praca" }).unwrap();
+            let active=snapshot(&tracker).unwrap().active.unwrap();
+            assert_eq!((active.project_id,active.task_id,active.description.as_str()),(project,None,"Fikcyjna praca"));
+            std::thread::sleep(Duration::from_millis(1200));
+            optional_task_migration::transition(&mut tracker,Some(active.id),&now(),optional_task_migration::TimerAction::Stop).unwrap();
+            let entry=snapshot(&tracker).unwrap().entries.remove(0);
+            assert_eq!(entry.id,active.id);
+            assert!(entry.duration_seconds>=1);
+            let exported=client_export_data(&tracker.db,client).unwrap();
+            assert_eq!(exported.entries.len(),1);
+            assert_eq!((exported.entries[0].id,exported.entries[0].description.as_str()),(entry.id,"Fikcyjna praca"));
+            assert!(client_export_data(&tracker.db,other_client).unwrap().entries.is_empty());
+        }
+        {
+            let mut db=Connection::open(&path).unwrap();
+            initialise(&mut db).unwrap();
+            let tracker=Tracker { db,running_since:None,restored:false };
+            let state=snapshot(&tracker).unwrap();
+            assert_eq!((state.clients.len(),state.projects.len(),state.entries.len()),(2,1,1));
+            assert_eq!(state.entries[0].description,"Fikcyjna praca");
+            assert!(state.active.is_none());
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[cfg(windows)]
