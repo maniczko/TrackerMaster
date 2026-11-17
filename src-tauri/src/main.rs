@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod storage_safety;
-#[cfg(test)]
 mod optional_task_migration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -470,8 +469,9 @@ fn rename_item(state: State<'_, Shared>, kind: String, id: i64, expected_name: S
 }
 
 fn set_project_archived(db: &mut Connection, project_id: i64, archived: bool) -> Cmd<()> {
+    let project_column = entry_project_sql(db, "e")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
-    if archived && tx.query_row("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN tasks t ON t.id=e.task_id WHERE t.project_id=?1 AND e.ended_at IS NULL)", [project_id], |r| r.get::<_, bool>(0)).map_err(db_err)? {
+    if archived && tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e WHERE {project_column}=?1 AND e.ended_at IS NULL)"), [project_id], |r| r.get::<_, bool>(0)).map_err(db_err)? {
         return Err("Najpierw zakończ lub rozstrzygnij aktywny pomiar tego projektu.".into());
     }
     if !archived && tx.query_row("SELECT EXISTS(SELECT 1 FROM projects p JOIN client_archives a ON a.client_id=p.client_id WHERE p.id=?1)", [project_id], |r| r.get::<_,bool>(0)).map_err(db_err)? { return Err("Najpierw przywróć klienta, do którego należy ten projekt.".into()); }
@@ -481,11 +481,12 @@ fn set_project_archived(db: &mut Connection, project_id: i64, archived: bool) ->
 }
 
 fn set_client_archived(db: &mut Connection, client_id: i64, archived: bool) -> Cmd<()> {
+    let project_column = entry_project_sql(db, "e")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     if !tx.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1)", [client_id], |r| r.get::<_,bool>(0)).map_err(db_err)? { return Err("Nie znaleziono klienta.".into()); }
     if archived {
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE client_id=?1 AND archived=0)", [client_id], |r| r.get::<_,bool>(0)).map_err(db_err)? { return Err("Klient ma aktywne projekty. Zarchiwizuj je przed archiwizacją klienta.".into()); }
-        if tx.query_row("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN tasks t ON t.id=e.task_id JOIN projects p ON p.id=t.project_id WHERE p.client_id=?1 AND e.ended_at IS NULL)", [client_id], |r| r.get::<_,bool>(0)).map_err(db_err)? { return Err("Najpierw zakończ lub rozstrzygnij aktywny pomiar klienta.".into()); }
+        if tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id={project_column} WHERE p.client_id=?1 AND e.ended_at IS NULL)"), [client_id], |r| r.get::<_,bool>(0)).map_err(db_err)? { return Err("Najpierw zakończ lub rozstrzygnij aktywny pomiar klienta.".into()); }
         tx.execute("INSERT OR IGNORE INTO client_archives(client_id) VALUES(?1)", [client_id]).map_err(db_err)?;
     } else { tx.execute("DELETE FROM client_archives WHERE client_id=?1", [client_id]).map_err(db_err)?; }
     tx.commit().map_err(db_err)
@@ -885,6 +886,12 @@ fn validate_client_archives_schema(db: &Connection) -> rusqlite::Result<()> {
     let conflict = db.query_row("SELECT EXISTS(SELECT 1 FROM client_archives a JOIN projects p ON p.client_id=a.client_id WHERE p.archived=0)", [], |r| r.get::<_,bool>(0))?;
     let active = db.query_row("SELECT EXISTS(SELECT 1 FROM client_archives a JOIN projects p ON p.client_id=a.client_id JOIN tasks t ON t.project_id=p.id JOIN time_entries e ON e.task_id=t.id WHERE e.ended_at IS NULL)", [], |r| r.get::<_,bool>(0))?;
     if !fk || !pk || conflict || active { return Err(rusqlite::Error::InvalidQuery); }
+    Ok(())
+}
+
+fn validate_project_timer_activity(db: &Connection) -> rusqlite::Result<()> {
+    let invalid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id=e.project_id WHERE e.ended_at IS NULL AND (p.archived=1 OR EXISTS(SELECT 1 FROM client_archives c WHERE c.client_id=p.client_id)))", [], |r| r.get(0))?;
+    if invalid { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 

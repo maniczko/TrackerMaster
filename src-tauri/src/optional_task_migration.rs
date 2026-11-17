@@ -251,6 +251,9 @@ mod tests {
         assert_eq!((active.id,active.project_id,active.task_id),(id,1,None));
         let report=crate::report_data(&tracker,Utc::now(),crate::power_sample()).unwrap();
         assert_eq!((report.active.as_ref().unwrap().project_id,report.active.unwrap().task_id),(1,None));
+        let health=crate::storage_safety::diagnose_database(&tracker.db).unwrap();
+        assert_eq!((health.schema_version,health.open_entries),(11,1));
+        assert!(crate::set_project_archived(&mut tracker.db,1,true).is_err());
         assert!(transition(&mut tracker,None,&crate::now(),TimerAction::Start { project_id:2,task_id:None,description:"Błędny stan" }).is_err());
         assert!(transition(&mut tracker,Some(id),&crate::now(),TimerAction::Start { project_id:2,task_id:Some(1),description:"Zły projekt" }).is_err());
         assert_eq!(tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),id);

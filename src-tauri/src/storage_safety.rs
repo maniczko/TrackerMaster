@@ -60,7 +60,7 @@ fn validate_database(db: &Connection) -> Result<()> {
         return Err(invalid());
     }
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if !(0..=10).contains(&version) {
+    if !(0..=11).contains(&version) {
         return Err(invalid());
     }
 
@@ -89,6 +89,7 @@ fn validate_database(db: &Connection) -> Result<()> {
     if version >= 8 { crate::validate_billing_schema(db)?; }
     if version >= 9 { crate::validate_task_archives_schema(db)?; }
     if version >= 10 { crate::validate_description_schema(db)?; }
+    if version >= 11 { crate::optional_task_migration::validate(db)?; crate::validate_project_timer_activity(db)?; }
     // A PRAGMA integrity_check does not detect broken relationships, and
     // stored data may have been written with foreign_keys disabled.
     for (table, from, target, to) in [
@@ -414,7 +415,7 @@ mod tests {
         assert!(prepare_restore(&invalid_path).is_err());
         let mut source = Connection::open(&source_path).unwrap();
         crate::initialise(&mut source).unwrap();
-        source.pragma_update(None, "user_version", 11).unwrap();
+        source.pragma_update(None, "user_version", 12).unwrap();
         assert!(prepare_restore(&source_path).is_err());
         source.pragma_update(None, "user_version", 10).unwrap();
         let prepared = prepare_restore(&source_path).unwrap();
