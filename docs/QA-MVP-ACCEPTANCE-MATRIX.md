@@ -1,18 +1,18 @@
 # TECH-06 — Macierz testów i odbioru MVP TrackerMaster
 
 **Data opracowania:** 2026-11-17  
-**Źródła:** Notion „Backlog — Personal Time Tracker”: PTT-01–PTT-41, TECH-06, DEV-15, QA-01 oraz decyzje D1–D12; GitHub \`main\` bazowo \`d9f70423d9cb2ffff0ed22d6308fb08c7da3de8c\`.  
+**Źródła:** Notion „Backlog — Personal Time Tracker”: PTT-01–PTT-41, TECH-06, DEV-15, QA-01 oraz decyzje D1–D12; GitHub `main` bazowo `d9f70423d9cb2ffff0ed22d6308fb08c7da3de8c`.  
 **Status dokumentu:** PLAN DO NIEZALEŻNEGO REVIEW. Wszystkie wyniki wykonania niżej są **NOT RUN** — ten dokument nie jest protokołem przetestowania instalatora.  
-**Kryterium pokrycia:** 30 wymaganych w backlogu pozycji oznaczonych *MVP + Must* (PTT-05 i PTT-21 mają priorytet Should, więc nie są bramką Must). „Must” to priorytet wpisu, nie dowód zatwierdzonej akceptacji — właściwość \`Akceptacja\` wymaga odrębnego rozstrzygnięcia.
+**Kryterium pokrycia:** 30 wymaganych w backlogu pozycji oznaczonych *MVP + Must* (PTT-05 i PTT-21 mają priorytet Should, więc nie są bramką Must). „Must” to priorytet wpisu, nie dowód zatwierdzonej akceptacji — właściwość `Akceptacja` wymaga odrębnego rozstrzygnięcia.
 
 ## 1. Środowisko, dane i zasady
 
 - **System odbiorowy:** czysty Windows 11 x64, zwykłe konto użytkownika, ochrony Windows aktywne (w tym aktualne ustawienia Smart App Control / Code Integrity), instalacja z docelowego pakietu. Nie wyłączać ochrony w celu zaliczenia testów.
 - **Aktualna decyzja dystrybucyjna D11 (17.11.2026):** *Microsoft Store, MSIX, Private audience, Free, pierwszy odbiorca = jedyne osobiste MSA właściciela*. Wcześniejsze instrukcje o NSIS należy traktować jako historyczne, a nie aktualną bramkę wydania. Konto Partner Center, paczka i prywatna grupa muszą zostać rzeczywiście skonfigurowane i niezależnie zweryfikowane; samo spisanie decyzji nie jest PASS.
-- **Dane wyłącznie syntetyczne:** klient **K-A „Test Alfa”**, klient **K-B „Test Beta”**; każdy ma projekt **„Wspólny”** z odrębnymi ID oraz zadania **A1, A2, B1**. Dodatkowo wpisy datowane na **2026-03-29** i **2026-10-25** dla przejść DST w \`Europe/Warsaw\`. Nie używać danych realnych klientów ani produkcyjnych kont.
-- **Uruchomienie:** zalogować konto standardowe, odłączyć internet w zadanych scenariuszach; zapisać architekturę, build Windows, commit, wersję aplikacji/pakietu, \`user_version\` SQLite, strefę IANA, hash pakietu, stan kontroli aplikacji i ścieżkę danych (bez pełnych danych konta).
+- **Dane wyłącznie syntetyczne:** klient **K-A „Test Alfa”**, klient **K-B „Test Beta”**; każdy ma projekt **„Wspólny”** z odrębnymi ID oraz zadania **A1, A2, B1**. Dodatkowo wpisy datowane na **2026-03-29** i **2026-10-25** dla przejść DST w `Europe/Warsaw`. Nie używać danych realnych klientów ani produkcyjnych kont.
+- **Uruchomienie:** zalogować konto standardowe, odłączyć internet w zadanych scenariuszach; zapisać architekturę, build Windows, commit, wersję aplikacji/pakietu, `user_version` SQLite, strefę IANA, hash pakietu, stan kontroli aplikacji i ścieżkę danych (bez pełnych danych konta).
 - **Bezpieczeństwo testów awaryjnych:** używać tylko izolowanego profilu/VM i kopii fikcyjnej bazy. Symulować brak miejsca, przerwanie procesu, niezgodną kopię i zmianę zegara **wyłącznie** w piaskownicy. Nie niszczyć bieżących danych ani nie instalować niepodpisanej wersji przez wyłączanie zabezpieczeń.
-- **Wynik testu:** \`PASS\`, \`FAIL\`, \`BLOCKED\`, \`NOT RUN\`. \`PASS\` wymaga **wykonanego** scenariusza i dowodu. Testu bez docelowego sprzętu/pakietu nie oznaczać PASS; brak Must jest BLOCKED dla bramki QA-01.
+- **Wynik testu:** `PASS`, `FAIL`, `BLOCKED`, `NOT RUN`. `PASS` wymaga **wykonanego** scenariusza i dowodu. Testu bez docelowego sprzętu/pakietu nie oznaczać PASS; brak Must jest BLOCKED dla bramki QA-01.
 
 ## 2. Macierz: wymagania Must MVP → scenariusze
 
@@ -77,7 +77,7 @@
 
 **T12 — raport klienta (PTT-20).** Dane: K-A = 2h w jednym dniu, K-B = 3h (również projekt nazwany „Wspólny”); jeden wpis usunięty, jeden aktywny, jeden pending. Kroki: filtr K-A, K-B i świadomy widok „wszyscy”; zmień okres i grupowanie; porównaj sumy z historią. Oczekiwane: K-A=2h, K-B=3h, razem 5h tylko gdy wybrano wszystkich; wpisy usunięte i niezatwierdzone nie zawyżają sum; filtr nie zmienia się sam po odświeżeniu.
 
-**T13 — podgląd i eksport jednego klienta (PTT-22/23/38).** Dane: K-A i K-B, opisy z polskimi znakami, średnikiem, cudzysłowem i nową linią; wpis przekraczający 24h. Kroki: wybierz K-A i okres, przygotuj podgląd, porównaj ID/liczby/czasy; pobierz CSV po potwierdzeniu; otwórz w polskim Excelu i parserze CSV; próbuj odpowiedzi backendu z obcym klientem/duplikatem ID. Oczekiwane: UTF-8 BOM, separator \`;\`, quoting, pełne sekundy i HH:MM:SS bez modulo 24h, daty IANA; podgląd = źródło pliku, brak wpisów K-B i brak powtórzonych ID, niezgodność powoduje odmowę eksportu. Testy PR #3 są automatyczne; QA GUI pozostaje osobny.
+**T13 — podgląd i eksport jednego klienta (PTT-22/23/38).** Dane: K-A i K-B, opisy z polskimi znakami, średnikiem, cudzysłowem i nową linią; wpis przekraczający 24h. Kroki: wybierz K-A i okres, przygotuj podgląd, porównaj ID/liczby/czasy; pobierz CSV po potwierdzeniu; otwórz w polskim Excelu i parserze CSV; próbuj odpowiedzi backendu z obcym klientem/duplikatem ID. Oczekiwane: UTF-8 BOM, separator `;`, quoting, pełne sekundy i HH:MM:SS bez modulo 24h, daty IANA; podgląd = źródło pliku, brak wpisów K-B i brak powtórzonych ID, niezgodność powoduje odmowę eksportu. Testy PR #3 są automatyczne; QA GUI pozostaje osobny.
 
 **T14 — backup i restore (PTT-25).** Dane: dwaj klienci z historią, otwarty timer, WAL aktywny, niezależna testowa kopia SQLite. Kroki: wykonaj kopię przy aktywnym timerze, sprawdź integralność; zakończ timer; wskaż kopię, obejrzyj podgląd, anuluj, potem świadomie potwierdź; spróbuj przywrócić uszkodzoną/nowszą kopię. Oczekiwane: spójny snapshot bez brakujących wpisów, brak zmian produkcyjnej bazy przed potwierdzeniem; odmowa złej kopii bez utraty danych, kopia bezpieczeństwa przed podmianą, restart po restore, brak stale działań innych okien.
 
@@ -85,7 +85,7 @@
 
 **T16 — pełny cykl offline (PTT-01/11/32).** Dane: obaj klienci, projekty i zadania, dzienny zestaw kilku pomiarów. Kroki: wyłącz internet przed startem; wykonaj lokalne CRUD, Start/Switch/Stop, historię, raport i CSV, restart; dopiero po teście przywróć internet. Oczekiwane: żadna kluczowa czynność MVP nie wymaga Notion/tokena ani połączenia; wszystkie ID i dane pozostają po restarcie, raport zgodny z zapisami.
 
-**T17 — jedna instancja (PTT-33).** Dane: aktywne okno i timer K-A. Kroki: uruchom \`tracker-master.exe\` drugi raz w tym samym profilu; sprawdź liczbę procesów i otwarte SQLite; uruchom z drugiego standardowego profilu Windows. Oczekiwane: nie ma drugiego zapisu do tej samej bazy ani drugiego timera; pierwsza sesja pozostaje responsywna; profil B ma własną izolowaną bazę.
+**T17 — jedna instancja (PTT-33).** Dane: aktywne okno i timer K-A. Kroki: uruchom `tracker-master.exe` drugi raz w tym samym profilu; sprawdź liczbę procesów i otwarte SQLite; uruchom z drugiego standardowego profilu Windows. Oczekiwane: nie ma drugiego zapisu do tej samej bazy ani drugiego timera; pierwsza sesja pozostaje responsywna; profil B ma własną izolowaną bazę.
 
 **T18 — zegar i strefa (PTT-34).** Dane: aktywny timer, strefa raportu Europe/Warsaw. Kroki: w VM przesuń zegar Windows w przód i wstecz, zmień strefę systemową; wróć do poprawnej daty i restart. Oczekiwane: brak ujemnego/zawyżonego czasu akceptowanego milcząco; niepewność wymaga ręcznego rozstrzygnięcia; strefa raportu nie zmienia się wskutek samej zmiany strefy komputera.
 
@@ -95,21 +95,21 @@
 
 **T21 — świadome zakończenie (PTT-07/37).** Dane: aktywny A1; otwarte główne okno i widget. Kroki: w tray wybierz „Zakończ aplikację”, odmów lub anuluj, a następnie zatrzymaj pomiar i zakończ; uruchom ponownie. Oczekiwane: po anulowaniu aplikacja odpowiada i timer nadal działa; po świadomym zakończeniu zapis i historia są poprawne, żadna ścieżka dialogu nie zawiesza aplikacji.
 
-**T22 — CSV injection i polskie znaki (PTT-22/39).** Dane: nazwy i opisy rozpoczynające się \`=\`, \`+\`, \`-\`, \`@\`, tabulatorem/nową linią; \`Zażółć gęślą jaźń\`, \`"test";\` i wielowierszowy opis. Kroki: podgląd, eksport CSV, otwórz w arkuszu i zweryfikuj cytowanie; ponownie odczytaj oryginalny wpis w SQLite. Oczekiwane: żaden tekst użytkownika nie jest wykonany jako formuła, polskie znaki i nowe linie zachowane, eksport nie modyfikuje opisu źródłowego.
+**T22 — CSV injection i polskie znaki (PTT-22/39).** Dane: nazwy i opisy rozpoczynające się `=`, `+`, `-`, `@`, tabulatorem/nową linią; `Zażółć gęślą jaźń`, `"test";` i wielowierszowy opis. Kroki: podgląd, eksport CSV, otwórz w arkuszu i zweryfikuj cytowanie; ponownie odczytaj oryginalny wpis w SQLite. Oczekiwane: żaden tekst użytkownika nie jest wykonany jako formuła, polskie znaki i nowe linie zachowane, eksport nie modyfikuje opisu źródłowego.
 
 ## 4. Dodatkowe bramki D11 wydania Store (NOT RUN)
 
 **R01 — prawdziwe MSIX i Private audience.** Dane: konto MSA właściciela (bez wpisywania adresu do dowodów), drugie niezaproszone MSA, czysty Windows 11 x64. Kroki: zweryfikuj zatwierdzony pakiet w Store, pozytywny pobór przez właściciela, negatywna próba obcego konta także z bezpośrednim linkiem. Oczekiwane: produkt Free, prywatna grupa tylko z MSA właściciela, brak nieautoryzowanego pobrania, nie rozszerzano grona testerów. Nie tworzyć konta/nie publikować bez osobnej operacyjnej autoryzacji.
 
-**R02 — trwałość po uninstall/reinstall MSIX.** Dane: K-A/K-B, ID, wpisy, korekty, backupy, ustawienia, zapisane hashe. Kroki: na rzeczywistym podpisanym pakiecie utwórz dane, aktualizuj wersję, odinstaluj normalnie, ponownie zainstaluj w tym samym profilu; sprawdź zarówno bazę główną, jak i WAL/SHM, ID i ustawienia. Oczekiwane: dedykowany **niewirtualizowany per-user AppData** zgodnie z ostatnią decyzją D11; żadnego wyzerowania danych po normalnym uninstall; migracje zachowują wszystkie relacje i historię. Nie domniemywać tego z działania Tauri \`app_data_dir\` ani testu debug EXE.
+**R02 — trwałość po uninstall/reinstall MSIX.** Dane: K-A/K-B, ID, wpisy, korekty, backupy, ustawienia, zapisane hashe. Kroki: na rzeczywistym podpisanym pakiecie utwórz dane, aktualizuj wersję, odinstaluj normalnie, ponownie zainstaluj w tym samym profilu; sprawdź zarówno bazę główną, jak i WAL/SHM, ID i ustawienia. Oczekiwane: dedykowany **niewirtualizowany per-user AppData** zgodnie z ostatnią decyzją D11; żadnego wyzerowania danych po normalnym uninstall; migracje zachowują wszystkie relacje i historię. Nie domniemywać tego z działania Tauri `app_data_dir` ani testu debug EXE.
 
-**R03 — podpis i reputacja / aktualizacja.** Dane: finalny Store MSIX, hash artefaktu, wersje N i N+1, Windows 11 x64 z aktywnymi zabezpieczeniami. Kroki: zweryfikuj tożsamość/podpis Store, instalację i uruchomienie, upgrade z wpisami klientów; sprawdź zdarzenia ochrony Windows. Oczekiwane: prawidłowa sygnatura i działające uruchomienie bez wyłączenia Smart App Control; brak utraty czasu i danych po upgrade; brak sekretów/poufnych danych w artefaktach. Sam zielony \`cargo test\` lub \`tauri build --no-bundle\` = niewystarczający dowód.
+**R03 — podpis i reputacja / aktualizacja.** Dane: finalny Store MSIX, hash artefaktu, wersje N i N+1, Windows 11 x64 z aktywnymi zabezpieczeniami. Kroki: zweryfikuj tożsamość/podpis Store, instalację i uruchomienie, upgrade z wpisami klientów; sprawdź zdarzenia ochrony Windows. Oczekiwane: prawidłowa sygnatura i działające uruchomienie bez wyłączenia Smart App Control; brak utraty czasu i danych po upgrade; brak sekretów/poufnych danych w artefaktach. Sam zielony `cargo test` lub `tauri build --no-bundle` = niewystarczający dowód.
 
 ## 5. Minimalny zapis wyniku (dla każdego Txx / Rxx)
 
 | Pole | Wymagane |
 |---|---|
-| Test ID / wymagania | Np. \`T14 / PTT-25\` |
+| Test ID / wymagania | Np. `T14 / PTT-25` |
 | Wykonawca i niezależny recenzent | Identyfikator, nie tajne dane konta |
 | Commit / tag / SHA-256 pakietu | Konkretna testowana wersja |
 | Środowisko | Windows 11 build, x64, tryb ochrony, profil, MSIX |
@@ -124,6 +124,6 @@
 ## 6. Otwarte uzgodnienia i kontrola aktualności
 
 - D11 i D12 mają nadal zbiorczy status „Do decyzji”; w ich treści znajdują się liczne zatwierdzone poddecyzje. Przed wykonaniem QA potwierdzić ostatnią wersję kontraktu (nowsze poddecyzje mogą nadpisywać wcześniejsze zapisy, np. NSIS→Store MSIX).
-- Właściwość \`Akceptacja\` wymaga osobnego zatwierdzenia; ten plan nie zmienia jej automatycznie.
+- Właściwość `Akceptacja` wymaga osobnego zatwierdzenia; ten plan nie zmienia jej automatycznie.
 - Przy nowym Must zmienić macierz, dodać scenariusz i ponownie zrewidować bramkę; nie zaliczać pokrycia testem, który nie spełnia nowego kontraktu.
 - Pokrycie scenariuszami = plan. Pokrycie wdrożeniem = osobny przegląd GitHub. Pokrycie wykonaniem = zarejestrowany wynik QA. Te trzy poziomy raportować oddzielnie.
