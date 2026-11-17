@@ -29,6 +29,7 @@ pub fn transition(tracker: &mut crate::Tracker, expected: Option<i64>, at: &str,
     };
     if let Some((project_id,task_id,description,_)) = &target { crate::valid_description(description)?; target_billing(&tx,*project_id,*task_id)?; }
     if let Some((id, active_project, active_task, started)) = active {
+        crate::ensure_no_sleep_periods(&tx, id)?;
         let seconds = elapsed.ok_or("Pomiar wymaga ręcznego ustalenia czasu zakończenia.")?;
         let uncertain = match crate::power_sample() { Ok(end_power) => crate::sleep_or_invalid(tracker.running_since.as_ref().unwrap().power,end_power), Err(_) => true };
         if uncertain { drop(tx); tracker.running_since=None; return Err("Wykryto przerwę w pracy systemu lub błąd zegara. Pomiar wymaga weryfikacji; nie został zakończony.".into()); }

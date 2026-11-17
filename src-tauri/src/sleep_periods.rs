@@ -99,6 +99,31 @@ pub fn list_for_entry(db: &Connection, entry_id: i64) -> Result<Vec<SleepPeriod>
     rows.collect()
 }
 
+/// Prepare a completed entry for reports. All boundaries are validated before
+/// returning data; an open or inconsistent interval makes the entry unsafe.
+pub fn completed_periods(db: &Connection, entry_id: i64, started_at: &str, ended_at: &str) -> Result<Option<(i64, Vec<SleepPeriod>)>> {
+    let periods = list_for_entry(db, entry_id)?;
+    if periods.is_empty() { return Ok(None); }
+    let start = DateTime::parse_from_rfc3339(started_at).map_err(|_| Error::InvalidQuery)?.timestamp_millis();
+    let end = DateTime::parse_from_rfc3339(ended_at).map_err(|_| Error::InvalidQuery)?.timestamp_millis();
+    if !valid_ms(start) || !valid_ms(end) || end < start { return Err(Error::InvalidQuery); }
+    let mut cursor = start;
+    let mut omitted = 0i64;
+    for period in &periods {
+        let period_end = period.ended_ms.ok_or(Error::InvalidQuery)?;
+        if period.entry_id != entry_id || period.started_ms < cursor || period.started_ms < start || period_end <= period.started_ms || period_end > end { return Err(Error::InvalidQuery); }
+        match period.decision.as_str() {
+            "pending" | "excluded" => omitted = omitted.checked_add(period_end - period.started_ms).ok_or(Error::InvalidQuery)?,
+            "included" => (),
+            _ => return Err(Error::InvalidQuery),
+        }
+        cursor = period_end;
+    }
+    let elapsed = end.checked_sub(start).ok_or(Error::InvalidQuery)?;
+    let work = elapsed.checked_sub(omitted).ok_or(Error::InvalidQuery)? / 1000;
+    Ok(Some((work, periods)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

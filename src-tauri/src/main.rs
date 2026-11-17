@@ -93,7 +93,7 @@ struct Task { id: i64, project_id: i64, name: String, archived: bool }
 #[derive(Serialize)]
 struct Active { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, recovered: bool, uncertain: bool, billable: bool, description: String }
 #[derive(Serialize)]
-struct Entry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String }
+struct Entry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 struct DeletedEntry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, deleted_at: String }
 #[derive(Serialize)]
@@ -109,7 +109,7 @@ struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at
 #[derive(Serialize)]
 struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
 #[derive(Serialize)]
-struct ExportEntry { id: i64, client: String, project: String, task: String, description: String, started_at: String, ended_at: String, duration_seconds: i64, billable: bool }
+struct ExportEntry { id: i64, client: String, project: String, task: String, description: String, started_at: String, ended_at: String, duration_seconds: i64, billable: bool, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 struct ExportData { client_id: i64, client: String, time_zone: String, entries: Vec<ExportEntry> }
 
@@ -182,8 +182,10 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
         Ok(Active { id:r.get(0)?, task_id:r.get(1)?, started_at, recovered, uncertain, billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)? })
     }).optional().map_err(db_err)?;
     let entries = db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500")).map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    enrich_entries_with_sleep(db, &mut entries)?;
     Ok(Snapshot { clients, projects, tasks, active, entries })
 }
 
@@ -193,6 +195,32 @@ fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
     snapshot(&tracker)
 }
 
+// Apply stored sleep decisions only to the entry that owns them. Any corrupt
+// or unfinished boundaries fail closed rather than silently adding work.
+fn ensure_no_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<()> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version >= 12 {
+        let found: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods WHERE entry_id=?1)", [entry_id], |r| r.get(0)).map_err(db_err)?;
+        if found { return Err("Wpis zawiera okresy uśpienia. Jego zmiana wymaga pełnej obsługi tych okresów.".into()); }
+    }
+    Ok(())
+}
+fn completed_sleep(db: &Connection, id: i64, start: &str, end: &str) -> Cmd<Option<(i64, Vec<sleep_periods::SleepPeriod>)>> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(None); }
+    sleep_periods::completed_periods(db, id, start, end)
+        .map_err(|_| "Nie można bezpiecznie rozliczyć zapisanych okresów uśpienia. Sprawdź dane i kopię.".into())
+}
+fn enrich_entries_with_sleep(db: &Connection, entries: &mut [Entry]) -> Cmd<()> {
+    for entry in entries {
+        if let Some((duration, periods)) = completed_sleep(db, entry.id, &entry.started_at, &entry.ended_at)? {
+            entry.duration_seconds = duration;
+            entry.sleep_periods = Some(periods);
+        }
+    }
+    Ok(())
+}
+
 // Unlike the history preview, a report must include every non-deleted entry.
 // The active interval is only a provisional projection and is withheld whenever
 // sleep, a clock change, a restart, or an unavailable power sample is detected.
@@ -200,8 +228,10 @@ fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample
     ensure_available(tracker)?;
     let project = entry_project_sql(&tracker.db, "time_entries")?;
     let entries = tracker.db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id")).map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    enrich_entries_with_sleep(&tracker.db, &mut entries)?;
     let row: Option<(i64, Option<i64>, String, bool, String, i64)> = tracker.db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_err)?;
     let active = row.map(|(id, task_id, started_at, billable, description, project_id)| {
         let projection = active_projection(tracker, &started_at, current, &power);
@@ -230,7 +260,14 @@ fn client_export_data(db: &Connection, client_id: i64) -> Cmd<ExportData> {
     let mismatch: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id={project} LEFT JOIN tasks t ON t.id=e.task_id WHERE p.client_id=?1 AND e.task_id IS NOT NULL AND (t.id IS NULL OR t.project_id<>p.id) AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id))"), [client_id], |r| r.get(0)).map_err(db_err)?;
     if mismatch { return Err("Nie można wyeksportować danych: zadanie nie pasuje do projektu. Sprawdź bazę danych.".into()); }
     let sql = format!("SELECT e.id,c.name,p.name,COALESCE(t.name,''),COALESCE(d.description,''),e.started_at,e.ended_at,e.duration_seconds,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e JOIN projects p ON p.id={project} JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id LEFT JOIN entry_descriptions d ON d.entry_id=e.id WHERE p.client_id=?1 AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id");
-    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)?, sleep_periods:None })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    for entry in &mut entries {
+        if let Some((duration, periods)) = completed_sleep(db, entry.id, &entry.started_at, &entry.ended_at)? {
+            entry.duration_seconds = duration;
+            entry.sleep_periods = Some(periods);
+        }
+    }
     Ok(ExportData { client_id, client, time_zone, entries })
 }
 
@@ -811,6 +848,7 @@ fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let active: Option<(i64, String)> = tx.query_row("SELECT id, started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_err)?;
     let (id, start) = active.ok_or("Nie ma pomiaru do odzyskania.")?;
+    ensure_no_sleep_periods(&tx, id)?;
     let start = DateTime::parse_from_rfc3339(&start).map_err(|_| "Niepoprawny zapis czasu w bazie.")?.with_timezone(&Utc);
     if end < start { return Err("Zakończenie nie może być przed rozpoczęciem pomiaru.".into()); }
     if end > start { ensure_no_overlap(&tx, start, end, Some(id))?; }
@@ -888,6 +926,7 @@ fn correct_entry(tracker: &mut Tracker, entry_id: i64, expected_start: &str, exp
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let previous: Option<(String, String, i64)> = tx.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
     let (old_start, old_end, old_seconds) = previous.ok_or("Nie znaleziono zakończonego wpisu.")?;
+    ensure_no_sleep_periods(&tx, entry_id)?;
     if old_start != expected_start || old_end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed korektą.".into()); }
     ensure_no_overlap(&tx, start, end, Some(entry_id))?;
     let new_start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -934,6 +973,7 @@ fn mark_entry_deleted(tracker: &mut Tracker, entry_id: i64, expected_start: &str
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let entry: Option<(String, String)> = tx.query_row("SELECT started_at,ended_at FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_err)?;
     let (start, end) = entry.ok_or("Nie znaleziono zakończonego wpisu lub wpis został już usunięty.")?;
+    ensure_no_sleep_periods(&tx, entry_id)?;
     if start != expected_start || end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed usunięciem.".into()); }
     tx.execute("INSERT INTO entry_deletions(entry_id,deleted_at) VALUES(?1,?2)", params![entry_id,deleted_at]).map_err(db_err)?;
     tx.commit().map_err(db_err)
@@ -2204,4 +2244,31 @@ mod tests {
         assert_eq!(version, 0);
         assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'projects')", [], |r| r.get::<_, bool>(0)).unwrap());
     }
+    #[test]
+    fn completed_sleep_is_separate_in_report_and_client_export() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'),(2,'B'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt A'),(2,2,'Projekt B'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',10800),(2,2,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',10800);").unwrap();
+        let start=DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(1,?1,?2)",params![start,start+7200000]).unwrap();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(2,?1,?2)",params![start,start+7200000]).unwrap();
+        let mut tracker=Tracker { db, running_since:None, restored:false };
+        let report=report_data(&tracker,Utc::now(),Err("unused".into())).unwrap();
+        let first=report.entries.iter().find(|entry|entry.id==1).unwrap();
+        assert_eq!(first.duration_seconds,3600);
+        assert_eq!(first.sleep_periods.as_ref().unwrap()[0].decision,"pending");
+        let client=client_export_data(&tracker.db,1).unwrap();
+        assert_eq!(client.entries.len(),1);
+        assert_eq!(client.entries[0].id,1);
+        assert_eq!(client.entries[0].duration_seconds,3600);
+        let period_id=client.entries[0].sleep_periods.as_ref().unwrap()[0].id;
+        let current=DateTime::parse_from_rfc3339("2026-01-02T10:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(correct_entry(&mut tracker,1,"2026-01-01T10:00:00Z","2026-01-01T13:00:00Z","2026-01-01T10:30:00Z","2026-01-01T13:00:00Z",current).is_err());
+        assert!(mark_entry_deleted(&mut tracker,1,"2026-01-01T10:00:00Z","2026-01-01T13:00:00Z","2026-01-02T10:00:00Z").is_err());
+        crate::sleep_periods::resolve(&mut tracker.db,1,period_id,true,start+7200001).unwrap();
+        let report=report_data(&tracker,Utc::now(),Err("unused".into())).unwrap();
+        assert_eq!(report.entries.iter().find(|entry|entry.id==1).unwrap().duration_seconds,10800);
+        assert_eq!(report.entries.iter().find(|entry|entry.id==2).unwrap().duration_seconds,3600);
+    }
+
 }
