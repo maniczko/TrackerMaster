@@ -246,6 +246,11 @@ mod tests {
         let mut tracker=crate::Tracker { db, running_since:None, restored:false };
         transition(&mut tracker,None,&crate::now(),TimerAction::Start { project_id:1,task_id:None,description:"Bez zadania" }).unwrap();
         let id:i64=tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get(0)).unwrap();
+        let snapshot=crate::snapshot(&tracker).unwrap();
+        let active=snapshot.active.unwrap();
+        assert_eq!((active.id,active.project_id,active.task_id),(id,1,None));
+        let report=crate::report_data(&tracker,Utc::now(),crate::power_sample()).unwrap();
+        assert_eq!((report.active.as_ref().unwrap().project_id,report.active.unwrap().task_id),(1,None));
         assert!(transition(&mut tracker,None,&crate::now(),TimerAction::Start { project_id:2,task_id:None,description:"Błędny stan" }).is_err());
         assert!(transition(&mut tracker,Some(id),&crate::now(),TimerAction::Start { project_id:2,task_id:Some(1),description:"Zły projekt" }).is_err());
         assert_eq!(tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),id);
@@ -261,6 +266,9 @@ mod tests {
         assert_eq!(restored,(1,None,"Bez zadania".into(),true));
         let third:i64=tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL",[],|r|r.get(0)).unwrap();
         transition(&mut tracker,Some(third),&crate::now(),TimerAction::Stop).unwrap();
+        let report=crate::report_data(&tracker,Utc::now(),crate::power_sample()).unwrap();
+        assert_eq!(report.entries.len(),3);
+        assert!(report.entries.iter().all(|entry| entry.task_id.is_none()));
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries",[],|r|r.get::<_,i64>(0)).unwrap(),3);
     }

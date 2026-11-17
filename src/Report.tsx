@@ -7,8 +7,8 @@ import { filterByClient } from './reportClientFilter';
 type Id = number | string;
 type Client = { id: Id; name: string };
 type Project = { id: Id; client_id: Id; name: string };
-type Completed = ReportEntry & { task_id: number; project_id: number; billable: boolean };
-type Active = { id: number; task_id: number; project_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean; billable: boolean };
+type Completed = ReportEntry & { task_id: number | null; project_id: number; billable: boolean };
+type Active = { id: number; task_id: number | null; project_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean; billable: boolean };
 type Data = { entries: Completed[]; active: Active | null; time_zone: string };
 
 function todayWarsaw() {
