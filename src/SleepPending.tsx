@@ -1,8 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatDuration } from './App';
+import { parseLocalDate } from './localDateTime';
 
-type PendingSleep = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null };
+type PendingSleep = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean };
 
 function dateTime(ms: number) {
   return new Intl.DateTimeFormat('pl-PL', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(ms));
@@ -14,6 +15,7 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [resumeInput, setResumeInput] = useState<Record<number, string>>({});
   const started = useRef(false);
   const previousIds = useRef(new Set<number>());
   const requestId = useRef(0);
@@ -69,6 +71,23 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
       setError(saved ? 'Decyzja została zapisana, ale nie udało się odświeżyć danych.' : 'Nie udało się zapisać decyzji. Sprawdź listę i spróbuj ponownie.');
     } finally { busyRef.current = false; setBusy(false); }
   }
+  async function supplyResume(item: PendingSleep) {
+    if (busyRef.current || item.endedMs !== null) return;
+    const end = parseLocalDate(resumeInput[item.id] ?? '');
+    if (!end) { setError('Podaj jednoznaczną datę i godzinę wybudzenia.'); return; }
+    busyRef.current = true; setBusy(true); setError('');
+    let saved = false;
+    try {
+      await invoke('set_sleep_resume', { entryId: item.entryId, periodId: item.id, endedAt: end.toISOString() });
+      saved = true;
+      setResumeInput(current => { const next = { ...current }; delete next[item.id]; return next; });
+      await refresh();
+      await onResolved();
+    } catch {
+      await refresh();
+      setError(saved ? 'Czas wybudzenia zapisano, ale nie udało się odświeżyć danych.' : 'Nie udało się zapisać czasu wybudzenia. Sprawdź datę i zakres pomiaru.');
+    } finally { busyRef.current = false; setBusy(false); }
+  }
   function showList() {
     setOpen(true); setShowBanner(false);
     window.setTimeout(() => listRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0);
@@ -85,8 +104,8 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
       {open && <div className="table-wrap"><table><thead><tr><th>Okres</th><th>Klient / projekt / zadanie</th><th>Czas</th><th>Decyzja</th></tr></thead><tbody>{items.map(item => <tr key={item.id}>
         <td>{dateTime(item.startedMs)} – {item.endedMs === null ? 'brak czasu wybudzenia' : dateTime(item.endedMs)}</td>
         <td>{item.client} / {item.project} / {item.task || 'Bez zadania'} <small>· wpis #{item.entryId}</small></td>
-        <td>{item.endedMs === null ? 'Nieznany' : formatDuration((item.endedMs - item.startedMs) / 1000)}</td>
-        <td>{item.endedMs === null ? 'Wymaga ustalenia czasu wybudzenia' : <><button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, true)}>Dolicz</button>{' '}<button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, false)}>Odrzuć</button></>}</td>
+        <td>{item.endedMs === null ? 'Nieznany' : <>{formatDuration((item.endedMs - item.startedMs) / 1000)}{item.manualResume && <small> · wybudzenie wskazane ręcznie</small>}</>}</td>
+        <td>{item.endedMs === null ? <form onSubmit={event => { event.preventDefault(); void supplyResume(item); }}><label>Faktyczna lub szacowana godzina wybudzenia <input type="datetime-local" step="1" required disabled={busy} value={resumeInput[item.id] ?? ''} onChange={event => setResumeInput(current => ({ ...current, [item.id]: event.target.value }))} /></label> <button type="submit" className="secondary" disabled={busy || !resumeInput[item.id]}>Zapisz godzinę</button></form> : <><button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, true)}>Dolicz</button>{' '}<button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, false)}>Odrzuć</button></>}</td>
       </tr>)}</tbody></table><button type="button" className="secondary" onClick={() => setOpen(false)}>Później</button></div>}
     </section>}
   </>;

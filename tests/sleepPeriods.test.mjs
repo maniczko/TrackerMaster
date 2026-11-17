@@ -81,3 +81,15 @@ test('a failed migration rolls back, and a verified pre-migration backup keeps t
     backup.close(); db.close();
   } finally { rmSync(dir, {recursive:true, force:true}); }
 });
+
+test('a manually supplied resume remains pending and cannot be silently rewritten', () => {
+  const db = dbAt();
+  try {
+    insert(db, 1, 1000);
+    assert.throws(() => db.prepare('UPDATE sleep_periods SET manual_resume=1').run(), /CHECK/);
+    db.prepare('UPDATE sleep_periods SET ended_ms=2000,manual_resume=1 WHERE entry_id=1 AND ended_ms IS NULL').run();
+    assert.deepEqual({...db.prepare('SELECT ended_ms,manual_resume,decision FROM sleep_periods WHERE entry_id=1').get()}, {ended_ms:2000,manual_resume:1,decision:'pending'});
+    assert.throws(() => db.prepare('UPDATE sleep_periods SET manual_resume=0').run(), /immutable/);
+    assert.throws(() => db.prepare('UPDATE sleep_periods SET ended_ms=3000').run(), /immutable/);
+  } finally { db.close(); }
+});

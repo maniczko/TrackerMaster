@@ -5,6 +5,7 @@ CREATE TABLE sleep_periods (
     entry_id INTEGER NOT NULL REFERENCES time_entries(id) ON DELETE RESTRICT,
     started_ms INTEGER NOT NULL CHECK (typeof(started_ms) = 'integer' AND started_ms BETWEEN 0 AND 8640000000000000),
     ended_ms INTEGER CHECK (ended_ms IS NULL OR (typeof(ended_ms) = 'integer' AND ended_ms > started_ms AND ended_ms <= 8640000000000000)),
+    manual_resume INTEGER NOT NULL DEFAULT 0 CHECK (manual_resume IN (0,1) AND (ended_ms IS NOT NULL OR manual_resume=0)),
     decision TEXT NOT NULL DEFAULT 'pending' CHECK (decision IN ('pending', 'included', 'excluded')),
     decided_ms INTEGER,
     CHECK ((decision = 'pending' AND decided_ms IS NULL) OR
@@ -43,7 +44,7 @@ BEGIN SELECT RAISE(ABORT, 'overlapping sleep periods'); END;
 CREATE TRIGGER sleep_periods_immutable BEFORE UPDATE ON sleep_periods
 WHEN NEW.id IS NOT OLD.id OR NEW.entry_id IS NOT OLD.entry_id
   OR NEW.started_ms IS NOT OLD.started_ms
-  OR (OLD.ended_ms IS NOT NULL AND NEW.ended_ms IS NOT OLD.ended_ms)
+  OR (OLD.ended_ms IS NOT NULL AND (NEW.ended_ms IS NOT OLD.ended_ms OR NEW.manual_resume IS NOT OLD.manual_resume))
   OR (OLD.decision <> 'pending' AND
       (NEW.decision IS NOT OLD.decision OR NEW.decided_ms IS NOT OLD.decided_ms))
 BEGIN SELECT RAISE(ABORT, 'immutable sleep period'); END;

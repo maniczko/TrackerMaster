@@ -14,6 +14,7 @@ pub struct SleepPeriod {
     pub entry_id: i64,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
+    pub manual_resume: bool,
     pub decision: String,
 }
 
@@ -32,7 +33,7 @@ pub fn validate(db: &Connection) -> Result<()> {
         let actual: String = db.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |r| r.get(0))?;
         if actual != expected { return Err(Error::InvalidQuery); }
     }
-    let bad: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods s LEFT JOIN time_entries e ON e.id=s.entry_id WHERE e.id IS NULL OR s.id<=0 OR typeof(s.started_ms)!='integer' OR s.started_ms<0 OR s.started_ms>8640000000000000 OR (s.ended_ms IS NOT NULL AND (typeof(s.ended_ms)!='integer' OR s.ended_ms<=s.started_ms OR s.ended_ms>8640000000000000)) OR s.decision NOT IN ('pending','included','excluded') OR (s.decision='pending' AND s.decided_ms IS NOT NULL) OR (s.decision IN ('included','excluded') AND (s.ended_ms IS NULL OR typeof(s.decided_ms)!='integer' OR s.decided_ms<0 OR s.decided_ms>8640000000000000))) OR EXISTS(SELECT 1 FROM sleep_periods a JOIN sleep_periods b ON a.entry_id=b.entry_id AND a.id<b.id WHERE (b.ended_ms IS NULL OR a.started_ms<b.ended_ms) AND (a.ended_ms IS NULL OR b.started_ms<a.ended_ms))", [], |r| r.get(0))?;
+    let bad: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods s LEFT JOIN time_entries e ON e.id=s.entry_id WHERE e.id IS NULL OR s.id<=0 OR typeof(s.started_ms)!='integer' OR s.started_ms<0 OR s.started_ms>8640000000000000 OR (s.ended_ms IS NOT NULL AND (typeof(s.ended_ms)!='integer' OR s.ended_ms<=s.started_ms OR s.ended_ms>8640000000000000)) OR s.manual_resume NOT IN (0,1) OR (s.ended_ms IS NULL AND s.manual_resume<>0) OR s.decision NOT IN ('pending','included','excluded') OR (s.decision='pending' AND s.decided_ms IS NOT NULL) OR (s.decision IN ('included','excluded') AND (s.ended_ms IS NULL OR typeof(s.decided_ms)!='integer' OR s.decided_ms<0 OR s.decided_ms>8640000000000000))) OR EXISTS(SELECT 1 FROM sleep_periods a JOIN sleep_periods b ON a.entry_id=b.entry_id AND a.id<b.id WHERE (b.ended_ms IS NULL OR a.started_ms<b.ended_ms) AND (a.ended_ms IS NULL OR b.started_ms<a.ended_ms))", [], |r| r.get(0))?;
     if bad { return Err(Error::InvalidQuery); }
     Ok(())
 }
@@ -79,6 +80,23 @@ pub fn record_resume(db: &mut Connection, entry_id: i64, period_id: i64, ended_m
     tx.commit()
 }
 
+/// A user may supply a missing resume boundary. It is stored as user-provided
+/// and cannot be rewritten later, even if the pending decision is postponed.
+pub fn record_resume_manual(db: &mut Connection, entry_id: i64, period_id: i64, ended_ms: i64, current_ms: i64) -> Result<()> {
+    if entry_id <= 0 || period_id <= 0 || !valid_ms(ended_ms) || !valid_ms(current_ms) || ended_ms > current_ms { return Err(Error::InvalidQuery); }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(i64, Option<String>)> = tx.query_row("SELECT s.started_ms,e.ended_at FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id WHERE s.id=?1 AND s.entry_id=?2 AND s.ended_ms IS NULL AND s.decision='pending'", params![period_id,entry_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (started_ms,entry_end) = row.ok_or(Error::InvalidQuery)?;
+    if ended_ms <= started_ms { return Err(Error::InvalidQuery); }
+    if let Some(entry_end) = entry_end {
+        let entry_end = DateTime::parse_from_rfc3339(&entry_end).map_err(|_| Error::InvalidQuery)?.timestamp_millis();
+        if ended_ms > entry_end { return Err(Error::InvalidQuery); }
+    }
+    let changed = tx.execute("UPDATE sleep_periods SET ended_ms=?1,manual_resume=1 WHERE id=?2 AND entry_id=?3 AND ended_ms IS NULL AND decision='pending'", params![ended_ms,period_id,entry_id])?;
+    if changed != 1 { return Err(Error::InvalidQuery); }
+    tx.commit()
+}
+
 /// Decide only one identified, complete pending period. Retry cannot double count.
 pub fn resolve(db: &mut Connection, entry_id: i64, period_id: i64, include: bool, decided_ms: i64) -> Result<()> {
     if entry_id <= 0 || period_id <= 0 || !valid_ms(decided_ms) { return Err(Error::InvalidQuery); }
@@ -94,8 +112,8 @@ pub fn resolve(db: &mut Connection, entry_id: i64, period_id: i64, include: bool
 
 pub fn list_for_entry(db: &Connection, entry_id: i64) -> Result<Vec<SleepPeriod>> {
     if entry_id <= 0 { return Err(Error::InvalidQuery); }
-    let mut stmt = db.prepare("SELECT id,entry_id,started_ms,ended_ms,decision FROM sleep_periods WHERE entry_id=?1 ORDER BY started_ms,id")?;
-    let rows = stmt.query_map([entry_id], |r| Ok(SleepPeriod { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, decision:r.get(4)? }))?;
+    let mut stmt = db.prepare("SELECT id,entry_id,started_ms,ended_ms,manual_resume,decision FROM sleep_periods WHERE entry_id=?1 ORDER BY started_ms,id")?;
+    let rows = stmt.query_map([entry_id], |r| Ok(SleepPeriod { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, manual_resume:r.get(4)?, decision:r.get(5)? }))?;
     rows.collect()
 }
 
@@ -172,6 +190,20 @@ mod tests {
         assert!(validate(&db).is_ok());
         db.execute_batch("DROP TRIGGER sleep_periods_immutable;").unwrap();
         assert!(validate(&db).is_err());
+    }
+
+    #[test]
+    fn user_resume_boundary_is_recorded_once_without_resolving_decision() {
+        let mut db=fixture();
+        let start=DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        let id=record_suspend(&mut db,1,start).unwrap();
+        assert!(record_resume_manual(&mut db,1,id,start+2000,start+1000).is_err());
+        assert!(record_resume_manual(&mut db,1,id,start,start+1000).is_err());
+        record_resume_manual(&mut db,1,id,start+1000,start+2000).unwrap();
+        assert!(record_resume_manual(&mut db,1,id,start+1500,start+2000).is_err());
+        let p=list_for_entry(&db,1).unwrap();
+        assert_eq!((p[0].ended_ms,p[0].manual_resume,p[0].decision.as_str()),(Some(start+1000),true,"pending"));
+        assert!(db.execute("UPDATE sleep_periods SET manual_resume=0 WHERE id=?1",[id]).is_err());
     }
 
 }
