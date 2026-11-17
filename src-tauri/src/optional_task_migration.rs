@@ -17,6 +17,20 @@ pub fn target_billing(db: &Connection, project_id: i64, task_id: Option<i64>) ->
     Ok(billable)
 }
 
+/// Insert the new running row and its metadata as part of the caller's timer
+/// transaction. The caller also checks timer state and interval overlaps.
+pub fn insert_running(db: &Connection, project_id: i64, task_id: Option<i64>, start: &str, description: &str, billing_override: Option<bool>) -> std::result::Result<i64, String> {
+    if db.is_autocommit() { return Err("Pomiar wymaga transakcji zapisu.".into()); }
+    crate::valid_description(description)?;
+    let default_billable = target_billing(db, project_id, task_id)?;
+    let billable = billing_override.unwrap_or(default_billable);
+    db.execute("INSERT INTO time_entries(task_id,project_id,started_at) VALUES(?1,?2,?3)", params![task_id,project_id,start]).map_err(crate::db_err)?;
+    let id = db.last_insert_rowid();
+    if billable { db.execute("INSERT INTO billable_entries(entry_id) VALUES(?1)", [id]).map_err(crate::db_err)?; }
+    if !description.is_empty() { db.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2)", params![id,description]).map_err(crate::db_err)?; }
+    Ok(id)
+}
+
 pub fn validate(db: &Connection) -> Result<()> {
     let columns: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='task_id' AND UPPER(type)='INTEGER' AND \"notnull\"=0) AND EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='project_id' AND UPPER(type)='INTEGER' AND \"notnull\"=1)", [], |r| r.get(0))?;
     let relationships: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('time_entries') WHERE \"from\"='project_id' AND \"table\"='projects' AND \"to\"='id') AND EXISTS(SELECT 1 FROM pragma_foreign_key_list('time_entries') a JOIN pragma_foreign_key_list('time_entries') b ON a.id=b.id WHERE a.\"table\"='tasks' AND b.\"table\"='tasks' AND a.\"from\"='task_id' AND a.\"to\"='id' AND b.\"from\"='project_id' AND b.\"to\"='project_id')", [], |r| r.get(0))?;
@@ -152,5 +166,25 @@ mod tests {
         db.execute("UPDATE projects SET archived=1 WHERE id=1", []).unwrap();
         assert!(target_billing(&db, 1, None).is_err());
         assert!(target_billing(&db, 999, None).is_err());
+    }
+
+    #[test]
+    fn inserts_project_timer_and_rolls_back_metadata_failure() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO billable_projects VALUES(1);").unwrap();
+        migrate(&mut db).unwrap();
+        assert!(insert_running(&db, 1, None, "2026-01-01T10:00:00Z", "Opis", None).is_err());
+        db.execute_batch("CREATE TRIGGER reject_description BEFORE INSERT ON entry_descriptions BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+        {
+            let tx = db.transaction().unwrap();
+            assert!(insert_running(&tx, 1, None, "2026-01-01T10:00:00Z", "Opis", None).is_err());
+        }
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM time_entries",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM billable_entries",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        db.execute_batch("DROP TRIGGER reject_description;").unwrap();
+        let id = { let tx = db.transaction().unwrap(); let id = insert_running(&tx,1,None,"2026-01-01T10:00:00Z","Opis",None).unwrap(); tx.commit().unwrap(); id };
+        let row: (i64,Option<i64>,String,bool) = db.query_row("SELECT project_id,task_id,(SELECT description FROM entry_descriptions WHERE entry_id=time_entries.id),EXISTS(SELECT 1 FROM billable_entries WHERE entry_id=time_entries.id) FROM time_entries WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(row,(1,None,"Opis".to_string(),true));
     }
 }
