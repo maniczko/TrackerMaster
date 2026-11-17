@@ -513,10 +513,20 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
 }
 
 fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Option<i64>, description: &str) -> Cmd<()> {
+    change_timer(tracker, end, next_task, description, None)
+}
+
+fn change_timer(tracker: &mut Tracker, end: &str, next_task: Option<i64>, description: &str, resume_id: Option<i64>) -> Cmd<()> {
     ensure_available(tracker)?;
-    let description = valid_description(description)?;
+    valid_description(description)?;
     let elapsed = tracker.running_since.as_ref().map(|clock| clock.since.elapsed().as_secs() as i64);
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
+    let source: Option<(i64, String, bool)> = if let Some(id) = resume_id {
+        Some(tx.query_row("SELECT task_id,COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=e.id),''),EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e WHERE e.id=?1 AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id)", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?.ok_or("Wpis do wznowienia nie istnieje lub został usunięty.")?)
+    } else { None };
+    let next_task = source.as_ref().map(|s| s.0).or(next_task);
+    let description = source.as_ref().map(|s| s.1.as_str()).unwrap_or(description);
+    valid_description(description)?;
     let active: Option<(i64, i64, String)> = tx.query_row("SELECT id,task_id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
     if let Some((id, active_task, started)) = active {
         let seconds = elapsed.ok_or("Pomiar wymaga ręcznego ustalenia czasu zakończenia.")?;
@@ -529,7 +539,7 @@ fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Op
             tracker.running_since = None;
             return Err("Wykryto przerwę w pracy systemu lub błąd zegara. Pomiar wymaga weryfikacji; nie został zakończony.".into());
         }
-        if next_task == Some(active_task) {
+        if next_task == Some(active_task) && source.is_none() {
             return Ok(());
         }
         let start_dt = DateTime::parse_from_rfc3339(&started).map_err(|_| "Niepoprawny zapis czasu w bazie.")?;
@@ -559,13 +569,29 @@ fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Op
         ensure_no_overlap(&tx, start, DateTime::<Utc>::MAX_UTC, None).map_err(|_| "Nie można rozpocząć pomiaru: inny wpis trwa teraz lub znajduje się w przyszłości. Sprawdź zegar i historię.".to_string())?;
         tx.execute("INSERT INTO time_entries(task_id,started_at) VALUES(?1,?2)",params![task_id,end]).map_err(db_err)?;
         let id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO billable_entries(entry_id) SELECT ?1 WHERE EXISTS(SELECT 1 FROM tasks t JOIN billable_projects b ON b.project_id=t.project_id WHERE t.id=?2)", params![id,task_id]).map_err(db_err)?;
+        if let Some((_, _, billable)) = &source {
+            if *billable { tx.execute("INSERT INTO billable_entries(entry_id) VALUES(?1)", [id]).map_err(db_err)?; }
+        } else {
+            tx.execute("INSERT INTO billable_entries(entry_id) SELECT ?1 WHERE EXISTS(SELECT 1 FROM tasks t JOIN billable_projects b ON b.project_id=t.project_id WHERE t.id=?2)", params![id,task_id]).map_err(db_err)?;
+        }
         if !description.is_empty() { tx.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2)", params![id,description]).map_err(db_err)?; }
     }
     let next_clock = if next_task.is_some() { Some(RunningClock { since: Instant::now(), power: power_sample()? }) } else { None };
     tx.commit().map_err(db_err)?;
     tracker.running_since = next_clock;
     Ok(())
+}
+
+fn resume_saved_entry(tracker: &mut Tracker, source_id: i64, expected_active_id: Option<i64>, at: &str) -> Cmd<()> {
+    if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != expected_active_id { return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into()); }
+    change_timer(tracker, at, None, "", Some(source_id))
+}
+
+#[tauri::command]
+fn resume_entry(state: State<'_, Shared>, source_id: i64, expected_active_id: Option<i64>) -> Cmd<Snapshot> {
+    let mut tracker = locked(&state)?;
+    resume_saved_entry(&mut tracker, source_id, expected_active_id, &now())?;
+    snapshot(&tracker)
 }
 
 fn stop_expected_for_exit(tracker: &mut Tracker, expected_id: i64) -> Cmd<()> {
@@ -1054,7 +1080,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -1123,6 +1149,45 @@ mod tests {
         let state = snapshot(&tracker).unwrap();
         assert_eq!(state.active.unwrap().description, "Nowy opis");
         assert_eq!(state.entries.len(), 1);
+    }
+
+    #[test]
+    fn resume_copies_source_and_switches_atomically() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let source = add_manual_entry_with_description(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current, "Oryginalny opis").unwrap();
+        set_entry_billing(&mut tracker.db, source, false, true, &now()).unwrap();
+        close_active(&mut tracker, &now(), Some(1)).unwrap();
+        let active = snapshot(&tracker).unwrap().active.unwrap().id;
+        assert!(resume_saved_entry(&mut tracker, source, None, &now()).is_err());
+        tracker.db.execute_batch("CREATE TRIGGER reject_resume BEFORE INSERT ON entry_descriptions BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+        assert!(resume_saved_entry(&mut tracker, source, Some(active), &now()).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, active);
+        tracker.db.execute_batch("DROP TRIGGER reject_resume;").unwrap();
+        resume_saved_entry(&mut tracker, source, Some(active), &now()).unwrap();
+        let state = snapshot(&tracker).unwrap();
+        let resumed = state.active.unwrap();
+        assert_ne!(resumed.id, active);
+        assert_eq!(resumed.description, "Oryginalny opis");
+        assert!(resumed.billable);
+        assert_eq!(state.entries.iter().find(|e| e.id == source).unwrap().description, "Oryginalny opis");
+        assert!(state.entries.iter().any(|e| e.id == active));
+    }
+
+    #[test]
+    fn resume_rejects_archived_task_and_deleted_source_without_stopping_active() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let source = add_manual_entry_with_description(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current, "").unwrap();
+        set_task_archived(&mut tracker.db, 1, true).unwrap();
+        close_active(&mut tracker, &now(), Some(2)).unwrap();
+        let active = snapshot(&tracker).unwrap().active.unwrap().id;
+        assert!(resume_saved_entry(&mut tracker, source, Some(active), &now()).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, active);
+        set_task_archived(&mut tracker.db, 1, false).unwrap();
+        tracker.db.execute("INSERT INTO entry_deletions(entry_id,deleted_at) VALUES(?1,?2)", params![source,now()]).unwrap();
+        assert!(resume_saved_entry(&mut tracker, source, Some(active), &now()).is_err());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, active);
     }
 
     #[test]
