@@ -4,6 +4,13 @@
 //! existing database. The transaction preserves entry IDs and all references.
 use rusqlite::{Connection, Error, Result, TransactionBehavior};
 
+pub fn validate(db: &Connection) -> Result<()> {
+    let columns: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='task_id' AND UPPER(type)='INTEGER' AND \"notnull\"=0) AND EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='project_id' AND UPPER(type)='INTEGER' AND \"notnull\"=1)", [], |r| r.get(0))?;
+    let relationships: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('time_entries') WHERE \"from\"='project_id' AND \"table\"='projects' AND \"to\"='id') AND EXISTS(SELECT 1 FROM pragma_foreign_key_list('time_entries') a JOIN pragma_foreign_key_list('time_entries') b ON a.id=b.id WHERE a.\"table\"='tasks' AND b.\"table\"='tasks' AND a.\"from\"='task_id' AND a.\"to\"='id' AND b.\"from\"='project_id' AND b.\"to\"='project_id')", [], |r| r.get(0))?;
+    if !columns || !relationships || db.prepare("PRAGMA foreign_key_check")?.query([])?.next()?.is_some() { return Err(Error::InvalidQuery); }
+    crate::storage_safety::validate_timer_index(db)
+}
+
 pub fn migrate(db: &mut Connection) -> Result<()> {
     let enabled: i64 = db.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     if enabled != 1 { return Err(Error::InvalidQuery); }
@@ -47,8 +54,7 @@ fn migrate_transaction(db: &mut Connection) -> Result<()> {
     tx.execute_batch("DROP TABLE time_entries;
         ALTER TABLE time_entries_v11 RENAME TO time_entries;
         CREATE UNIQUE INDEX one_running_timer ON time_entries((1)) WHERE ended_at IS NULL;")?;
-    if tx.prepare("PRAGMA foreign_key_check")?.query([])?.next()?.is_some() { return Err(Error::InvalidQuery); }
-    crate::storage_safety::validate_timer_index(&tx)?;
+    validate(&tx)?;
     tx.pragma_update(None, "user_version", 11)?;
     tx.commit()
 }
@@ -76,6 +82,7 @@ mod tests {
     fn preserves_ids_history_references_and_enforces_project_consistency() {
         let mut db = example();
         migrate(&mut db).unwrap();
+        validate(&db).unwrap();
         assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(), 11);
         assert_eq!(db.pragma_query_value(None,"foreign_keys",|r|r.get::<_,i64>(0)).unwrap(), 1);
         assert_eq!(db.query_row("SELECT description FROM descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(), "Opis");
@@ -95,5 +102,26 @@ mod tests {
         assert_eq!(db.pragma_query_value(None,"foreign_keys",|r|r.get::<_,i64>(0)).unwrap(), 1);
         assert_eq!(db.query_row("SELECT COUNT(*) FROM time_entries",[],|r|r.get::<_,i64>(0)).unwrap(), 2);
         assert_eq!(db.query_row("SELECT description FROM descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(), "Opis");
+    }
+
+    #[test]
+    fn migrates_actual_v10_schema_with_all_entry_dependents() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');
+            INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie');
+            INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(41,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600);
+            INSERT INTO entry_descriptions VALUES(41,'Opis');
+            INSERT INTO billable_entries VALUES(41);
+            INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(41,'2026-01-02T00:00:00Z','2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600);
+            INSERT INTO billing_revisions(entry_id,changed_at,before_billable,after_billable) VALUES(41,'2026-01-02T00:00:00Z',0,1);
+            INSERT INTO description_revisions(entry_id,changed_at,before_description,after_description) VALUES(41,'2026-01-02T00:00:00Z','','Opis');
+            INSERT INTO entry_deletions(entry_id,deleted_at) VALUES(41,'2026-01-03T00:00:00Z');").unwrap();
+        migrate(&mut db).unwrap();
+        let count = |table: &str| db.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE entry_id=41"),[],|r|r.get::<_,i64>(0)).unwrap();
+        for table in ["entry_descriptions", "billable_entries", "entry_revisions", "billing_revisions", "description_revisions", "entry_deletions"] { assert_eq!(count(table), 1); }
+        assert!(db.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
+        assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(), 1);
     }
 }
