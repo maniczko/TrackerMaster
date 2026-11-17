@@ -25,7 +25,7 @@ export function spreadsheetText(value: string): string {
 }
 
 const csvField = (value: string) => `"${value.replace(/"/g, '""')}"`;
-const localTimestamp = (value: string, zone: string) => Temporal.Instant.from(value).toZonedDateTimeISO(zone).toString({ smallestUnit: 'second', timeZoneName: 'never', calendarName: 'never' });
+export const localTimestamp = (value: string, zone: string) => Temporal.Instant.from(value).toZonedDateTimeISO(zone).toString({ smallestUnit: 'second', timeZoneName: 'never', calendarName: 'never' });
 
 export function exportCsv(rows: ExportRow[], zone: string): string {
   const headers = ['ID wpisu', 'Klient', 'Projekt', 'Zadanie', 'Opis', 'Start', 'Koniec', 'Rozliczalność', 'Czas całkowity (sekundy)', 'Czas całkowity (HH:MM:SS)', 'Czas w wybranym okresie (sekundy)', 'Czas w wybranym okresie (HH:MM:SS)'];

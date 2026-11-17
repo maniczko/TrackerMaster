@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useState } from 'react';
-import { exportCsv, formatDuration, makeExportRows, spreadsheetText } from './reportCsv';
+import { exportCsv, formatDuration, localTimestamp, makeExportRows, spreadsheetText } from './reportCsv';
 import type { ExportEntry, ExportRow } from './reportCsv';
 
 type ExportData = { client_id: number; client: string; time_zone: string; entries: ExportEntry[] };
@@ -42,10 +42,10 @@ export default function ReportExport({ client, from, through, zone }: { client: 
     <button type="button" className="secondary report-button" disabled={!client || !zone || busy} onClick={() => void prepare()}>{busy ? 'Przygotowywanie…' : 'Przygotuj podgląd CSV'}</button>
     {error && <div role="alert" className="alert error">{error}</div>}
     {current && <div className="export-preview">
-      <p>Klient: <strong>{current.client}</strong> · {current.from} — {current.through} · {current.zone}</p>
+      <p>Klient: <strong>{spreadsheetText(current.client)}</strong> · {current.from} — {current.through} · {current.zone}</p>
       <p>Liczba wpisów: <strong>{current.rows.length}</strong> · Czas w okresie: <strong>{formatDuration(current.total)}</strong></p>
       <p className="muted">Podgląd i plik zawierają te same zakończone wpisy. Tekst podobny do formuły otrzyma apostrof ochronny.</p>
-      {current.rows.length > 0 && <div className="table-wrap"><table><thead><tr><th>ID</th><th>Projekt</th><th>Zadanie</th><th>Opis</th><th>Początek (UTC)</th><th>Koniec (UTC)</th><th>Rozliczalny</th><th>Cały wpis</th><th>W okresie</th></tr></thead><tbody>{current.rows.map(({ source, contribution }) => <tr key={source.id}><td>{source.id}</td><td>{spreadsheetText(source.project)}</td><td>{spreadsheetText(source.task)}</td><td>{spreadsheetText(source.description)}</td><td>{source.started_at}</td><td>{source.ended_at}</td><td>{source.billable ? 'Tak' : 'Nie'}</td><td>{formatDuration(source.duration_seconds)}</td><td>{formatDuration(contribution)}</td></tr>)}</tbody></table></div>}
+      {current.rows.length > 0 && <div className="table-wrap"><table><thead><tr><th>ID</th><th>Projekt</th><th>Zadanie</th><th>Opis</th><th>Początek</th><th>Koniec</th><th>Rozliczalny</th><th>Cały wpis</th><th>W okresie</th></tr></thead><tbody>{current.rows.map(({ source, contribution }) => <tr key={source.id}><td>{source.id}</td><td>{spreadsheetText(source.project)}</td><td>{spreadsheetText(source.task)}</td><td>{spreadsheetText(source.description)}</td><td>{localTimestamp(source.started_at, current.zone)}</td><td>{localTimestamp(source.ended_at, current.zone)}</td><td>{source.billable ? 'Tak' : 'Nie'}</td><td>{formatDuration(source.duration_seconds)} ({source.duration_seconds} s)</td><td>{formatDuration(contribution)} ({contribution} s)</td></tr>)}</tbody></table></div>}
       <button type="button" className="secondary report-button" onClick={download}>Potwierdź i pobierz CSV</button>
     </div>}
   </section>;
