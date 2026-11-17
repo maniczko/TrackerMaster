@@ -87,11 +87,11 @@ struct Project { id: i64, client_id: i64, name: String, archived: bool, billable
 #[derive(Serialize)]
 struct Task { id: i64, project_id: i64, name: String, archived: bool }
 #[derive(Serialize)]
-struct Active { id: i64, task_id: i64, started_at: String, recovered: bool, billable: bool, description: String }
+struct Active { id: i64, task_id: i64, project_id: i64, started_at: String, recovered: bool, billable: bool, description: String }
 #[derive(Serialize)]
-struct Entry { id: i64, task_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String }
+struct Entry { id: i64, task_id: i64, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String }
 #[derive(Serialize)]
-struct DeletedEntry { id: i64, task_id: i64, started_at: String, ended_at: String, duration_seconds: i64, deleted_at: String }
+struct DeletedEntry { id: i64, task_id: i64, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, deleted_at: String }
 #[derive(Serialize)]
 struct EntryRevision { id: i64, changed_at: String, before_start: String, before_end: String, before_seconds: i64, after_start: String, after_end: String, after_seconds: i64 }
 #[derive(Serialize)]
@@ -101,7 +101,7 @@ struct DescriptionRevision { id: i64, changed_at: String, before_description: St
 #[derive(Serialize)]
 struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>, active: Option<Active>, entries: Vec<Entry> }
 #[derive(Serialize)]
-struct ReportActive { id: i64, task_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String }
+struct ReportActive { id: i64, task_id: i64, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String }
 #[derive(Serialize)]
 struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
 
@@ -141,11 +141,11 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
     let tasks = db.prepare("SELECT id,project_id,name,EXISTS(SELECT 1 FROM task_archives a WHERE a.task_id=tasks.id) FROM tasks ORDER BY name COLLATE NOCASE,id").map_err(db_err)?
         .query_map([], |r| Ok(Task { id:r.get(0)?, project_id:r.get(1)?, name:r.get(2)?, archived:r.get(3)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    let active = db.query_row("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE ended_at IS NULL", [], |r| Ok(Active {
-        id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, recovered:tracker.running_since.is_none(), billable:r.get(3)?, description:r.get(4)?
+    let active = db.query_row("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),(SELECT project_id FROM tasks WHERE id=time_entries.task_id) FROM time_entries WHERE ended_at IS NULL", [], |r| Ok(Active {
+        id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, recovered:tracker.running_since.is_none(), billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)?
     })).optional().map_err(db_err)?;
-    let entries = db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500").map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)? })).map_err(db_err)?
+    let entries = db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),(SELECT project_id FROM tasks WHERE id=time_entries.task_id) FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500").map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     Ok(Snapshot { clients, projects, tasks, active, entries })
 }
@@ -161,11 +161,11 @@ fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
 // sleep, a clock change, a restart, or an unavailable power sample is detected.
 fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample>) -> Cmd<ReportData> {
     ensure_available(tracker)?;
-    let entries = tracker.db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id").map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)? })).map_err(db_err)?
+    let entries = tracker.db.prepare("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),(SELECT project_id FROM tasks WHERE id=time_entries.task_id) FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id").map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    let row: Option<(i64, i64, String, bool, String)> = tracker.db.query_row("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(db_err)?;
-    let active = row.map(|(id, task_id, started_at, billable, description)| {
+    let row: Option<(i64, i64, String, bool, String, i64)> = tracker.db.query_row("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),(SELECT project_id FROM tasks WHERE id=time_entries.task_id) FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_err)?;
+    let active = row.map(|(id, task_id, started_at, billable, description, project_id)| {
         let projection = tracker.running_since.as_ref().and_then(|clock| {
             let power = power.as_ref().ok()?;
             if sleep_or_invalid(clock.power, *power) { return None; }
@@ -179,7 +179,7 @@ fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample
         });
         let unresolved = projection.is_none();
         let (ended_at, duration_seconds) = match projection { Some((end, duration)) => (Some(end), Some(duration)), None => (None, None) };
-        ReportActive { id, task_id, started_at, ended_at, duration_seconds, unresolved, billable, description }
+        ReportActive { id, task_id, project_id, started_at, ended_at, duration_seconds, unresolved, billable, description }
     });
     let time_zone = tracker.db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
     Ok(ReportData { entries, active, time_zone })
@@ -803,8 +803,8 @@ fn delete_time_entry(state: State<'_, Shared>, entry_id: i64, expected_start: St
 #[tauri::command]
 fn deleted_entries(state: State<'_, Shared>) -> Cmd<Vec<DeletedEntry>> {
     let tracker = locked(&state)?;
-    let mut stmt = tracker.db.prepare("SELECT e.id,e.task_id,e.started_at,e.ended_at,e.duration_seconds,d.deleted_at FROM entry_deletions d JOIN time_entries e ON e.id=d.entry_id ORDER BY d.deleted_at DESC,e.id DESC LIMIT 500").map_err(db_err)?;
-    let entries = stmt.query_map([], |r| Ok(DeletedEntry { id:r.get(0)?,task_id:r.get(1)?,started_at:r.get(2)?,ended_at:r.get(3)?,duration_seconds:r.get(4)?,deleted_at:r.get(5)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut stmt = tracker.db.prepare("SELECT e.id,e.task_id,e.started_at,e.ended_at,e.duration_seconds,d.deleted_at,(SELECT project_id FROM tasks WHERE id=e.task_id) FROM entry_deletions d JOIN time_entries e ON e.id=d.entry_id ORDER BY d.deleted_at DESC,e.id DESC LIMIT 500").map_err(db_err)?;
+    let entries = stmt.query_map([], |r| Ok(DeletedEntry { id:r.get(0)?,task_id:r.get(1)?,started_at:r.get(2)?,ended_at:r.get(3)?,duration_seconds:r.get(4)?,deleted_at:r.get(5)?,project_id:r.get(6)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     Ok(entries)
 }
 
@@ -1131,6 +1131,18 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn snapshot_and_report_include_the_entries_project() {
+        let mut tracker = seeded();
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        add_manual_entry(&mut tracker, 1, "2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", current).unwrap();
+        assert_eq!(snapshot(&tracker).unwrap().entries[0].project_id, 1);
+        assert_eq!(report_data(&tracker, current, Err("clock".into())).unwrap().entries[0].project_id, 1);
+        close_active(&mut tracker, &now(), Some(2)).unwrap();
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().project_id, 1);
+        assert_eq!(report_data(&tracker, Utc::now(), power_sample()).unwrap().active.unwrap().project_id, 1);
     }
 
     #[test]

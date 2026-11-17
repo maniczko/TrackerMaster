@@ -2,13 +2,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { dateInZone, reportByDay, reportOverlaps, validTimeZone } from './reportTime';
 import type { ReportEntry } from './reportTime';
+import { filterByClient } from './reportClientFilter';
 
 type Id = number | string;
 type Client = { id: Id; name: string };
 type Project = { id: Id; client_id: Id; name: string };
-type Task = { id: Id; project_id: Id; name: string };
-type Completed = ReportEntry & { task_id: number; billable: boolean };
-type Active = { id: number; task_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean; billable: boolean };
+type Completed = ReportEntry & { task_id: number; project_id: number; billable: boolean };
+type Active = { id: number; task_id: number; project_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean; billable: boolean };
 type Data = { entries: Completed[]; active: Active | null; time_zone: string };
 
 function todayWarsaw() {
@@ -21,7 +21,7 @@ function duration(value: number) {
   return [Math.floor(seconds / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map(n => String(n).padStart(2, '0')).join(':');
 }
 
-export default function Report({ clients, projects, tasks, loaded, onEditEntry }: { clients: Client[]; projects: Project[]; tasks: Task[]; loaded: boolean; onEditEntry: (entry: Completed) => void }) {
+export default function Report({ clients, projects, loaded, onEditEntry }: { clients: Client[]; projects: Project[]; loaded: boolean; onEditEntry: (entry: Completed) => void }) {
   const [open, setOpen] = useState(false);
   const [from, setFrom] = useState(() => todayWarsaw().slice(0, 8) + '01');
   const [through, setThrough] = useState(todayWarsaw);
@@ -54,15 +54,7 @@ export default function Report({ clients, projects, tasks, loaded, onEditEntry }
 
   const result = useMemo(() => {
     if (!data) return null;
-    const taskClients = new Map(tasks.map(task => {
-      const project = projects.find(p => String(p.id) === String(task.project_id));
-      return [String(task.id), project ? String(project.client_id) : null];
-    }));
-    const belongs = (taskId: Id) => !client || taskClients.get(String(taskId)) === client;
-    // An unresolved relation must not silently disappear from a filtered report.
-    const missingRelations = !!client && [...data.entries, ...(data.active ? [data.active] : [])].some(e => !taskClients.get(String(e.task_id)));
-    const entries = data.entries.filter(e => belongs(e.task_id));
-    const active = data.active && belongs(data.active.task_id) ? data.active : null;
+    const { entries, active, missingRelations } = filterByClient(data.entries, data.active, projects, client);
     try {
       if (!validTimeZone(data.time_zone)) return { invalidZone: true as const };
       const completed = reportByDay(entries, from, through, data.time_zone);
@@ -75,7 +67,7 @@ export default function Report({ clients, projects, tasks, loaded, onEditEntry }
     } catch {
       return { invalidRange: true as const, invalidZone: false };
     }
-  }, [data, from, through, client, tasks, projects]);
+  }, [data, from, through, client, projects]);
 
   return <section className="card report" aria-label="Raport czasu">
     <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div><button type="button" className="secondary report-button" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
