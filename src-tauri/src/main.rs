@@ -2,12 +2,13 @@
 
 mod storage_safety;
 mod sleep_periods;
+mod power_events;
 mod optional_task_migration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use std::{sync::Mutex, time::Instant};
+use std::{sync::{Arc, Mutex}, time::Instant};
 use tauri::{Emitter, Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
@@ -71,7 +72,7 @@ fn confirm_stop_and_exit() -> bool {
     // Yes/No, question icon, default to No.
     unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), 0x4 | 0x20 | 0x100) == 6 }
 }
-type Shared = Mutex<Tracker>;
+type Shared = Arc<Mutex<Tracker>>;
 const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
 struct HotkeyState { project_id: Option<i64>, task_id: Option<i64>, registered: bool, widget_ready: bool, message: String, shortcut: String }
 impl Default for HotkeyState {
@@ -1294,7 +1295,12 @@ fn main() {
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
                 err
             })?;
-            app.manage(Mutex::new(Tracker { db, running_since: None, restored: false }));
+            let tracker = Arc::new(Mutex::new(Tracker { db, running_since: None, restored: false }));
+            app.manage(tracker.clone());
+            #[cfg(windows)]
+            if power_events::register(tracker).is_err() {
+                show_start_error("Nie udało się uruchomić monitorowania uśpienia. Po przerwie pomiar może wymagać ręcznej weryfikacji.");
+            }
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(HotkeyChange(Mutex::new(())));
             app.manage(Mutex::new(RestoreState::default()));
