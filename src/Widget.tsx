@@ -95,7 +95,13 @@ export default function Widget() {
   }, []);
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
-      if (!shortcut.registered && matchesShortcut(event, shortcut.shortcut)) { event.preventDefault(); void toggle(); }
+      if (!shortcut.registered && matchesShortcut(event, shortcut.shortcut)) {
+        event.preventDefault();
+        void invoke<{ registered: boolean; message: string; shortcut: string }>('shortcut_status').then(next => {
+          setShortcut({ ...next, shortcut: next.shortcut || defaultShortcut });
+          if (!next.registered && next.shortcut === shortcut.shortcut) void toggleRef.current();
+        }).catch(() => setError('Nie udało się sprawdzić skrótu. Użyj przycisku Start / Stop.'));
+      }
       if (event.key === 'Escape' && open) { event.preventDefault(); void setPanel(false); }
     };
     window.addEventListener('keydown', handleKey); return () => window.removeEventListener('keydown', handleKey);

@@ -736,11 +736,14 @@ fn save_shortcut_preference(dir: &std::path::Path, value: &str) -> Cmd<()> {
 fn replace_shortcut<R, P, U>(old: &str, new: &str, registered: bool, mut register: R, mut persist: P, mut unregister: U) -> Cmd<()>
 where R: FnMut(&str) -> Cmd<()>, P: FnMut(&str) -> Cmd<()>, U: FnMut(&str) -> Cmd<()> {
     register(new).map_err(|_| "Ten skrót jest niedostępny lub zajęty. Poprzedni skrót pozostaje bez zmian.".to_string())?;
-    if let Err(err) = persist(new) { let _ = unregister(new); return Err(err); }
+    if let Err(err) = persist(new) {
+        if unregister(new).is_err() { return Err("Nie udało się zapisać ustawienia ani zwolnić nowego skrótu. Uruchom aplikację ponownie i sprawdź ustawienia.".into()); }
+        return Err(err);
+    }
     if registered && old != new && unregister(old).is_err() {
         let restored = persist(old).is_ok();
-        let _ = unregister(new);
-        return Err(if restored { "Nie udało się zmienić skrótu. Poprzedni pozostał aktywny." } else { "Nie udało się przywrócić ustawienia skrótu. Sprawdź je po ponownym uruchomieniu." }.into());
+        let removed = unregister(new).is_ok();
+        return Err(if restored && removed { "Nie udało się zmienić skrótu. Poprzedni pozostał aktywny." } else { "Nie udało się w pełni przywrócić ustawienia skrótu. Uruchom aplikację ponownie i sprawdź ustawienia." }.into());
     }
     Ok(())
 }
