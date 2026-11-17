@@ -2,7 +2,20 @@
 //!
 //! The caller must create and verify a backup before calling this for an
 //! existing database. The transaction preserves entry IDs and all references.
-use rusqlite::{Connection, Error, Result, TransactionBehavior};
+use rusqlite::{params, Connection, Error, OptionalExtension, Result, TransactionBehavior};
+
+/// Validate the user's explicit project and optional task inside the same write
+/// transaction as a timer start. Return the project's current billing default.
+pub fn target_billing(db: &Connection, project_id: i64, task_id: Option<i64>) -> std::result::Result<bool, String> {
+    let project: Option<(bool, bool, bool)> = db.query_row("SELECT p.archived,EXISTS(SELECT 1 FROM client_archives c WHERE c.client_id=p.client_id),EXISTS(SELECT 1 FROM billable_projects b WHERE b.project_id=p.id) FROM projects p WHERE p.id=?1", [project_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_| "Nie można odczytać projektu.".to_string())?;
+    let (archived, client_archived, billable) = project.ok_or("Nie znaleziono projektu.")?;
+    if archived || client_archived { return Err("Projekt lub jego klient jest w archiwum.".into()); }
+    if let Some(task_id) = task_id {
+        let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tasks t WHERE t.id=?1 AND t.project_id=?2 AND NOT EXISTS(SELECT 1 FROM task_archives a WHERE a.task_id=t.id))", params![task_id,project_id], |r| r.get(0)).map_err(|_| "Nie można odczytać zadania.".to_string())?;
+        if !valid { return Err("Zadanie nie należy do projektu lub znajduje się w archiwum.".into()); }
+    }
+    Ok(billable)
+}
 
 pub fn validate(db: &Connection) -> Result<()> {
     let columns: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='task_id' AND UPPER(type)='INTEGER' AND \"notnull\"=0) AND EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='project_id' AND UPPER(type)='INTEGER' AND \"notnull\"=1)", [], |r| r.get(0))?;
@@ -123,5 +136,21 @@ mod tests {
         for table in ["entry_descriptions", "billable_entries", "entry_revisions", "billing_revisions", "description_revisions", "entry_deletions"] { assert_eq!(count(table), 1); }
         assert!(db.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
         assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn project_target_checks_parent_task_and_billing() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'),(2,1,'Inny'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO billable_projects VALUES(1);").unwrap();
+        assert_eq!(target_billing(&db, 1, None).unwrap(), true);
+        assert_eq!(target_billing(&db, 1, Some(1)).unwrap(), true);
+        assert!(target_billing(&db, 2, Some(1)).is_err());
+        db.execute("INSERT INTO task_archives VALUES(1)", []).unwrap();
+        assert!(target_billing(&db, 1, Some(1)).is_err());
+        assert!(target_billing(&db, 1, None).is_ok());
+        db.execute("UPDATE projects SET archived=1 WHERE id=1", []).unwrap();
+        assert!(target_billing(&db, 1, None).is_err());
+        assert!(target_billing(&db, 999, None).is_err());
     }
 }
