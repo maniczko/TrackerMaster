@@ -403,6 +403,26 @@ mod tests {
     }
 
     #[test]
+    fn backup_and_restore_preserve_project_entry_without_task() {
+        let source_path=test_path("taskless-backup-source");
+        let dest_path=test_path("taskless-backup-dest");
+        let _source_cleanup=Cleanup(source_path.clone());
+        let _dest_cleanup=Cleanup(dest_path.clone());
+        let dir=dest_path.with_extension("dir");
+        let mut source=Connection::open(&source_path).unwrap();
+        crate::initialise(&mut source).unwrap();
+        source.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES(41,NULL,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_descriptions VALUES(41,'Opis'); INSERT INTO billable_entries VALUES(41);").unwrap();
+        let backup=create_backup(&source,&dir).unwrap();
+        let prepared=prepare_restore(&backup).unwrap();
+        assert_eq!((prepared.health.schema_version,prepared.health.completed_entries),(11,1));
+        let mut destination=Connection::open(&dest_path).unwrap();
+        crate::initialise(&mut destination).unwrap();
+        restore_prepared(&mut destination,&prepared,&dir).unwrap();
+        let entry:(i64,Option<i64>,String,bool)=destination.query_row("SELECT project_id,task_id,(SELECT description FROM entry_descriptions WHERE entry_id=e.id),EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e WHERE id=41",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(entry,(1,None,"Opis".into(),true));
+    }
+
+    #[test]
     fn restore_rejects_corrupt_or_newer_files_and_active_destination() {
         let source_path = test_path("restore-valid");
         let dest_path = test_path("restore-active");
