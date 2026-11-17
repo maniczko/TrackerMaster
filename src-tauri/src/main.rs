@@ -72,7 +72,7 @@ fn confirm_stop_and_exit() -> bool {
 }
 type Shared = Mutex<Tracker>;
 #[derive(Default)]
-struct HotkeyState { task_id: Option<i64>, registered: bool, widget_ready: bool, message: String }
+struct HotkeyState { project_id: Option<i64>, task_id: Option<i64>, registered: bool, widget_ready: bool, message: String }
 type Hotkey = Mutex<HotkeyState>;
 #[derive(Default)]
 struct RestoreState { sequence: u64, pending: Option<storage_safety::PreparedRestore> }
@@ -531,6 +531,18 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
 }
 
 fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Option<i64>, description: &str) -> Cmd<()> {
+    let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version == 11 {
+        let active: Option<i64> = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r|r.get(0)).optional().map_err(db_err)?;
+        let action = match next_task {
+            Some(task_id) => {
+                let project_id: Option<i64> = tracker.db.query_row("SELECT project_id FROM tasks WHERE id=?1", [task_id], |r|r.get(0)).optional().map_err(db_err)?;
+                optional_task_migration::TimerAction::Start { project_id: project_id.ok_or("Nie znaleziono zadania.")?, task_id:Some(task_id), description }
+            },
+            None => optional_task_migration::TimerAction::Stop,
+        };
+        return optional_task_migration::transition(tracker,active,end,action);
+    }
     change_timer(tracker, end, next_task, description, None)
 }
 
@@ -601,8 +613,17 @@ fn change_timer(tracker: &mut Tracker, end: &str, next_task: Option<i64>, descri
 }
 
 fn resume_saved_entry(tracker: &mut Tracker, source_id: i64, expected_active_id: Option<i64>, at: &str) -> Cmd<()> {
+    let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r|r.get(0)).map_err(db_err)?;
+    if version == 11 { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
     if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != expected_active_id { return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into()); }
     change_timer(tracker, at, None, "", Some(source_id))
+}
+
+#[tauri::command]
+fn start_project_timer(state: State<'_, Shared>, project_id: i64, task_id: Option<i64>, expected_active_id: Option<i64>, description: Option<String>) -> Cmd<Snapshot> {
+    let mut tracker=locked(&state)?;
+    optional_task_migration::transition(&mut tracker,expected_active_id,&now(),optional_task_migration::TimerAction::Start { project_id, task_id, description:description.as_deref().unwrap_or("") })?;
+    snapshot(&tracker)
 }
 
 #[tauri::command]
@@ -640,8 +661,10 @@ fn stop_timer(state: State<'_, Shared>, expected_active_id: i64) -> Cmd<Snapshot
 }
 
 #[tauri::command]
-fn set_shortcut_task(state: State<'_, Hotkey>, task_id: Option<i64>) -> Cmd<()> {
-    state.lock().map_err(|_| "Błąd skrótu.".to_string())?.task_id = task_id;
+fn set_shortcut_task(state: State<'_, Hotkey>, project_id: Option<i64>, task_id: Option<i64>) -> Cmd<()> {
+    let mut hotkey=state.lock().map_err(|_| "Błąd skrótu.".to_string())?;
+    hotkey.project_id = project_id;
+    hotkey.task_id = task_id;
     Ok(())
 }
 #[tauri::command]
@@ -664,6 +687,13 @@ fn widget_start(state: State<'_, Shared>, task_id: i64, description: Option<Stri
     let mut tracker = locked(&state)?;
     if snapshot(&tracker)?.active.is_some() { return Err("Pomiar już trwa. Sprawdź aktualny stan.".into()); }
     close_active_with_description(&mut tracker, &now(), Some(task_id), description.as_deref().unwrap_or(""))?;
+    snapshot(&tracker)
+}
+
+#[tauri::command]
+fn widget_project_start(state: State<'_, Shared>, project_id: i64, task_id: Option<i64>, description: Option<String>) -> Cmd<Snapshot> {
+    let mut tracker=locked(&state)?;
+    optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id,task_id,description:description.as_deref().unwrap_or("") })?;
     snapshot(&tracker)
 }
 
@@ -827,6 +857,13 @@ fn deleted_entries(state: State<'_, Shared>) -> Cmd<Vec<DeletedEntry>> {
 fn create_manual_entry(state: State<'_, Shared>, task_id: i64, started_at: String, ended_at: String, description: Option<String>) -> Cmd<Snapshot> {
     let mut tracker = locked(&state)?;
     add_manual_entry_with_description(&mut tracker, task_id, &started_at, &ended_at, Utc::now(), description.as_deref().unwrap_or(""))?;
+    snapshot(&tracker)
+}
+
+#[tauri::command]
+fn create_project_manual_entry(state: State<'_, Shared>, project_id: i64, task_id: Option<i64>, started_at: String, ended_at: String, description: Option<String>) -> Cmd<Snapshot> {
+    let mut tracker=locked(&state)?;
+    optional_task_migration::insert_manual(&mut tracker,project_id,task_id,&started_at,&ended_at,Utc::now(),description.as_deref().unwrap_or(""))?;
     snapshot(&tracker)
 }
 
@@ -1012,9 +1049,14 @@ fn main() {
             let Ok(mut tracker) = shared.lock() else { hotkey.message = "Nie można odczytać timera.".into(); return; };
             let result = match snapshot(&tracker) {
                 Ok(current) if current.active.is_some() => close_active(&mut tracker, &now(), None),
-                Ok(_) => match hotkey.task_id {
-                    Some(task_id) => close_active(&mut tracker, &now(), Some(task_id)),
-                    None => Err("Wybierz zadanie w mini timerze przed użyciem skrótu.".into()),
+                Ok(_) => match (hotkey.project_id,hotkey.task_id) {
+                    (Some(project_id),task_id) => match tracker.db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)) {
+                        Ok(11) => optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id,task_id,description:"" }),
+                        Ok(10) => match task_id { Some(task_id) => close_active(&mut tracker,&now(),Some(task_id)), None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()) },
+                        _ => Err("Nie można odczytać wersji bazy danych.".into()),
+                    },
+                    (None,Some(task_id)) => close_active(&mut tracker, &now(), Some(task_id)),
+                    (None,None) => Err("Wybierz projekt w mini timerze przed użyciem skrótu.".into()),
                 },
                 Err(err) => Err(err),
             };
@@ -1120,7 +1162,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }

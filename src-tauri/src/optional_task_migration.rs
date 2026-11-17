@@ -80,6 +80,23 @@ pub fn insert_running(db: &Connection, project_id: i64, task_id: Option<i64>, st
     Ok(id)
 }
 
+pub fn insert_manual(tracker: &mut crate::Tracker, project_id: i64, task_id: Option<i64>, started_at: &str, ended_at: &str, current: DateTime<Utc>, description: &str) -> std::result::Result<i64,String> {
+    crate::ensure_available(tracker)?;
+    crate::valid_description(description)?;
+    let (start,end)=crate::parse_manual_range(started_at,ended_at,current)?;
+    let tx=tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(crate::db_err)?;
+    let billable=target_billing(&tx,project_id,task_id)?;
+    crate::ensure_no_overlap(&tx,start,end,None)?;
+    let start_text=start.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+    let end_text=end.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+    tx.execute("INSERT INTO time_entries(task_id,project_id,started_at,ended_at,duration_seconds,manually_resolved) VALUES(?1,?2,?3,?4,?5,1)",params![task_id,project_id,start_text,end_text,(end-start).num_seconds()]).map_err(crate::db_err)?;
+    let id=tx.last_insert_rowid();
+    if billable { tx.execute("INSERT INTO billable_entries(entry_id) VALUES(?1)",[id]).map_err(crate::db_err)?; }
+    if !description.is_empty() { tx.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2)",params![id,description]).map_err(crate::db_err)?; }
+    tx.commit().map_err(crate::db_err)?;
+    Ok(id)
+}
+
 pub fn validate(db: &Connection) -> Result<()> {
     let columns: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='task_id' AND UPPER(type)='INTEGER' AND \"notnull\"=0) AND EXISTS(SELECT 1 FROM pragma_table_info('time_entries') WHERE name='project_id' AND UPPER(type)='INTEGER' AND \"notnull\"=1)", [], |r| r.get(0))?;
     let relationships: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('time_entries') WHERE \"from\"='project_id' AND \"table\"='projects' AND \"to\"='id') AND EXISTS(SELECT 1 FROM pragma_foreign_key_list('time_entries') a JOIN pragma_foreign_key_list('time_entries') b ON a.id=b.id WHERE a.\"table\"='tasks' AND b.\"table\"='tasks' AND a.\"from\"='task_id' AND a.\"to\"='id' AND b.\"from\"='project_id' AND b.\"to\"='project_id')", [], |r| r.get(0))?;
@@ -274,5 +291,21 @@ mod tests {
         assert!(report.entries.iter().all(|entry| entry.task_id.is_none()));
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+    }
+
+    #[test]
+    fn manual_project_entry_inherits_billing_and_rejects_overlaps() {
+        let mut db=Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO billable_projects VALUES(1);").unwrap();
+        migrate(&mut db).unwrap();
+        let mut tracker=crate::Tracker { db, running_since:None, restored:false };
+        let now=DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z").unwrap().with_timezone(&Utc);
+        let id=insert_manual(&mut tracker,1,None,"2026-01-01T09:00:00Z","2026-01-01T10:00:00Z",now,"Ręczny").unwrap();
+        let result=crate::snapshot(&tracker).unwrap();
+        assert_eq!((result.entries[0].id,result.entries[0].project_id,result.entries[0].task_id,result.entries[0].billable),(id,1,None,true));
+        assert_eq!(result.entries[0].description,"Ręczny");
+        assert!(insert_manual(&mut tracker,1,None,"2026-01-01T09:30:00Z","2026-01-01T10:30:00Z",now,"").is_err());
+        assert_eq!(crate::snapshot(&tracker).unwrap().entries.len(),1);
     }
 }
