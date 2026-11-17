@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatDuration, same } from './App';
 import type { Snapshot } from './App';
@@ -17,6 +18,8 @@ export default function Widget() {
   const [cursor, setCursor] = useState(0);
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const search = useRef<HTMLInputElement>(null);
+  const toggleRef = useRef<() => Promise<void>>(async () => {});
+  const busyRef = useRef(false);
 
   useEffect(() => {
     try {
@@ -64,15 +67,27 @@ export default function Widget() {
   }, []);
   useEffect(() => { if (open) search.current?.focus(); }, [open]);
   const toggle = useCallback(async () => {
-    if (busy || !data || data.active?.recovered || (!data.active && !choice)) return;
+    if (busyRef.current || !data || data.active?.recovered || (!data.active && !choice)) return;
+    busyRef.current = true;
     setBusy(true); setError('');
     try {
       if (data.active) await invoke('widget_stop', { entryId: Number(data.active.id) });
       else { await invoke('widget_start', { taskId: Number(choice!.task.id), description: draft }); setDraft(''); }
       await refresh();
     } catch (e) { await refresh(); setError(`Nie udało się wykonać operacji: ${String(e)}`); }
-    finally { setBusy(false); }
-  }, [busy, data, choice, draft, refresh]);
+    finally { busyRef.current = false; setBusy(false); }
+  }, [data, choice, draft, refresh]);
+  toggleRef.current = toggle;
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen('tracker-shortcut', () => { void toggleRef.current(); }).then(async remove => {
+      if (disposed) { remove(); return; }
+      unlisten = remove;
+      await invoke('widget_shortcut_ready');
+    }).catch(() => { if (!disposed) setError('Nie udało się przygotować skrótu w mini timerze. Użyj przycisku Start / Stop.'); });
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       if (!shortcut.registered && event.ctrlKey && event.shiftKey && !event.altKey && event.code === 'Space' && !event.repeat) { event.preventDefault(); void toggle(); }

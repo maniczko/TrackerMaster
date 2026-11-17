@@ -6,7 +6,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::{sync::Mutex, time::Instant};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -71,7 +71,7 @@ fn confirm_stop_and_exit() -> bool {
 }
 type Shared = Mutex<Tracker>;
 #[derive(Default)]
-struct HotkeyState { task_id: Option<i64>, registered: bool, message: String }
+struct HotkeyState { task_id: Option<i64>, registered: bool, widget_ready: bool, message: String }
 type Hotkey = Mutex<HotkeyState>;
 #[derive(Default)]
 struct RestoreState { sequence: u64, pending: Option<storage_safety::PreparedRestore> }
@@ -277,6 +277,7 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
         window.unminimize().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
     } else {
+        if let Ok(mut hotkey) = app.state::<Hotkey>().lock() { hotkey.widget_ready = false; }
         let window = tauri::WebviewWindowBuilder::new(&app, "widget", tauri::WebviewUrl::default())
             .title("TrackerMaster — mini timer").inner_size(520.0, 76.0)
             .decorations(false).resizable(false).build().map_err(|e| e.to_string())?;
@@ -329,6 +330,7 @@ async fn widget_drag(app: tauri::AppHandle) -> Cmd<()> {
 
 #[tauri::command]
 async fn close_widget(app: tauri::AppHandle) -> Cmd<()> {
+    if let Ok(mut hotkey) = app.state::<Hotkey>().lock() { hotkey.widget_ready = false; }
     app.get_webview_window("widget").ok_or("Widget nie jest otwarty.")?.close().map_err(|e| e.to_string())
 }
 
@@ -624,6 +626,13 @@ fn stop_timer(state: State<'_, Shared>, expected_active_id: i64) -> Cmd<Snapshot
 #[tauri::command]
 fn set_shortcut_task(state: State<'_, Hotkey>, task_id: Option<i64>) -> Cmd<()> {
     state.lock().map_err(|_| "Błąd skrótu.".to_string())?.task_id = task_id;
+    Ok(())
+}
+#[tauri::command]
+fn widget_shortcut_ready(state: State<'_, Hotkey>) -> Cmd<()> {
+    let mut hotkey = state.lock().map_err(|_| "Błąd skrótu.".to_string())?;
+    hotkey.widget_ready = true;
+    if hotkey.registered { hotkey.message.clear(); }
     Ok(())
 }
 #[derive(Serialize)]
@@ -968,6 +977,14 @@ fn main() {
             if event.state() != ShortcutState::Pressed { return; }
             let hotkey = app.state::<Hotkey>();
             let Ok(mut hotkey) = hotkey.lock() else { return; };
+            if let Some(widget) = app.get_webview_window("widget") {
+                if !hotkey.widget_ready {
+                    hotkey.message = "Mini timer nie jest jeszcze gotowy do obsługi skrótu.".into();
+                } else {
+                    hotkey.message = widget.emit("tracker-shortcut", ()).err().map(|_| "Nie udało się przekazać skrótu do mini timera.".to_string()).unwrap_or_default();
+                }
+                return;
+            }
             let shared = app.state::<Shared>();
             let Ok(mut tracker) = shared.lock() else { hotkey.message = "Nie można odczytać timera.".into(); return; };
             let result = match snapshot(&tracker) {
@@ -1080,7 +1097,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
