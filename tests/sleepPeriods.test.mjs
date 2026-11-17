@@ -20,6 +20,8 @@ test('records separate half-open sleep periods and rejects overlap or missing ow
   assert.throws(() => insert(db, 1, 1999, 2001), /overlapping/);
   assert.throws(() => insert(db, 1, 4000, 4000), /CHECK/);
   assert.throws(() => insert(db, 9, 4000, 5000), /FOREIGN KEY/);
+  assert.throws(() => insert(db, 1, -1, 0), /CHECK/);
+  assert.throws(() => insert(db, 1, 8640000000000001, null), /CHECK/);
   assert.equal(db.prepare('SELECT count(*) AS n FROM sleep_periods').get().n, 3);
   db.close();
 });

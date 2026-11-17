@@ -3,12 +3,12 @@
 CREATE TABLE sleep_periods (
     id INTEGER PRIMARY KEY,
     entry_id INTEGER NOT NULL REFERENCES time_entries(id) ON DELETE RESTRICT,
-    started_ms INTEGER NOT NULL CHECK (typeof(started_ms) = 'integer'),
-    ended_ms INTEGER CHECK (ended_ms IS NULL OR (typeof(ended_ms) = 'integer' AND ended_ms > started_ms)),
+    started_ms INTEGER NOT NULL CHECK (typeof(started_ms) = 'integer' AND started_ms BETWEEN 0 AND 8640000000000000),
+    ended_ms INTEGER CHECK (ended_ms IS NULL OR (typeof(ended_ms) = 'integer' AND ended_ms > started_ms AND ended_ms <= 8640000000000000)),
     decision TEXT NOT NULL DEFAULT 'pending' CHECK (decision IN ('pending', 'included', 'excluded')),
     decided_ms INTEGER,
     CHECK ((decision = 'pending' AND decided_ms IS NULL) OR
-           (decision IN ('included', 'excluded') AND ended_ms IS NOT NULL AND typeof(decided_ms) = 'integer')),
+           (decision IN ('included', 'excluded') AND ended_ms IS NOT NULL AND typeof(decided_ms) = 'integer' AND decided_ms BETWEEN 0 AND 8640000000000000)),
     UNIQUE (entry_id, started_ms)
 );
 CREATE INDEX sleep_periods_pending ON sleep_periods(decision, id);
