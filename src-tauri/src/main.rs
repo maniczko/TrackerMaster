@@ -103,6 +103,10 @@ struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>
 struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String }
 #[derive(Serialize)]
 struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
+#[derive(Serialize)]
+struct ExportEntry { id: i64, client: String, project: String, task: String, description: String, started_at: String, ended_at: String, duration_seconds: i64, billable: bool }
+#[derive(Serialize)]
+struct ExportData { client_id: i64, client: String, time_zone: String, entries: Vec<ExportEntry> }
 
 fn now() -> String { Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true) }
 fn valid_name(name: &str) -> Cmd<&str> {
@@ -201,6 +205,27 @@ fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample
 fn get_report_data(state: State<'_, Shared>) -> Cmd<ReportData> {
     let tracker = locked(&state)?;
     report_data(&tracker, Utc::now(), power_sample())
+}
+
+// Select by client inside SQLite; never assemble a client export from an
+// unfiltered frontend report. A mismatched task is unsafe to export.
+fn client_export_data(db: &Connection, client_id: i64) -> Cmd<ExportData> {
+    if client_id <= 0 { return Err("Wybierz klienta do eksportu.".into()); }
+    let client: String = db.query_row("SELECT name FROM clients WHERE id=?1", [client_id], |r| r.get(0)).optional().map_err(db_err)?
+        .ok_or("Nie znaleziono wybranego klienta.")?;
+    let time_zone = db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
+    let project = entry_project_sql(db, "e")?;
+    let mismatch: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id={project} LEFT JOIN tasks t ON t.id=e.task_id WHERE p.client_id=?1 AND e.task_id IS NOT NULL AND (t.id IS NULL OR t.project_id<>p.id) AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id))"), [client_id], |r| r.get(0)).map_err(db_err)?;
+    if mismatch { return Err("Nie można wyeksportować danych: zadanie nie pasuje do projektu. Sprawdź bazę danych.".into()); }
+    let sql = format!("SELECT e.id,c.name,p.name,COALESCE(t.name,''),COALESCE(d.description,''),e.started_at,e.ended_at,e.duration_seconds,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e JOIN projects p ON p.id={project} JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id LEFT JOIN entry_descriptions d ON d.entry_id=e.id WHERE p.client_id=?1 AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id");
+    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    Ok(ExportData { client_id, client, time_zone, entries })
+}
+
+#[tauri::command]
+fn get_client_export_data(state: State<'_, Shared>, client_id: i64) -> Cmd<ExportData> {
+    let tracker = locked(&state)?;
+    client_export_data(&tracker.db, client_id)
 }
 
 fn update_report_timezone(db: &Connection, expected: &str, zone: &str) -> Cmd<()> {
@@ -1187,7 +1212,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -1219,6 +1244,30 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[test]
+    fn export_query_isolates_clients_and_excludes_open_and_deleted_entries() {
+        let mut tracker = seeded();
+        initialise(&mut tracker.db).unwrap();
+        tracker.db.execute_batch("INSERT INTO clients(id,name) VALUES(2,'A podobny');
+            INSERT INTO projects(id,client_id,name) VALUES(2,2,'Obcy projekt');
+            INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES
+              (1,1,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600),
+              (2,NULL,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600),
+              (3,NULL,2,'2026-01-01T11:00:00Z','2026-01-01T12:00:00Z',3600),
+              (4,NULL,1,'2026-01-01T12:00:00Z','2026-01-01T13:00:00Z',3600),
+              (5,NULL,1,'2026-01-01T13:00:00Z',NULL,NULL);
+            INSERT INTO entry_deletions(entry_id,deleted_at) VALUES(4,'2026-01-01T14:00:00Z');").unwrap();
+        let export = client_export_data(&tracker.db, 1).unwrap();
+        assert_eq!(export.client, "A");
+        assert_eq!(export.entries.iter().map(|e|e.id).collect::<Vec<_>>(), vec![1,2]);
+        assert_eq!(export.entries[1].task, "");
+        assert_eq!(client_export_data(&tracker.db, 2).unwrap().entries[0].project, "Obcy projekt");
+        assert!(client_export_data(&tracker.db, 99).is_err());
+        tracker.db.pragma_update(None, "foreign_keys", false).unwrap();
+        tracker.db.execute("INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES(6,1,2,'2026-01-01T14:00:00Z','2026-01-01T15:00:00Z',3600)", []).unwrap();
+        assert!(client_export_data(&tracker.db, 2).is_err());
     }
 
     #[test]
