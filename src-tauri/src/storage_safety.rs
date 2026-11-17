@@ -610,6 +610,14 @@ mod tests {
         let rollback_db = &old_b.staged;
         assert_eq!(rollback_db.query_row("SELECT name FROM clients WHERE id=77", [], |r| r.get::<_, String>(0)).unwrap(), "Only on destination");
         assert_eq!(rollback_db.query_row("SELECT duration_seconds FROM time_entries WHERE id=777", [], |r| r.get::<_, i64>(0)).unwrap(), 900);
+        // Complete an actual second restore to prove a full rollback, not just
+        // that the fallback snapshot is readable.
+        let safety_of_a = restore_prepared(&mut b, &old_b, &b_data).unwrap();
+        preflight_existing(&safety_of_a).unwrap();
+        assert_eq!(diagnose_database(&b).unwrap().clients, 1);
+        assert_eq!(b.query_row("SELECT name FROM clients WHERE id=77", [], |r| r.get::<_, String>(0)).unwrap(), "Only on destination");
+        assert_eq!(b.query_row("SELECT duration_seconds FROM time_entries WHERE id=777", [], |r| r.get::<_, i64>(0)).unwrap(), 900);
+        assert_eq!(b.query_row("SELECT COUNT(*) FROM clients WHERE name='Client A'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         assert_eq!(a.query_row("SELECT COUNT(*) FROM clients", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
     }
 
