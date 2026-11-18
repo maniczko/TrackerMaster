@@ -364,7 +364,7 @@ async function verifyRestoreRetry(cdp, sessionId) {
   const backupFiles = await readdir(backupDir);
   assert.equal(backupFiles.length, 1);
   assert.equal(backupPath, join(backupDir, backupFiles[0]));
-  const savedBackupDir = join(temp, 'saved-backups');
+  const savedBackupDir = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'saved-backups-test');
   await rename(backupDir, savedBackupDir);
   const source = join(savedBackupDir, backupFiles[0]);
   await writeFile(backupDir, 'forced backup creation failure', { flag: 'wx' });
