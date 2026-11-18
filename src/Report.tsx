@@ -1,33 +1,36 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { dateInZone, reportByDay, reportOverlaps, validTimeZone } from './reportTime';
-import type { ReportEntry } from './reportTime';
-import { filterByClient } from './reportClientFilter';
+import { dateInZone, validTimeZone } from './reportTime';
 import { reportPresetRange } from './reportPresets';
 import type { ReportPreset } from './reportPresets';
 import { readReportFilter, validReportFilter } from './reportFilterStorage';
 import type { SavedReportFilter } from './reportFilterStorage';
 import ReportExport from './ReportExport';
+import ReportDetails from './ReportDetails';
+import { formatDuration as duration } from './reportCsv';
+import { makeReportView } from './reportView';
+import type { ActiveReportEntry, CompletedReportEntry, ReportClient, ReportProject, ReportTask } from './reportView';
 
-type Id = number | string;
-type Client = { id: Id; name: string };
-type Project = { id: Id; client_id: Id; name: string };
-type Completed = ReportEntry & { task_id: number | null; project_id: number; billable: boolean };
-type Active = { sleep_periods?: ReportEntry['sleep_periods']; id: number; task_id: number | null; project_id: number; started_at: string; ended_at: string | null; duration_seconds: number | null; unresolved: boolean; billable: boolean };
-type Data = { entries: Completed[]; active: Active | null; time_zone: string };
+type Data = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
+type Props = {
+  clients: ReportClient[];
+  projects: ReportProject[];
+  tasks: ReportTask[];
+  loaded: boolean;
+  revision: number;
+  hasUnsavedEdit: () => boolean;
+  onEditEntry: (entryId: number) => void;
+  onShowHistory: (entryId: number) => void;
+};
 
 function todayWarsaw() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
   const part = (name: string) => parts.find(p => p.type === name)?.value;
   return `${part('year')}-${part('month')}-${part('day')}`;
 }
-function duration(value: number) {
-  const seconds = Math.max(0, Math.floor(value));
-  return [Math.floor(seconds / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map(n => String(n).padStart(2, '0')).join(':');
-}
-
-export default function Report({ clients, projects, loaded, onEditEntry }: { clients: Client[]; projects: Project[]; loaded: boolean; onEditEntry: (entry: Completed) => void }) {
+export default function Report({ clients, projects, tasks, loaded, revision, hasUnsavedEdit, onEditEntry, onShowHistory }: Props) {
   const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<'summary' | 'details'>('summary');
   const [initialFilter] = useState(() => { try { return readReportFilter(window.localStorage); } catch { return { filter: null, problem: true }; } });
   const [from, setFrom] = useState(() => initialFilter.filter?.kind === 'custom' ? initialFilter.filter.from : todayWarsaw().slice(0, 8) + '01');
   const [through, setThrough] = useState(() => initialFilter.filter?.kind === 'custom' ? initialFilter.filter.through : todayWarsaw());
@@ -36,9 +39,11 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   const [filterStorageProblem, setFilterStorageProblem] = useState(false);
   const [now, setNow] = useState(Date.now);
   const [client, setClient] = useState('');
-  const [data, setData] = useState<Data | null>(null);
+  const [snapshot, setSnapshot] = useState<{ request: string; data: Data } | null>(null);
   const [error, setError] = useState('');
   const [refresh, setRefresh] = useState(0);
+  const request = `${revision}:${refresh}`;
+  const data = snapshot?.request === request ? snapshot.data : null;
   const [zoneDraft, setZoneDraft] = useState('');
   const [zoneError, setZoneError] = useState('');
   const [zoneSaving, setZoneSaving] = useState(false);
@@ -76,52 +81,52 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   }
 
   useEffect(() => {
-    if (!open || !loaded || !filterReady) { setData(null); return; }
+    if (!open || !loaded || !filterReady) { setSnapshot(null); return; }
     let cancelled = false;
     let timer: number | undefined;
     async function update() {
       try {
         const next = await invoke<Data>('get_report_data');
-        if (!cancelled) { setData(next); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
+        if (!cancelled) { setSnapshot({ request, data: next }); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
       } catch (e) {
-        if (!cancelled) { setData(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
+        if (!cancelled) { setSnapshot(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
       } finally {
         if (!cancelled) timer = window.setTimeout(update, 5000);
       }
     }
     void update();
     return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [open, loaded, refresh, filterReady]);
+  }, [open, loaded, request, filterReady]);
 
   useEffect(() => {
     const zone = data?.time_zone;
     if (!open || preset === 'custom' || !zone || !validTimeZone(zone)) return;
     const timer = window.setInterval(() => {
+      if (hasUnsavedEdit()) return;
       const current = Date.now();
       setNow(previous => dateInZone(previous, zone) === dateInZone(current, zone) ? previous : current);
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [open, preset, data?.time_zone]);
+  }, [open, preset, data?.time_zone, hasUnsavedEdit]);
 
   const range = useMemo(() => preset !== 'custom' && data && validTimeZone(data.time_zone)
     ? reportPresetRange(preset, now, data.time_zone) : { from, through }, [preset, now, data, from, through]);
 
   const result = useMemo(() => {
     if (!data) return null;
-    const { entries, active, missingRelations } = filterByClient(data.entries, data.active, projects, client);
-    try {
-      if (!validTimeZone(data.time_zone)) return { invalidZone: true as const };
-      const completed = reportByDay(entries, range.from, range.through, data.time_zone);
-      const activeEntry = active && !active.unresolved && active.ended_at !== null && active.duration_seconds !== null
-        ? { id: active.id, started_at: active.started_at, ended_at: active.ended_at, duration_seconds: active.duration_seconds, billable: active.billable, sleep_periods: active.sleep_periods } : null;
-      const combined = reportByDay(activeEntry ? [...entries, activeEntry] : entries, range.from, range.through, data.time_zone);
-      const billableSeconds = reportByDay([...entries.filter(entry => entry.billable), ...(activeEntry?.billable ? [activeEntry] : [])], range.from, range.through, data.time_zone).totalSeconds;
-      const overlaps = reportOverlaps(activeEntry ? [...entries, activeEntry] : entries, range.from, range.through, data.time_zone);
-      return { completed, combined, overlaps, active, activeSeconds: combined.totalSeconds - completed.totalSeconds, billableSeconds, missingRelations, invalidRange: false, invalidZone: false };
-    } catch {
-      return { invalidRange: true as const, invalidZone: false };
+    if (!validTimeZone(data.time_zone)) return { error: 'Zapisana strefa raportu nie jest obsługiwana.' };
+    if (!validReportFilter({ kind: 'custom', ...range })) {
+      return { error: 'Podaj poprawny zakres dat od 1970 roku. Data końcowa nie może być wcześniejsza niż początkowa.' };
     }
-  }, [data, range.from, range.through, client, projects]);
+    try {
+      return { view: makeReportView(data, { clients, projects, tasks }, client, range.from, range.through) };
+    } catch (problem) {
+      return { error: problem instanceof Error ? problem.message : 'Nie udało się obliczyć raportu.' };
+    }
+  }, [data, range, client, clients, projects, tasks]);
+  const view = result?.view;
+  const incomplete = !!view && (view.excludedEntryIds.length > 0 || view.missingRelations);
+  const scope = JSON.stringify([client, range.from, range.through, data?.time_zone]);
 
   return <section className="card report" aria-label="Raport czasu">
     <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div><button type="button" className="secondary report-button" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
@@ -134,18 +139,47 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
       {!loaded && <p role="status">Odśwież dane aplikacji, aby wyświetlić raport.</p>}
       {error && <div role="alert" className="alert error">{error} <button type="button" onClick={() => setRefresh(n => n + 1)}>Ponów</button></div>}
       {loaded && !data && !error && <p role="status">Wczytywanie raportu…</p>}
-      {result?.invalidZone && <div role="alert" className="alert error">Zapisana strefa raportu nie jest obsługiwana. Wybierz poprawną strefę przed wyświetleniem wyników.</div>}
-      {result && 'invalidRange' in result && result.invalidRange && <div role="alert" className="alert error">Podaj poprawny zakres dat od 1970 roku; data końcowa nie może być wcześniejsza niż początkowa.</div>}
-      {result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <>
-        {(result.combined.excludedEntryIds.length > 0 || result.missingRelations) && <div role="alert" className="alert error"><strong>Raport jest niepełny.</strong> {result.combined.excludedEntryIds.length > 0 && <>Nie można bezpiecznie przypisać czasu do dni dla wpisów: {result.combined.excludedEntryIds.join(', ')}. Sprawdź je w historii. </>}{result.missingRelations && 'Brakuje powiązania części wpisów z klientem.'}</div>}
-        {result.overlaps.entryIds.length > 0 && <div role="alert" className="alert error"><strong>Wykryto nakładające się pomiary.</strong> Suma może uwzględniać ten sam czas więcej niż raz. Sprawdź wpisy: {result.overlaps.entryIds.map(id => `#${id}`).join(', ')}{result.overlaps.truncated ? ' i być może kolejne' : ''}. <div className="actions">{data?.entries.filter(entry => result.overlaps.entryIds.includes(entry.id)).map(entry => <button type="button" className="secondary" key={entry.id} onClick={() => onEditEntry(entry)}>Popraw wpis #{entry.id}</button>)}</div>{result.active && result.overlaps.entryIds.includes(result.active.id) && <p>Zatrzymaj aktywny pomiar, aby go poprawić.</p>}</div>}
-        {result.combined.pendingSeconds > 0 && <div role="status" className="alert"><strong>Uśpienie do rozstrzygnięcia: {duration(result.combined.pendingSeconds)}.</strong> Ten czas nie jest uwzględniony w pracy ani rozliczeniach.</div>}
-        {result.active?.unresolved && <div role="alert" className="alert error">Aktywny pomiar wymaga weryfikacji lub sprawdzenia zegara. Nie jest doliczany do raportu.</div>}
-        <div className="report-summary"><div><small>Łącznie{result.combined.excludedEntryIds.length || result.missingRelations ? ' — niepełne' : ''}</small><strong>{duration(result.combined.totalSeconds)}</strong></div><div><small>Średnio na dzień z pracą</small><strong>{result.combined.averageSeconds === null ? 'Brak danych' : duration(result.combined.averageSeconds)}</strong></div><div><small>Czas rozliczalny</small><strong>{duration(result.billableSeconds)}</strong><small>{result.combined.totalSeconds ? `${new Intl.NumberFormat('pl-PL', { maximumFractionDigits: 1 }).format(100 * result.billableSeconds / result.combined.totalSeconds)}% czasu` : 'Brak danych'}</small></div><div><small>W tym aktywny pomiar · orientacyjnie</small><strong>{duration(result.activeSeconds)}</strong></div></div>
-        {result.active && !result.active.unresolved && <p className="muted">Aktywny pomiar jest tymczasowy i aktualizuje się co kilka sekund.</p>}
-        {result.combined.days.length === 0 ? <p className="muted">Brak zakończonych lub aktywnych pomiarów w wybranym zakresie.</p> : <div className="table-wrap"><table><thead><tr><th>Dzień</th><th>Czas</th></tr></thead><tbody>{result.combined.days.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
+      {result?.error && <div role="alert" className="alert error">{result.error}</div>}
+      {view && data && <>
+        {incomplete && <div role="alert" className="alert error">
+          <strong>Raport jest niepełny.</strong> {view.excludedEntryIds.length > 0 && <>Nie można bezpiecznie przypisać czasu do dni dla wpisów {view.excludedEntryIds.join(', ')}. </>}
+          {view.missingRelations && 'Sprawdź powiązanie wpisów z klientem, projektem i zadaniem.'}
+        </div>}
+        {view.overlaps.entryIds.length > 0 && <div role="alert" className="alert error">
+          <strong>Wykryto nakładające się pomiary.</strong> Suma może uwzględniać ten sam czas więcej niż raz.
+          <div className="actions">
+            {data.entries.filter(entry => view.overlaps.entryIds.includes(entry.id)).map(entry =>
+              <button type="button" className="secondary" key={entry.id} onClick={() => onEditEntry(entry.id)}>Popraw wpis #{entry.id}</button>)}
+          </div>
+          {view.overlaps.truncated && <p>Wyświetlono tylko część powiązanych wpisów.</p>}
+          {view.active && view.overlaps.entryIds.includes(view.active.id) && <p>Zatrzymaj aktywny pomiar, aby go poprawić.</p>}
+        </div>}
+        {view.pendingSeconds > 0 && <p role="status" className="alert">Uśpienie do rozstrzygnięcia <strong>{duration(view.pendingSeconds)}</strong></p>}
+        {view.awaitingSeconds > 0 && <p role="status" className="alert">
+          Praca we wpisach z nierozstrzygniętą przerwą <strong>{duration(view.awaitingSeconds)}</strong>. Pojawi się w zatwierdzonej sumie po rozstrzygnięciu przerwy.
+        </p>}
+        {view.active?.unresolved && <div role="alert" className="alert error">Aktywny pomiar wymaga weryfikacji lub sprawdzenia zegara.</div>}
+        <div className="report-presets" role="group" aria-label="Widok raportu">
+          <button type="button" className="secondary report-button" aria-pressed={tab === 'summary'} onClick={() => setTab('summary')}>Podsumowanie</button>
+          <button type="button" className="secondary report-button" aria-pressed={tab === 'details'} onClick={() => setTab('details')}>Szczegóły</button>
+        </div>
+        {tab === 'summary' ? <>
+          <div className="report-summary">
+            <div><small>Zatwierdzony czas{incomplete ? ' · suma niepełna' : ''}</small><strong>{duration(view.finalizedSeconds)}</strong></div>
+            <div><small>Aktywny pomiar · orientacyjnie</small><strong>{duration(view.activeSeconds)}</strong></div>
+            <div><small>Łącznie z aktywnym pomiarem</small><strong>{duration(view.liveSeconds)}</strong></div>
+            <div><small>Średnio na dzień z pracą</small><strong>{view.averageSeconds === null ? 'Brak danych' : duration(view.averageSeconds)}</strong></div>
+            <div><small>Czas rozliczalny</small><strong>{duration(view.billableSeconds)}</strong>
+              <small>{view.liveSeconds ? `${new Intl.NumberFormat('pl-PL', { maximumFractionDigits: 1 }).format(100 * view.billableSeconds / view.liveSeconds)}% czasu` : 'Brak danych'}</small></div>
+          </div>
+          {view.liveDays.length === 0 ? <p className="muted">Brak zatwierdzonego lub aktywnego czasu w wybranym zakresie.</p> :
+            <div className="table-wrap"><table><thead><tr><th scope="col">Dzień</th><th scope="col">Czas z aktywnym pomiarem</th></tr></thead>
+              <tbody>{view.liveDays.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
+        </> : <ReportDetails key={`details:${scope}`} rows={view.rows}
+          finalizedSeconds={view.finalizedSeconds} zone={data.time_zone} onEdit={onEditEntry} onHistory={onShowHistory} />}
+        <ReportExport key={`export:${scope}`} client={client} from={range.from}
+          through={range.through} zone={data.time_zone} expectedRows={view.finalizedRows} incomplete={incomplete} />
       </>}
-      {data && result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <ReportExport key={JSON.stringify([client, range.from, range.through, data.time_zone])} client={client} from={range.from} through={range.through} zone={data.time_zone} />}
     </>}
   </section>;
 }

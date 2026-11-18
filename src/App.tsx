@@ -62,13 +62,17 @@ export default function App() {
   const [restorePreview, setRestorePreview] = useState<RestorePreview | null>(null);
   const [restoreConfirmed, setRestoreConfirmed] = useState(false);
   const [restoreDone, setRestoreDone] = useState('');
-  const [revisions, setRevisions] = useState<{ entryId: Id; items: Revision[]; billing: BillingRevision[]; descriptions: DescriptionRevision[]; origin: DraftOrigin | null } | null>(null);
+  const [revisions, setRevisions] = useState<{ entryId: Id; items: Revision[]; billing: BillingRevision[]; descriptions: DescriptionRevision[]; origin: DraftOrigin | null; reveal: boolean } | null>(null);
   const revisionsRequest = useRef(0);
+  const revisionSection = useRef<HTMLElement>(null);
   const entryEditor = useRef<EntryDraftEditorHandle>(null);
+  const hasUnsavedReportEdit = useCallback(() => entryEditor.current?.hasUnsavedChanges() ?? false, []);
   const descriptionRef = useRef<HTMLElement>(null);
   const [loaded, setLoaded] = useState(false);
+  const [reportRevision, setReportRevision] = useState(0);
   const [now, setNow] = useState(Date.now());
   useEffect(() => { if (describe) descriptionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [describe?.id]);
+  useEffect(() => { if (revisions?.reveal) revisionSection.current?.scrollIntoView({ block: 'start' }); }, [revisions]);
   const refresh = useCallback(async () => {
     try {
       const next = await invoke<Snapshot>('get_snapshot');
@@ -108,17 +112,18 @@ export default function App() {
         try { await refresh(); } catch { /* Odczyt można ponowić osobno. */ }
         return;
       }
+      setReportRevision(version => version + 1);
       try { await refresh(); setNotice(message); }
       catch (e) { setError(`${message} Nie udało się odświeżyć danych: ${String(e)}. Ponów odczyt, nie operację.`); }
     } finally { setBusy(false); }
   }
   async function retryRefresh() {
     setBusy(true); setError(''); setNotice('');
-    try { await refresh(); setNotice('Dane zostały odświeżone.'); }
+    try { await refresh(); setReportRevision(version => version + 1); setNotice('Dane zostały odświeżone.'); }
     catch (e) { setError(`Nie udało się odczytać danych: ${String(e)}`); }
     finally { setBusy(false); }
   }
-  async function showRevisions(entryId: Id) {
+  async function showRevisions(entryId: Id, reveal = false) {
     const request = ++revisionsRequest.current;
     try {
       const args = { entryId: Number(entryId) };
@@ -128,7 +133,7 @@ export default function App() {
         invoke<DescriptionRevision[]>('description_revisions', args),
         invoke<DraftOrigin | null>('get_entry_draft_origin', args),
       ]);
-      if (request === revisionsRequest.current) setRevisions({ entryId, items, billing, descriptions, origin });
+      if (request === revisionsRequest.current) setRevisions({ entryId, items, billing, descriptions, origin, reveal });
     } catch (e) { if (request === revisionsRequest.current) setError(`Nie udało się odczytać historii zmian: ${String(e)}`); }
   }
   async function loadDeleted() {
@@ -220,7 +225,9 @@ export default function App() {
         </aside>
       </div>
       {describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
-      <Report clients={data.clients} projects={data.projects} loaded={loaded} onEditEntry={entry => entryEditor.current?.openEntry(Number(entry.id), 'start')} />
+      <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} hasUnsavedEdit={hasUnsavedReportEdit}
+        onEditEntry={entryId => entryEditor.current?.openEntry(entryId, 'start')}
+        onShowHistory={entryId => { void showRevisions(entryId, true); }} />
       <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
         <p className="muted">Pomiary zapisane przed dodaniem rozliczalności mają domyślnie status nierozliczalny. Możesz go zmienić dla każdego wpisu.</p>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta i projekt powyżej; zadanie jest opcjonalne. Podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
@@ -233,6 +240,7 @@ export default function App() {
         <EntryDraftEditor ref={entryEditor} clients={data.clients} projects={data.projects} tasks={data.tasks}
           enabled={loaded && !busy} onCommitted={async entryId => {
             setNotice('Zmiany wpisu zostały zapisane.');
+            setReportRevision(version => version + 1);
             try {
               await refresh();
               if (revisions && same(revisions.entryId, entryId)) await showRevisions(entryId);
@@ -241,7 +249,7 @@ export default function App() {
         {deleting && <div className="alert error" role="alert"><strong>Usunąć wpis #{deleting.id}?</strong> {formatPreciseDate(deleting.started_at)} – {deleting.ended_at && formatPreciseDate(deleting.ended_at)}. Nie będzie uwzględniany w zestawieniach; informacja o usunięciu pozostanie w historii. <button type="button" disabled={busy || !loaded} onClick={() => void execute(async () => { await invoke('delete_time_entry', { entryId: Number(deleting.id), expectedStart: deleting.started_at, expectedEnd: deleting.ended_at }); setDeleting(null); if (deleted) await loadDeleted(); }, 'Wpis został usunięty z zestawień.')}>Potwierdź usunięcie</button>{' '}<button type="button" disabled={busy} onClick={() => setDeleting(null)}>Anuluj</button></div>}
         {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : <div className="table-wrap"><table><thead><tr><th>Zadanie</th><th>Klient / projekt</th><th>Rozpoczęcie</th><th>Zakończenie</th><th>Czas</th><th>Operacje</th></tr></thead><tbody>{entries.map(e => { const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, e.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id)); return <tr key={e.id}><td><strong>{e.task_id === null ? 'Bez zadania' : t?.name || 'Nieznane zadanie'}</strong>{e.description && <small className="entry-description">{e.description}</small>}</td><td>{c?.name || '—'} / {p?.name || '—'}</td><td>{formatDate(e.started_at)}</td><td>{formatDate(e.ended_at)}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td><td className="duration">{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td><td><button type="button" className="secondary" disabled={busy || !loaded || !!data.active?.recovered} aria-label={`Wznów: ${t?.name || 'zadanie'}`} onClick={() => void execute(() => invoke('resume_entry', { sourceId: Number(e.id), expectedActiveId: data.active ? Number(data.active.id) : null }), 'Pomiar wznowiony.')}>Wznów</button>{' '}<button type="button" className="secondary" disabled={busy || !loaded} aria-label={`Zmień opis: ${t?.name || 'zadanie'}`} onClick={() => entryEditor.current?.openEntry(Number(e.id), 'description')}>Opis</button>{' '}<button type="button" className="secondary" disabled={busy || !loaded} aria-label={`${e.billable ? 'Oznacz jako nierozliczalny' : 'Oznacz jako rozliczalny'}: ${t?.name || 'zadanie'}`} onClick={() => void execute(() => invoke('set_entry_billable', { entryId: Number(e.id), expected: e.billable, billable: !e.billable }), 'Zapisano rozliczalność wpisu.')}>{e.billable ? 'Rozliczalny' : 'Nierozliczalny'}</button>{' '}<button type="button" className="secondary" disabled={busy || !e.ended_at} aria-label={`Popraw wpis: ${t?.name || 'zadanie'}`} onClick={() => entryEditor.current?.openEntry(Number(e.id), 'start')}>Popraw</button>{' '}<button type="button" className="secondary" aria-label={`Historia zmian: ${t?.name || 'zadanie'}`} onClick={() => void showRevisions(e.id)}>Historia zmian</button>{' '}<button type="button" className="secondary" disabled={busy || !e.ended_at} aria-label={`Usuń wpis: ${t?.name || 'zadanie'}`} onClick={() => setDeleting(e)}>Usuń</button></td></tr>; })}</tbody></table></div>}
         <details onToggle={e => { if (e.currentTarget.open) void loadDeleted(); }}><summary>Usunięte wpisy</summary><p className="muted">Te wpisy nie są uwzględniane w aktywnej historii. Zachowano je wraz z historią zmian.</p><button type="button" className="secondary" onClick={() => void loadDeleted()}>Odśwież listę</button>{deleted === null ? <p className="muted">Odczytywanie lub brak dostępu do listy.</p> : deleted.length === 0 ? <p className="muted">Brak usuniętych wpisów.</p> : <ul>{deleted.map(entry => <li key={entry.id}><strong>{entry.task_id === null ? 'Bez zadania' : data.tasks.find(task => same(task.id, entry.task_id))?.name || 'Nieznane zadanie'}</strong> · {formatPreciseDate(entry.started_at)} – {formatPreciseDate(entry.ended_at)} · {formatDuration(entry.duration_seconds)} · usunięto {formatPreciseDate(entry.deleted_at)}{' '}<button type="button" className="secondary" onClick={() => void showRevisions(entry.id)}>Historia zmian</button></li>)}</ul>}{deleted?.length === 500 && <p className="muted">Wyświetlono ostatnie 500 usuniętych wpisów.</p>}</details>
-        {revisions && <section aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.origin && <p>Wpis powstał z odzyskanego szkicu wpisu #{revisions.origin.sourceEntryId} · {formatPreciseDate(revisions.origin.createdAt)}</p>}{!revisions.origin && revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
+        {revisions && <section ref={revisionSection} aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.origin && <p>Wpis powstał z odzyskanego szkicu wpisu #{revisions.origin.sourceEntryId} · {formatPreciseDate(revisions.origin.createdAt)}</p>}{!revisions.origin && revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
       </section>
       <ShortcutSettings />
       <section className="card" aria-label="Bezpieczeństwo danych"><div className="section-top"><div><p className="section-kicker">TWOJE DANE</p><h2>Kopia zapasowa</h2></div></div><p className="muted">Utwórz lokalną kopię bazy danych, również podczas trwającego pomiaru.</p><div className="actions"><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setLastBackup(await invoke<string>('create_backup')); }, 'Kopia została utworzona i sprawdzona.')}>Utwórz kopię</button><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setDatabaseHealth(await invoke<DatabaseHealth>('diagnose_database')); }, 'Sprawdzono bazę danych.')}>Sprawdź bazę</button></div>{lastBackup && <p role="status">Kopia została zapisana: <code>{lastBackup}</code>. Zawiera dane klientów i nie jest szyfrowana.</p>}{databaseHealth && <p role="status">Baza poprawna · Klienci: {databaseHealth.clients} · Projekty: {databaseHealth.projects} · Zadania: {databaseHealth.tasks} · Zakończone wpisy: {databaseHealth.completed_entries} · Otwarte pomiary: {databaseHealth.open_entries}</p>}
