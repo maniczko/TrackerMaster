@@ -94,6 +94,7 @@ pub(super) enum DraftApplication {
         description: String,
     },
     NewEntry {
+        database_id: String,
         client_id: i64,
         project_id: i64,
         task_id: Option<i64>,
@@ -136,6 +137,17 @@ pub(super) struct DraftFields {
     end: String,
     description: String,
     input_time_zone: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<DraftTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DraftTarget {
+    database_id: String,
+    client_id: Option<i64>,
+    project_id: Option<i64>,
+    task_id: Option<i64>,
 }
 
 impl DraftFields {
@@ -154,6 +166,19 @@ impl DraftFields {
                 .input_time_zone
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"/_+.-".contains(&byte))
+            && self.target.as_ref().is_none_or(|target| {
+                target.database_id.len() == 32
+                    && target
+                        .database_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    && [target.client_id, target.project_id, target.task_id]
+                        .into_iter()
+                        .flatten()
+                        .all(|id| id > 0)
+                    && (target.project_id.is_none() || target.client_id.is_some())
+                    && (target.task_id.is_none() || target.project_id.is_some())
+            })
     }
 }
 
@@ -175,11 +200,16 @@ pub(super) struct DraftList {
 }
 
 #[derive(Serialize)]
-#[serde(tag = "status", content = "source", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    content = "source",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub(super) enum DraftSourceStatus {
     Ready(DraftSource),
     Changed(DraftSource),
-    Missing,
+    Missing { database_id: String },
 }
 
 fn read_source(db: &Connection, entry_id: i64) -> Cmd<Option<DraftSource>> {
@@ -220,15 +250,22 @@ fn read_source(db: &Connection, entry_id: i64) -> Cmd<Option<DraftSource>> {
 }
 
 fn source_status(db: &Connection, previous: &DraftSource) -> Cmd<DraftSourceStatus> {
+    let database_id: String = db
+        .query_row(
+            "SELECT value FROM entry_database_identity WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if database_id != previous.database_id {
+        return Ok(DraftSourceStatus::Missing { database_id });
+    }
     let Some(current) = read_source(db, previous.entry_id)? else {
-        return Ok(DraftSourceStatus::Missing);
+        return Ok(DraftSourceStatus::Missing { database_id });
     };
     // A restore can reuse an entry ID for a different client or project.
-    if current.database_id != previous.database_id
-        || current.client_id != previous.client_id
-        || current.project_id != previous.project_id
-    {
-        return Ok(DraftSourceStatus::Missing);
+    if current.client_id != previous.client_id || current.project_id != previous.project_id {
+        return Ok(DraftSourceStatus::Missing { database_id });
     }
     Ok(if current == *previous {
         DraftSourceStatus::Ready(current)
@@ -446,17 +483,23 @@ fn resolve_draft(
             (origin, CORRECTION)
         }
         DraftApplication::NewEntry {
+            database_id,
             client_id,
             project_id,
             task_id,
             range,
             description,
         } => {
-            if !matches!(
-                source_status(&tx, &draft.source)?,
-                DraftSourceStatus::Missing
-            ) {
-                return Err("Oryginalny wpis jest dostępny. Otwórz ponownie szkic.".into());
+            match source_status(&tx, &draft.source)? {
+                DraftSourceStatus::Missing {
+                    database_id: current,
+                } if current == database_id => {}
+                DraftSourceStatus::Missing { .. } => {
+                    return Err(
+                        "Baza została zmieniona. Ponownie wybierz klienta i projekt.".into(),
+                    )
+                }
+                _ => return Err("Oryginalny wpis jest dostępny. Otwórz ponownie szkic.".into()),
             }
             let owner: Option<i64> = tx
                 .query_row(
@@ -647,6 +690,7 @@ mod tests {
             end: "2026-01-01T10:30:00".into(),
             description: description.into(),
             input_time_zone: "Europe/Warsaw".into(),
+            target: None,
         }
     }
 
@@ -723,7 +767,7 @@ mod tests {
         let other_db = database();
         assert!(matches!(
             source_status(&other_db, &original).unwrap(),
-            DraftSourceStatus::Missing
+            DraftSourceStatus::Missing { .. }
         ));
         assert!(matches!(
             source_status(&db, &original).unwrap(),
@@ -745,7 +789,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             source_status(&db, &original).unwrap(),
-            DraftSourceStatus::Missing
+            DraftSourceStatus::Missing { .. }
         ));
 
         let second = read_source(&db, 2).unwrap().unwrap();
@@ -753,7 +797,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             source_status(&db, &second).unwrap(),
-            DraftSourceStatus::Missing
+            DraftSourceStatus::Missing { .. }
         ));
     }
 
@@ -825,25 +869,33 @@ mod tests {
     fn creating_from_missing_source_uses_new_id_and_preserves_audit_in_backup() {
         let mut db = database();
         let source = read_source(&db, 1).unwrap().unwrap();
+        let database_id = source.database_id.clone();
         let dir = test_directory("new");
         let draft = persist_draft(&dir, source, fields("Odzyskany opis"), None).unwrap();
         db.execute_batch(
             "DELETE FROM entry_descriptions WHERE entry_id=1; DELETE FROM time_entries WHERE id=1;",
         )
         .unwrap();
-        let application = |client_id| DraftApplication::NewEntry {
+        assert_eq!(
+            serde_json::to_value(source_status(&db, &draft.source).unwrap()).unwrap(),
+            serde_json::json!({ "status": "missing", "source": { "databaseId": &database_id } })
+        );
+        let application = |target_database: &str, client_id| DraftApplication::NewEntry {
+            database_id: target_database.into(),
             client_id,
             project_id: 1,
             task_id: None,
             range: range("2026-01-01T10:30:00.000Z"),
             description: "Odzyskany opis".into(),
         };
-        assert!(resolve_draft(&mut db, &draft, application(2), test_now()).is_err());
+        assert!(resolve_draft(&mut db, &draft, application(&database_id, 2), test_now()).is_err());
+        assert!(resolve_draft(&mut db, &draft, application("stale", 1), test_now()).is_err());
         assert_eq!(find_resolution(&db, 1, &draft.revision).unwrap(), None);
-        let created = resolve_draft(&mut db, &draft, application(1), test_now()).unwrap();
+        let created =
+            resolve_draft(&mut db, &draft, application(&database_id, 1), test_now()).unwrap();
         assert_ne!(created, 1);
         assert_eq!(
-            resolve_draft(&mut db, &draft, application(1), test_now()).unwrap(),
+            resolve_draft(&mut db, &draft, application(&database_id, 1), test_now()).unwrap(),
             created
         );
         assert!(read_source(&db, 1).unwrap().is_none());

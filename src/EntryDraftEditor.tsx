@@ -37,6 +37,7 @@ type Review = {
   draft: EntryDraft;
   current: DraftSource | null;
   currentFields: DraftFields | null;
+  databaseId: string | null;
   selected: EditableField[];
 };
 type CloseRequest = { id: number; action: 'hide' | 'quit' };
@@ -159,13 +160,16 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     });
   }
 
-  async function showEditor(source: DraftSource, base: DraftSource | null, fields: DraftFields, saved: EntryDraft | null, focus: EditableField) {
+  async function showEditor(
+    source: DraftSource, base: DraftSource | null, fields: DraftFields, saved: EntryDraft | null,
+    focus: EditableField, target = emptyTarget,
+  ) {
     if (!closeReady) throw new Error('Ochrona edycji nie jest jeszcze dostępna. Otwórz edycję ponownie.');
     const baseline = base ? sourceFields(base, fields.inputTimeZone) : null;
     await invoke('set_entry_editor_guard', { open: true });
     setReview(null);
     setStorageProblem('');
-    replaceEditor({ session: ++sequence.current, source, base, baseline, fields, saved, target: emptyTarget, focus });
+    replaceEditor({ session: ++sequence.current, source, base, baseline, fields, saved, target, focus });
   }
 
   function canOpenEditor(): boolean {
@@ -188,13 +192,14 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
       entryId: draft.source.entryId, revision: draft.revision,
     });
     if (status.status === 'ready') {
-      await showEditor(draft.source, status.source, draft.fields, draft, 'start');
+      await showEditor(draft.source, status.source, { ...draft.fields, target: undefined }, draft, 'start');
       return;
     }
     const currentSource = status.status === 'changed' ? status.source : null;
     setReview({
       draft, current: currentSource,
       currentFields: currentSource ? sourceFields(currentSource, draft.fields.inputTimeZone) : null,
+      databaseId: status.status === 'missing' ? status.source.databaseId : null,
       selected: [],
     });
   }
@@ -305,9 +310,10 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
         };
       } else {
         const { clientId, projectId, taskId } = active.target;
-        if (!clientId || !projectId) throw new Error('Wybierz klienta i projekt dla nowego wpisu.');
+        if (!clientId || !projectId || !active.fields.target) throw new Error('Wybierz klienta i projekt dla nowego wpisu.');
         application = {
-          kind: 'new_entry', clientId: Number(clientId), projectId: Number(projectId), taskId: taskId ? Number(taskId) : null,
+          kind: 'new_entry', databaseId: active.fields.target.databaseId,
+          clientId: Number(clientId), projectId: Number(projectId), taskId: taskId ? Number(taskId) : null,
           range: draftRange(active.fields), description: active.fields.description,
         };
       }
@@ -331,7 +337,39 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
 
   function updateTarget(target: Target) {
     const active = current.current;
-    if (active && !operation.current) replaceEditor({ ...active, target });
+    if (!active || operation.current || !active.fields.target) return;
+    replaceEditor({
+      ...active, target,
+      fields: { ...active.fields, target: {
+        databaseId: active.fields.target.databaseId,
+        clientId: target.clientId ? Number(target.clientId) : null,
+        projectId: target.projectId ? Number(target.projectId) : null,
+        taskId: target.taskId ? Number(target.taskId) : null,
+      } },
+    });
+    window.clearTimeout(timer.current);
+    queueSnapshot(active.session);
+  }
+
+  function prepareNewEntry(recovered: EntryDraft, databaseId: string) {
+    const reference = recovered.fields.target?.databaseId === databaseId
+      ? recovered.fields.target : recovered.source.databaseId === databaseId ? recovered.source : null;
+    const client = clients.find(item => !item.archived && String(item.id) === String(reference?.clientId));
+    const project = client && projects.find(item => !item.archived
+      && String(item.id) === String(reference?.projectId) && String(item.client_id) === String(client.id));
+    const task = project && tasks.find(item => !item.archived
+      && String(item.id) === String(reference?.taskId) && String(item.project_id) === String(project.id));
+    const fields = { ...recovered.fields, target: {
+      databaseId,
+      clientId: client ? Number(client.id) : null,
+      projectId: project ? Number(project.id) : null,
+      taskId: task ? Number(task.id) : null,
+    } };
+    run(() => showEditor(recovered.source, null, fields, recovered, 'start', {
+      clientId: client ? String(client.id) : '',
+      projectId: project ? String(project.id) : '',
+      taskId: task ? String(task.id) : '',
+    }));
   }
 
   async function answerClose(request: CloseRequest, proceed: boolean) {
@@ -493,7 +531,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
                 }
               }}>Przenieś wybrane pola</button>
             : <button type="button" className="primary" disabled={working || !enabled} onClick={() => {
-                if (canOpenEditor()) run(() => showEditor(review.draft.source, null, review.draft.fields, review.draft, 'start'));
+                if (review.databaseId && canOpenEditor()) prepareNewEntry(review.draft, review.databaseId);
               }}>Utwórz nowy wpis ze szkicu</button>}
           <button type="button" className="secondary" onClick={() => setReview(null)}>Wróć do listy</button>
         </div>

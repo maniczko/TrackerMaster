@@ -16,7 +16,19 @@ export type DraftSource = {
   billingRevision: number;
 };
 
-export type DraftFields = { start: string; end: string; description: string; inputTimeZone: string };
+export type DraftTarget = {
+  databaseId: string;
+  clientId: number | null;
+  projectId: number | null;
+  taskId: number | null;
+};
+export type DraftFields = {
+  start: string;
+  end: string;
+  description: string;
+  inputTimeZone: string;
+  target?: DraftTarget;
+};
 export type EditableField = 'start' | 'end' | 'description';
 
 export type EntryDraft = {
@@ -30,12 +42,12 @@ export type EntryDraft = {
 export type DraftList = { drafts: EntryDraft[]; unreadable: number };
 export type DraftSourceStatus =
   | { status: 'ready' | 'changed'; source: DraftSource }
-  | { status: 'missing' };
+  | { status: 'missing'; source: { databaseId: string } };
 
 type DraftRange = { startedAt: string; endedAt: string };
 export type DraftApplication =
   | { kind: 'correction'; base: DraftSource; range: DraftRange | null; description: string }
-  | { kind: 'new_entry'; clientId: number; projectId: number; taskId: number | null; range: DraftRange; description: string };
+  | { kind: 'new_entry'; databaseId: string; clientId: number; projectId: number; taskId: number | null; range: DraftRange; description: string };
 
 export const editableFields: readonly EditableField[] = ['start', 'end', 'description'];
 
@@ -54,6 +66,10 @@ export function sourceFields(source: DraftSource, inputTimeZone: string): DraftF
 
 export function matchesFields(a: DraftFields, b: DraftFields): boolean {
   return a.inputTimeZone === b.inputTimeZone
+    && a.target?.databaseId === b.target?.databaseId
+    && a.target?.clientId === b.target?.clientId
+    && a.target?.projectId === b.target?.projectId
+    && a.target?.taskId === b.target?.taskId
     && editableFields.every(field => a[field] === b[field]);
 }
 
