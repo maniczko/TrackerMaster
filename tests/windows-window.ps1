@@ -38,7 +38,7 @@ public static class TrackerTestWindow {
 $window = [IntPtr]::new($WindowHandle)
 [uint32] $owner = 0
 if ([TrackerTestWindow]::GetWindowThreadProcessId($window, [ref] $owner) -eq 0 -or $owner -ne $PrimaryPid) {
-    throw 'The original test window no longer belongs to the launched application.'
+    throw "Cannot apply ${Action} to test window $WindowHandle. Expected process $PrimaryPid, found $owner."
 }
 if ($Action -eq 'Close') {
     if (![TrackerTestWindow]::PostMessageW($window, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)) {
