@@ -19,7 +19,7 @@ export function TimerIcon({ name }: { name: 'grip' | 'play' | 'stop' | 'pin' | '
 }
 
 type PickerProps = {
-  input: RefObject<HTMLInputElement | null>;
+  input: RefObject<HTMLInputElement>;
   choices: Choice[];
   recent: Choice[];
   selected: string | undefined;
