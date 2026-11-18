@@ -2,11 +2,8 @@ import { filterByClient } from './reportClientFilter.ts';
 import { reportByDay, reportOverlaps } from './reportTime.ts';
 import type { ReportDay, ReportEntry } from './reportTime.ts';
 import type { ExportEntry, ExportRow } from './reportCsv.ts';
+import type { ReportCatalog, ReportScope } from './reportScope.ts';
 
-type Id = number | string;
-export type ReportClient = { id: Id; name: string };
-export type ReportProject = { id: Id; client_id: Id; name: string };
-export type ReportTask = { id: Id; project_id: Id; name: string };
 export type CompletedReportEntry = ReportEntry & { task_id: number | null; project_id: number; billable: boolean; description: string };
 export type ActiveReportEntry = Omit<CompletedReportEntry, 'ended_at' | 'duration_seconds'> & {
   ended_at: string | null;
@@ -16,10 +13,12 @@ export type ActiveReportEntry = Omit<CompletedReportEntry, 'ended_at' | 'duratio
 export type ReportDetailRow = ExportRow & { status: 'finalized' | 'running' | 'pending'; pendingSeconds: number };
 export type ReportSortField = 'start' | 'end' | 'duration' | 'contribution';
 type ReportData = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
-type Catalog = { clients: ReportClient[]; projects: ReportProject[]; tasks: ReportTask[] };
 
-export function makeReportView(data: ReportData, catalog: Catalog, client: string, from: string, through: string) {
-  const filtered = filterByClient(data.entries, data.active, catalog.projects, client);
+export function makeReportView(data: ReportData, catalog: ReportCatalog, scope: ReportScope, from: string, through: string) {
+  const filtered = filterByClient(data.entries, data.active, catalog.projects, scope.clientId?.toString() ?? '');
+  const inScope = (entry: CompletedReportEntry | ActiveReportEntry) =>
+    (scope.projectId === null || entry.project_id === scope.projectId) &&
+    (scope.taskId === null || entry.task_id === scope.taskId);
   const clients = new Map(catalog.clients.map(item => [String(item.id), item]));
   const projects = new Map(catalog.projects.map(item => [String(item.id), item]));
   const tasks = new Map(catalog.tasks.map(item => [String(item.id), item]));
@@ -39,8 +38,8 @@ export function makeReportView(data: ReportData, catalog: Catalog, client: strin
     sources.set(entry.id, { ...entry, client: owner.name, project: project.name, task: task?.name ?? '' });
   }
 
-  for (const entry of filtered.entries) addRecord(entry);
-  const active = filtered.active;
+  for (const entry of filtered.entries) if (inScope(entry)) addRecord(entry);
+  const active = filtered.active && inScope(filtered.active) ? filtered.active : null;
   if (active && !active.unresolved && active.ended_at !== null && active.duration_seconds !== null) {
     addRecord({ ...active, ended_at: active.ended_at, duration_seconds: active.duration_seconds });
   }

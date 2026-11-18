@@ -7,11 +7,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 
-use crate::Cmd;
+use crate::{locked, validate_report_scope, Cmd, Shared};
 
 const REPORT_FILTER_FILE: &str = "report-date-filter.txt";
+const REPORT_SCOPE_FILE: &str = "report-scope.json";
 const WIDGET_PIN_FILE: &str = "widget-on-top.txt";
 const DRAFT_SORT_FILE: &str = "draft-sort.txt";
 const INVALID_REPORT_FILTER: &str = "Nieprawidłowy zakres raportu.";
@@ -85,10 +86,14 @@ pub(super) fn set_draft_sort(app: AppHandle, order: DraftSort) -> Cmd<()> {
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub(super) enum ReportFilter {
     Today,
+    Yesterday,
     Week,
+    PreviousWeek,
+    Month,
+    PreviousMonth,
     Custom { from: String, through: String },
 }
 
@@ -102,7 +107,11 @@ impl ReportFilter {
     fn encode(&self) -> Cmd<String> {
         match self {
             Self::Today => Ok("today".into()),
+            Self::Yesterday => Ok("yesterday".into()),
             Self::Week => Ok("week".into()),
+            Self::PreviousWeek => Ok("previousWeek".into()),
+            Self::Month => Ok("month".into()),
+            Self::PreviousMonth => Ok("previousMonth".into()),
             Self::Custom { from, through }
                 if valid_report_date(from) && valid_report_date(through) && from <= through =>
             {
@@ -115,7 +124,11 @@ impl ReportFilter {
     fn decode(value: &str) -> Cmd<Self> {
         let filter = match value.split('\n').collect::<Vec<_>>().as_slice() {
             ["today"] => Self::Today,
+            ["yesterday"] => Self::Yesterday,
             ["week"] => Self::Week,
+            ["previousWeek"] => Self::PreviousWeek,
+            ["month"] => Self::Month,
+            ["previousMonth"] => Self::PreviousMonth,
             ["custom", from, through] => Self::Custom {
                 from: (*from).into(),
                 through: (*through).into(),
@@ -164,6 +177,69 @@ pub(super) fn set_report_filter(app: AppHandle, filter: ReportFilter) -> Cmd<()>
         .app_data_dir()
         .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
     set_report_filter_at(&dir, &filter)
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ReportScope {
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub client_id: Option<i64>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub project_id: Option<i64>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub task_id: Option<i64>,
+}
+
+impl ReportScope {
+    pub(super) fn validate_ids(&self) -> Cmd<()> {
+        for (id, label) in [
+            (self.client_id, "klienta"),
+            (self.project_id, "projektu"),
+            (self.task_id, "zadania"),
+        ] {
+            if id.is_some_and(|id| !(1..=9_007_199_254_740_991).contains(&id)) {
+                return Err(format!("Nieprawidłowy identyfikator {label} w filtrze raportu."));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn get_report_scope_at(dir: &Path) -> Cmd<Option<ReportScope>> {
+    let Some(stored) = read_preference(dir, REPORT_SCOPE_FILE)? else {
+        return Ok(None);
+    };
+    let scope: ReportScope = serde_json::from_str(&stored)
+        .map_err(|_| "Nieprawidłowy zapis filtra klienta, projektu i zadania.")?;
+    scope.validate_ids()?;
+    Ok(Some(scope))
+}
+
+fn set_report_scope_at(dir: &Path, scope: ReportScope) -> Cmd<()> {
+    let stored = serde_json::to_string(&scope)
+        .map_err(|_| "Nie udało się przygotować zapisu filtra raportu.")?;
+    save_preference(dir, REPORT_SCOPE_FILE, &stored)
+        .map_err(|_| "Nie udało się zapamiętać klienta, projektu i zadania.".into())
+}
+
+#[tauri::command]
+pub(super) fn get_report_scope(app: AppHandle) -> Cmd<Option<ReportScope>> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    get_report_scope_at(&dir)
+}
+
+#[tauri::command]
+pub(super) fn set_report_scope(app: AppHandle, state: State<'_, Shared>, scope: ReportScope) -> Cmd<()> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    let tracker = locked(&state)?;
+    validate_report_scope(&tracker.db, scope)?;
+    set_report_scope_at(&dir, scope)
 }
 
 fn widget_pin_at(dir: &Path, legacy_on_top: Option<bool>) -> Cmd<bool> {
@@ -266,7 +342,30 @@ mod tests {
             get_report_filter_at(dir, Some(ReportFilter::Today)).unwrap(),
             Some(custom)
         );
+        set_report_filter_at(dir, &ReportFilter::PreviousMonth).unwrap();
+        assert_eq!(get_report_filter_at(dir, None).unwrap(), Some(ReportFilter::PreviousMonth));
         clean_up(dir, REPORT_FILTER_FILE);
+    }
+
+    #[test]
+    fn report_scope_distinguishes_an_absent_file_from_corrupt_or_missing_ids() {
+        let dir = test_directory("report-scope");
+        assert_eq!(get_report_scope_at(&dir).unwrap(), None);
+        let scope = ReportScope { client_id: Some(3), project_id: Some(7), task_id: Some(11) };
+        set_report_scope_at(&dir, scope).unwrap();
+        assert_eq!(get_report_scope_at(&dir).unwrap(), Some(scope));
+        for corrupt in [
+            "{}",
+            r#"{"clientId":3,"taskId":11}"#,
+            r#"{"clientId":3,"projectId":7,"taskId":"11"}"#,
+            r#"{"clientId":3,"projectId":7,"taskId":0}"#,
+        ] {
+            fs::write(dir.join(REPORT_SCOPE_FILE), corrupt).unwrap();
+            assert!(get_report_scope_at(&dir).is_err(), "{corrupt}");
+        }
+        set_report_scope_at(&dir, ReportScope::default()).unwrap();
+        assert_eq!(get_report_scope_at(&dir).unwrap(), Some(ReportScope::default()));
+        clean_up(&dir, REPORT_SCOPE_FILE);
     }
 
     #[test]

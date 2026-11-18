@@ -2,12 +2,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { useState } from 'react';
 import { exportCsv, formatDuration, localTimestamp, makeClientExportRows, sameExportRows, spreadsheetText } from './reportCsv';
 import type { ExportEntry, ExportRow } from './reportCsv';
+import type { ReportScope } from './reportScope';
 
 type ExportData = { client_id: number; client: string; time_zone: string; entries: ExportEntry[] };
 type Preview = { key: string; client: string; from: string; through: string; zone: string; rows: ExportRow[]; csv: string; total: number };
 
 type Props = {
-  client: string;
+  scope: ReportScope;
   from: string;
   through: string;
   zone: string;
@@ -15,18 +16,18 @@ type Props = {
   incomplete: boolean;
 };
 
-export default function ReportExport({ client, from, through, zone, expectedRows, incomplete }: Props) {
+export default function ReportExport({ scope, from, through, zone, expectedRows, incomplete }: Props) {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const key = JSON.stringify([client, from, through, zone]);
+  const key = JSON.stringify([scope, from, through, zone]);
   const current = preview?.key === key && !incomplete && sameExportRows(preview.rows, expectedRows) ? preview : null;
 
   async function prepare() {
     setBusy(true); setError(''); setPreview(null);
     try {
-      const data = await invoke<ExportData>('get_client_export_data', { clientId: Number(client) });
-      if (String(data.client_id) !== client || data.time_zone !== zone) throw new Error('Klient lub strefa raportu uległy zmianie. Odśwież raport i przygotuj podgląd ponownie.');
+      const data = await invoke<ExportData>('get_client_export_data', { scope });
+      if (data.client_id !== scope.clientId || data.time_zone !== zone) throw new Error('Klient lub strefa raportu uległy zmianie. Odśwież raport i przygotuj podgląd ponownie.');
       const rows = makeClientExportRows(data.entries, data.client, from, through, zone);
       if (!sameExportRows(rows, expectedRows)) throw new Error('Dane zmieniły się od wyświetlenia raportu. Przygotuj podgląd ponownie po odświeżeniu.');
       setPreview({ key, client: data.client, from, through, zone, rows, csv: exportCsv(rows, zone), total: rows.reduce((sum, row) => sum + row.contribution, 0) });
@@ -49,7 +50,7 @@ export default function ReportExport({ client, from, through, zone, expectedRows
   return <section className="report-export" aria-label="Eksport CSV">
     <h3>Eksport CSV klienta</h3>
     <p className="muted">Wybierz jednego klienta i zakres raportu, a następnie sprawdź podgląd. Plik obejmuje zakończone wpisy z rozstrzygniętymi przerwami.</p>
-    <button type="button" className="secondary report-button" disabled={!client || !zone || incomplete || busy} onClick={() => void prepare()}>{busy ? 'Przygotowywanie…' : 'Przygotuj podgląd CSV'}</button>
+    <button type="button" className="secondary report-button" disabled={scope.clientId === null || !zone || incomplete || busy} onClick={() => void prepare()}>{busy ? 'Przygotowywanie…' : 'Przygotuj podgląd CSV'}</button>
     {error && <div role="alert" className="alert error">{error}</div>}
     {incomplete && <p className="muted">Przygotowanie CSV będzie możliwe po poprawieniu danych raportu.</p>}
     {preview && !current && <p role="status">Dane w raporcie się zmieniły. Przygotuj nowy podgląd przed pobraniem.</p>}

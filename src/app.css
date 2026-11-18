@@ -56,6 +56,8 @@ textarea:focus{outline:2px solid var(--tm-focus);outline-offset:1px}
 .entry-draft-panel h3,.entry-draft-panel h4,.entry-draft-dialog h3{margin:0}
 .entry-draft-panel .actions,.entry-draft-dialog .actions{flex-wrap:wrap;align-items:center;margin-top:12px}
 .entry-draft-panel .selectors,.entry-draft-review{margin:14px 0}
+.report-scope-summary{display:flex;flex-wrap:wrap;gap:8px;margin:15px 0;padding:0;list-style:none}
+.report-scope-summary li{background:#edf5f1;border-radius:16px;color:#315c4d;font-size:12px;padding:5px 10px;overflow-wrap:anywhere}
 .entry-draft-panel textarea{margin-top:6px;width:100%;resize:vertical}
 .entry-draft-sort{display:grid;gap:6px;max-width:230px;margin:12px 0}
 .entry-draft-list{list-style:none;padding:0;margin:0}

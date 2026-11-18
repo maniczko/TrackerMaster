@@ -10,6 +10,7 @@ import {
 } from '../src/reportCsv.ts';
 import type { ExportEntry } from '../src/reportCsv.ts';
 import { makeReportView, sortReportRows } from '../src/reportView.ts';
+import { allReportClients, changeReportScope, resolveReportScope } from '../src/reportScope.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from '../src/reportView.ts';
 
 // TECH-10: exercise production TypeScript functions. No private customer data.
@@ -226,7 +227,7 @@ test('Detailed, Summary and independently fetched CSV agree on finalized work in
     unresolved: false,
   };
   const view = makeReportView({ entries: [midnight, foreign, awaiting], active, time_zone: 'UTC' },
-    reportsCatalog, '1', '2026-01-31', '2026-01-31');
+    reportsCatalog, { ...allReportClients, clientId: 1 }, '2026-01-31', '2026-01-31');
   assert.deepEqual(view.rows.map(row => [row.source.id, row.status, row.contribution]), [
     [1, 'finalized', 1800], [2, 'pending', 7200], [4, 'running', 2700],
   ]);
@@ -250,7 +251,7 @@ test('Detailed hides names from an unrelated task and stays stable when sorting 
   const mismatch = reportEntry(2, '2026-01-31T09:00:00Z', '2026-01-31T10:00:00Z', 3600, { task_id: 4 });
   const invalidTime = reportEntry(3, '2026-02-30T09:00:00Z', '2026-03-02T10:00:00Z', 3600);
   const view = makeReportView({ entries: [first, second, mismatch, invalidTime], active: null, time_zone: 'UTC' },
-    reportsCatalog, '1', '2026-01-31', '2026-03-02');
+    reportsCatalog, { ...allReportClients, clientId: 1 }, '2026-01-31', '2026-03-02');
   assert.equal(view.missingRelations, true);
   assert.deepEqual(view.excludedEntryIds, [3]);
   assert.equal(view.finalizedSeconds, 7200);
@@ -258,4 +259,43 @@ test('Detailed hides names from an unrelated task and stays stable when sorting 
     assert.deepEqual(sortReportRows(view.rows, 'start', descending).map(row => row.source.id), [5, 10]);
     assert.deepEqual(sortReportRows(view.rows, 'contribution', descending).map(row => row.source.id), [5, 10]);
   }
+});
+
+test('restoring a scope respects archived IDs and distinguishes missing or foreign selections', () => {
+  const chosen = { clientId: 2, projectId: 2, taskId: 4 };
+  const catalog = { ...reportsCatalog, projects: [
+    reportsCatalog.projects[0], { ...reportsCatalog.projects[1], archived: true, name: 'Nowa nazwa' },
+  ] };
+  assert.equal(resolveReportScope(chosen, catalog).problem, '');
+  assert.equal(resolveReportScope(chosen, catalog).project?.name, 'Nowa nazwa');
+  assert.match(resolveReportScope({ ...chosen, clientId: 99 }, catalog).problem, /klient/);
+  assert.match(resolveReportScope({ ...chosen, projectId: 99 }, catalog).problem, /projekt/);
+  assert.match(resolveReportScope({ ...chosen, taskId: 99 }, catalog).problem, /zadanie/);
+  assert.match(resolveReportScope({ ...chosen, clientId: 1 }, catalog).problem, /projekt nie należy/);
+  assert.match(resolveReportScope({ ...chosen, projectId: null }, catalog).problem, /zadanie nie należy/);
+
+  const unchanged = changeReportScope(chosen, 'clientId', 2, catalog);
+  assert.deepEqual(unchanged, { scope: chosen, message: '' });
+  const newClient = changeReportScope(chosen, 'clientId', 1, catalog);
+  assert.deepEqual(newClient.scope, { ...allReportClients, clientId: 1 });
+  assert.match(newClient.message, /projekt i zadanie/);
+  const newProject = changeReportScope(chosen, 'projectId', null, catalog);
+  assert.deepEqual(newProject.scope, { ...allReportClients, clientId: 2 });
+  assert.match(newProject.message, /zadanie/);
+});
+
+test('the shared report scope includes only the selected task across a month boundary', () => {
+  const from = '2026-11-30T22:30:00Z';
+  const through = '2026-12-01T01:30:00Z';
+  const foreign = reportEntry(1, from, through, 10800);
+  const projectOnly = reportEntry(2, from, through, 10800, { project_id: 2 });
+  const selected = reportEntry(3, from, through, 10800, { project_id: 2, task_id: 4 });
+  const data = { entries: [foreign, projectOnly, selected], active: { ...projectOnly, id: 4, unresolved: false }, time_zone: 'Europe/Warsaw' };
+  const scope = { clientId: 2, projectId: 2, taskId: 4 };
+  const november = makeReportView(data, reportsCatalog, scope, '2026-11-01', '2026-11-30');
+  const december = makeReportView(data, reportsCatalog, scope, '2026-12-01', '2026-12-31');
+  assert.equal(november.finalizedSeconds, 1800);
+  assert.equal(december.finalizedSeconds, 9000);
+  assert.equal(november.active, null);
+  assert.deepEqual(december.finalizedRows.map(row => row.source.id), [3]);
 });

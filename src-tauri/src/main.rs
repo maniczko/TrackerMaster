@@ -18,6 +18,7 @@ use tauri::{Emitter, Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use ui_preferences::ReportScope;
 
 struct RunningClock { since: Instant, power: PowerSample }
 #[derive(Clone, Copy)]
@@ -254,18 +255,44 @@ fn enrich_entries_with_sleep(db: &Connection, entries: &mut [Entry]) -> Cmd<()> 
     Ok(())
 }
 
-// Unlike the history preview, a report must include every non-deleted entry.
-// The active interval is only a provisional projection and is withheld whenever
-// sleep, a clock change, a restart, or an unavailable power sample is detected.
+fn validate_report_scope(db: &Connection, scope: ReportScope) -> Cmd<()> {
+    scope.validate_ids()?;
+    if let Some(client_id) = scope.client_id {
+        let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1)", [client_id], |r| r.get(0)).map_err(db_err)?;
+        if !exists { return Err("Nie istnieje zapisany klient.".into()); }
+    }
+    if let Some(project_id) = scope.project_id {
+        let owner: Option<i64> = db.query_row("SELECT client_id FROM projects WHERE id=?1", [project_id], |r| r.get(0)).optional().map_err(db_err)?;
+        if owner.is_none() { return Err("Nie istnieje zapisany projekt.".into()); }
+        if owner != scope.client_id { return Err("Zapisany projekt nie należy do wybranego klienta.".into()); }
+    }
+    if let Some(task_id) = scope.task_id {
+        let owner: Option<i64> = db.query_row("SELECT project_id FROM tasks WHERE id=?1", [task_id], |r| r.get(0)).optional().map_err(db_err)?;
+        if owner.is_none() { return Err("Nie istnieje zapisane zadanie.".into()); }
+        if owner != scope.project_id { return Err("Zapisane zadanie nie należy do wybranego projektu.".into()); }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample>) -> Cmd<ReportData> {
+    report_data_for_scope(tracker, current, power, ReportScope::default())
+}
+
+// Include every non-deleted entry in the selected scope. The active interval
+// is a projection and is withheld when its clock or sleep state is unresolved.
+fn report_data_for_scope(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample>, scope: ReportScope) -> Cmd<ReportData> {
     ensure_available(tracker)?;
+    validate_report_scope(&tracker.db, scope)?;
     let project = entry_project_sql(&tracker.db, "time_entries")?;
-    let entries = tracker.db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id")).map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
+    let filter = format!("(?1 IS NULL OR EXISTS(SELECT 1 FROM projects p WHERE p.id={project} AND p.client_id=?1)) AND (?2 IS NULL OR {project}=?2) AND (?3 IS NULL OR task_id=?3)");
+    let args = params![scope.client_id, scope.project_id, scope.task_id];
+    let entries = tracker.db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE {filter} AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id")).map_err(db_err)?
+        .query_map(args, |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     let mut entries = entries;
     enrich_entries_with_sleep(&tracker.db, &mut entries)?;
-    let row: Option<(i64, Option<i64>, String, bool, String, i64)> = tracker.db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_err)?;
+    let row: Option<(i64, Option<i64>, String, bool, String, i64)> = tracker.db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE {filter} AND ended_at IS NULL"), args, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_err)?;
     let active = row.map(|(id, task_id, started_at, billable, description, project_id)| {
         let projection = active_projection(&tracker.db, tracker.running_since.as_ref(), id, &started_at, current, &power);
         let unresolved = projection.is_none();
@@ -306,23 +333,29 @@ fn resolve_sleep_period(state: State<'_, Shared>, entry_id: i64, period_id: i64,
 }
 
 #[tauri::command]
-fn get_report_data(state: State<'_, Shared>) -> Cmd<ReportData> {
+fn get_report_data(state: State<'_, Shared>, scope: ReportScope) -> Cmd<ReportData> {
     let tracker = locked(&state)?;
-    report_data(&tracker, Utc::now(), power_sample())
+    report_data_for_scope(&tracker, Utc::now(), power_sample(), scope)
 }
 
-// Select by client inside SQLite; never assemble a client export from an
-// unfiltered frontend report. A mismatched task is unsafe to export.
+#[cfg(test)]
 fn client_export_data(db: &Connection, client_id: i64) -> Cmd<ExportData> {
-    if client_id <= 0 { return Err("Wybierz klienta do eksportu.".into()); }
-    let client: String = db.query_row("SELECT name FROM clients WHERE id=?1", [client_id], |r| r.get(0)).optional().map_err(db_err)?
-        .ok_or("Nie znaleziono wybranego klienta.")?;
+    client_export_data_for_scope(db, ReportScope { client_id: Some(client_id), ..ReportScope::default() })
+}
+
+// Enforce the same client, project and task restrictions inside SQLite for CSV.
+fn client_export_data_for_scope(db: &Connection, scope: ReportScope) -> Cmd<ExportData> {
+    let client_id = scope.client_id.ok_or("Wybierz klienta do eksportu.")?;
+    validate_report_scope(db, scope)?;
+    let client: String = db.query_row("SELECT name FROM clients WHERE id=?1", [client_id], |r| r.get(0)).map_err(db_err)?;
     let time_zone = db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
     let project = entry_project_sql(db, "e")?;
-    let mismatch: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id={project} LEFT JOIN tasks t ON t.id=e.task_id WHERE p.client_id=?1 AND e.task_id IS NOT NULL AND (t.id IS NULL OR t.project_id<>p.id) AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id))"), [client_id], |r| r.get(0)).map_err(db_err)?;
+    let filter = "p.client_id=?1 AND (?2 IS NULL OR p.id=?2) AND (?3 IS NULL OR e.task_id=?3) AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id)";
+    let args = params![client_id, scope.project_id, scope.task_id];
+    let mismatch: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id={project} LEFT JOIN tasks t ON t.id=e.task_id WHERE {filter} AND e.task_id IS NOT NULL AND (t.id IS NULL OR t.project_id<>p.id))"), args, |r| r.get(0)).map_err(db_err)?;
     if mismatch { return Err("Nie można wyeksportować danych: zadanie nie pasuje do projektu. Sprawdź bazę danych.".into()); }
-    let sql = format!("SELECT e.id,c.name,p.name,COALESCE(t.name,''),COALESCE(d.description,''),e.started_at,e.ended_at,e.duration_seconds,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e JOIN projects p ON p.id={project} JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id LEFT JOIN entry_descriptions d ON d.entry_id=e.id WHERE p.client_id=?1 AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id");
-    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)?, sleep_periods:None })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let sql = format!("SELECT e.id,c.name,p.name,COALESCE(t.name,''),COALESCE(d.description,''),e.started_at,e.ended_at,e.duration_seconds,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e JOIN projects p ON p.id={project} JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id LEFT JOIN entry_descriptions d ON d.entry_id=e.id WHERE {filter} ORDER BY e.id");
+    let entries = db.prepare(&sql).map_err(db_err)?.query_map(args, |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)?, sleep_periods:None })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
     let mut entries = entries;
     for entry in &mut entries {
         if let Some((duration, periods)) = completed_sleep(db, entry.id, &entry.started_at, &entry.ended_at)? {
@@ -334,9 +367,9 @@ fn client_export_data(db: &Connection, client_id: i64) -> Cmd<ExportData> {
 }
 
 #[tauri::command]
-fn get_client_export_data(state: State<'_, Shared>, client_id: i64) -> Cmd<ExportData> {
+fn get_client_export_data(state: State<'_, Shared>, scope: ReportScope) -> Cmd<ExportData> {
     let tracker = locked(&state)?;
-    client_export_data(&tracker.db, client_id)
+    client_export_data_for_scope(&tracker.db, scope)
 }
 
 fn update_report_timezone(db: &Connection, expected: &str, zone: &str) -> Cmd<()> {
@@ -1428,7 +1461,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::get_report_scope,ui_preferences::set_report_scope,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -1578,6 +1611,47 @@ mod tests {
         tracker.db.pragma_update(None, "foreign_keys", false).unwrap();
         tracker.db.execute("INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES(6,1,2,'2026-01-01T14:00:00Z','2026-01-01T15:00:00Z',3600)", []).unwrap();
         assert!(client_export_data(&tracker.db, 2).is_err());
+    }
+
+    #[test]
+    fn report_and_export_validate_and_isolate_the_saved_hierarchy() {
+        let mut tracker = seeded();
+        initialise(&mut tracker.db).unwrap();
+        tracker.db.execute_batch("
+            INSERT INTO clients(id,name) VALUES(2,'B');
+            INSERT INTO projects(id,client_id,name) VALUES(2,2,'Wspólny'),(3,1,'Wspólny');
+            UPDATE projects SET archived=1,name='Zmieniony' WHERE id=1;
+            INSERT INTO tasks(id,project_id,name) VALUES(2,2,'Zadanie'),(3,3,'Zadanie');
+            INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES
+              (1,1,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600),
+              (2,NULL,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600),
+              (3,2,2,'2026-01-01T11:00:00Z','2026-01-01T12:00:00Z',3600),
+              (4,3,3,'2026-01-01T12:00:00Z','2026-01-01T13:00:00Z',3600),
+              (5,2,2,'2026-01-01T13:00:00Z',NULL,NULL);").unwrap();
+        let selected = ReportScope { client_id: Some(1), project_id: Some(1), task_id: Some(1) };
+        let by_project = ReportScope { task_id: None, ..selected };
+        let by_client = ReportScope { project_id: None, task_id: None, ..selected };
+        for (scope, ids) in [(selected, vec![1]), (by_project, vec![1, 2]), (by_client, vec![1, 2, 4])] {
+            let report = report_data_for_scope(&tracker, Utc::now(), Err("unused".into()), scope).unwrap();
+            let csv = client_export_data_for_scope(&tracker.db, scope).unwrap();
+            assert_eq!(report.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(), ids);
+            assert_eq!(csv.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(), ids);
+            assert_eq!(csv.entries[0].project, "Zmieniony");
+            assert!(report.active.is_none());
+        }
+        assert!(report_data(&tracker, Utc::now(), Err("unused".into())).unwrap().active.is_some());
+        assert!(client_export_data_for_scope(&tracker.db, ReportScope::default()).is_err());
+        for invalid in [
+            ReportScope { client_id: Some(99), ..by_client },
+            ReportScope { project_id: Some(99), ..by_project },
+            ReportScope { task_id: Some(99), ..selected },
+            ReportScope { project_id: Some(2), ..selected },
+            ReportScope { task_id: Some(3), ..selected },
+            ReportScope { client_id: None, ..selected },
+        ] {
+            assert!(report_data_for_scope(&tracker, Utc::now(), Err("unused".into()), invalid).is_err());
+            assert!(client_export_data_for_scope(&tracker.db, invalid).is_err());
+        }
     }
 
     #[test]
