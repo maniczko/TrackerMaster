@@ -69,6 +69,12 @@ textarea:focus{outline:2px solid var(--tm-focus);outline-offset:1px}
 .timer-start button{flex:1}
 .timer-settings{margin-top:14px;padding-top:12px;border-top:1px solid #e3eeea}
 .timer button:focus-visible,.timer select:focus-visible,.timer input:focus-visible,.timer summary:focus-visible{outline:2px solid var(--tm-primary);outline-offset:3px}
+.report-zone-confirmation{width:min(490px,calc(100vw - 32px));padding:24px;border:1px solid var(--tm-border);border-radius:12px;color:var(--tm-ink)}
+.report-zone-confirmation::backdrop{background:rgba(27,48,45,.38)}
+.report-zone-confirmation h3{margin:0}
+.report-zone-confirmation dl{display:grid;grid-template-columns:auto 1fr;gap:8px 16px}
+.report-zone-confirmation dd{margin:0;overflow-wrap:anywhere;font-weight:700}
+.report-zone-confirmation .actions button:focus-visible{outline:2px solid var(--tm-focus);outline-offset:3px}
 .entry-draft-panel textarea{margin-top:6px;width:100%;resize:vertical}
 .entry-draft-sort{display:grid;gap:6px;max-width:230px;margin:12px 0}
 .entry-draft-list{list-style:none;padding:0;margin:0}

@@ -7,6 +7,7 @@ import { readReportFilter, validReportFilter } from './reportFilterStorage';
 import type { SavedReportFilter } from './reportFilterStorage';
 import ReportExport from './ReportExport';
 import ReportDetails from './ReportDetails';
+import ReportTimezone from './ReportTimezone';
 import { formatDuration as duration } from './reportCsv';
 import { makeReportView } from './reportView';
 import type { ActiveReportEntry, CompletedReportEntry } from './reportView';
@@ -47,11 +48,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
   const [failure, setFailure] = useState<{ request: string; message: string } | null>(null);
   const [refresh, setRefresh] = useState(0);
   const request = JSON.stringify([revision, refresh, reportScope]);
-  const [zoneDraft, setZoneDraft] = useState('');
   const [lastZone, setLastZone] = useState(defaultZone);
-  const [zoneError, setZoneError] = useState('');
-  const [zoneSaving, setZoneSaving] = useState(false);
-  const zoneInitialised = useRef(false);
   const pendingFilterSave = useRef(Promise.resolve());
   const pendingScopeSave = useRef(Promise.resolve());
   const catalog = useMemo(() => ({ clients, projects, tasks }), [clients, projects, tasks]);
@@ -141,10 +138,6 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
           setSnapshot({ request, data: next });
           setFailure(null);
           if (validTimeZone(next.time_zone)) setLastZone(next.time_zone);
-          if (!zoneInitialised.current) {
-            setZoneDraft(next.time_zone);
-            zoneInitialised.current = true;
-          }
         }
       } catch (e) {
         if (!cancelled) { setSnapshot(null); setFailure({ request, message: `Nie można odczytać raportu: ${String(e)}` }); }
@@ -216,7 +209,12 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
     }}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
     {open && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
-      {data && <details className="report-zone"><summary>Zmień strefę raportowania</summary><p className="muted">Podaj nazwę strefy IANA, np. Europe/Warsaw, Europe/London lub America/New_York. Zmiana przeliczy przypisanie wcześniejszych pomiarów do dni, bez zmiany zapisanych pomiarów.</p><label>Strefa raportowania<input value={zoneDraft} disabled={zoneSaving} list="report-time-zones" onChange={e => { setZoneDraft(e.target.value); setZoneError(''); }} /></label><datalist id="report-time-zones"><option value="Europe/Warsaw" /><option value="Europe/London" /><option value="Europe/Berlin" /><option value="America/New_York" /><option value="UTC" /></datalist>{' '}<button className="secondary report-button" type="button" disabled={zoneSaving || !loaded} onClick={() => { if (!validTimeZone(zoneDraft)) { setZoneError('Podaj poprawną nazwę strefy IANA, np. Europe/Warsaw.'); return; } setZoneSaving(true); setZoneError(''); void invoke('set_report_timezone', { expectedTimeZone: data.time_zone, timeZone: zoneDraft }).then(() => { setNow(Date.now()); setRefresh(n => n + 1); }).catch(e => { setZoneError(`Nie udało się zapisać strefy: ${String(e)}`); setRefresh(n => n + 1); }).finally(() => setZoneSaving(false)); }}>Zapisz strefę</button>{zoneError && <div role="alert" className="alert error">{zoneError}</div>}</details>}
+      {data && <ReportTimezone currentZone={data.time_zone} canChange={allowFilterChange}
+        onApply={async (expectedTimeZone, timeZone) => {
+          await invoke('set_report_timezone', { expectedTimeZone, timeZone });
+          setNow(Date.now());
+          setRefresh(previous => previous + 1);
+        }} />}
       <div className="selectors report-filters" role="group" aria-label="Okres raportu">
         <div><label htmlFor="report-period">Zakres dat</label><select id="report-period" value={dateReadProblem ? '' : preset} disabled={!filterReady}
           onChange={event => { if (allowFilterChange()) choosePeriod(event.target.value as ReportPreset | 'custom'); }}>
