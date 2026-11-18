@@ -39,27 +39,8 @@ jobs:
         env:
           VITE_TRACKER_TEST_MODE: '1'
         run: npm run tauri -- build --no-bundle --config src-tauri/tauri.isolated.conf.json
-      - name: Check isolated test data location
-        shell: pwsh
-        run: |
-          $testDb = Join-Path $env:APPDATA 'pl.tracker.personal.testonly\tracker.sqlite3'
-          $normalDb = Join-Path $env:APPDATA 'pl.tracker.personal\tracker.sqlite3'
-          if ((Test-Path -LiteralPath $testDb) -or (Test-Path -LiteralPath $normalDb)) { throw 'Runner profile is not empty.' }
-          $exe = Join-Path $PWD 'src-tauri\target\release\tracker-master.exe'
-          $process = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
-          try {
-            for ($attempt = 0; $attempt -lt 30; $attempt++) {
-              $process.Refresh()
-              if ($process.HasExited) { throw "Test application exited: $($process.ExitCode)" }
-              if (Test-Path -LiteralPath $testDb) { break }
-              Start-Sleep -Seconds 1
-            }
-            if (!(Test-Path -LiteralPath $testDb)) { throw 'Test database was not created in the isolated profile.' }
-            if (Test-Path -LiteralPath $normalDb) { throw 'Test application touched the normal profile.' }
-          } finally {
-            $process.Refresh()
-            if (!$process.HasExited) { Stop-Process -Id $process.Id -Force }
-          }
+      - name: Verify isolated Windows application and CSV
+        run: node tests/windows-application.mjs
       - name: Save isolated unsigned test build
         uses: actions/upload-artifact@v4
         with:
