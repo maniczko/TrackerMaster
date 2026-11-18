@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { access, mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
+import { access, mkdtemp, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -349,6 +349,55 @@ async function verifyMiniTimer(cdp, mainSession) {
   console.log('PASS: native mini timer used the custom shortcut label, found the second client by keyboard, started its timer and restored the pin on reopening');
 }
 
+async function verifyRestoreRetry(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const section = '[aria-label="Bezpieczeństwo danych"]';
+  const click = label => evaluate(`[...document.querySelectorAll(${JSON.stringify(section)} + ' button')].find(button => button.textContent.trim() === ${JSON.stringify(label)} && !button.disabled)?.click()`);
+  await click('Utwórz kopię');
+  const backupPath = await waitFor('verified backup created in the test profile', () =>
+    evaluate(`document.querySelector(${JSON.stringify(section)} + ' [role="status"] code')?.textContent || null`));
+  const backupDir = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'backups');
+  const backupFiles = await readdir(backupDir);
+  assert.equal(backupFiles.length, 1);
+  assert.equal(backupPath, join(backupDir, backupFiles[0]));
+  const savedBackupDir = join(temp, 'saved-backups');
+  await rename(backupDir, savedBackupDir);
+  const source = join(savedBackupDir, backupFiles[0]);
+  await writeFile(backupDir, 'forced backup creation failure', { flag: 'wx' });
+  try {
+    await evaluate(`(() => {
+      const details = document.querySelector(${JSON.stringify(section)} + ' details');
+      details.open = true;
+      const input = details.querySelector('input[type="text"]');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(source)});
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`);
+    await waitFor('backup check enabled', () => evaluate(`[...document.querySelectorAll(${JSON.stringify(section)} + ' button')].some(button => button.textContent.trim() === 'Sprawdź kopię' && !button.disabled)`));
+    await click('Sprawdź kopię');
+    await waitFor('restore preview', () => evaluate(`Boolean(document.querySelector(${JSON.stringify(section)} + ' input[type="checkbox"]'))`));
+    await evaluate(`document.querySelector(${JSON.stringify(section)} + ' input[type="checkbox"]').click()`);
+    await click('Przywróć kopię');
+    await waitFor('restore failure displayed', () => evaluate(`document.body.textContent.includes('Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.')`));
+    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(section)} + ' input[type="checkbox"]')?.checked`), false);
+    const db = new DatabaseSync(testDb, { readOnly: true });
+    try { assert.equal(db.prepare('SELECT COUNT(*) AS count FROM time_entries').get().count, 3); }
+    finally { db.close(); }
+    await unlink(backupDir);
+    await evaluate(`document.querySelector(${JSON.stringify(section)} + ' input[type="checkbox"]').click()`);
+    await click('Przywróć kopię');
+    await waitFor('restore succeeds after retry', () => evaluate(`document.body.textContent.includes('Kopia została przywrócona')`));
+    assert.equal((await readdir(backupDir)).filter(name => name.endsWith('.sqlite3')).length, 1);
+    console.log('PASS: real restore failure kept the preview and data; retry created a safety backup and succeeded');
+  } finally {
+    const obstacle = await stat(backupDir).catch(() => null);
+    if (obstacle?.isFile()) await unlink(backupDir);
+  }
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -426,6 +475,7 @@ async function runWindow(port, phase, recovery) {
       await verifyMiniTimer(cdp, sessionId);
       await verifySecondLaunch(child, env);
     }
+    if (phase === 'verify-recovery') await verifyRestoreRetry(cdp, sessionId);
     return seconds;
   } finally {
     cdp?.close();
