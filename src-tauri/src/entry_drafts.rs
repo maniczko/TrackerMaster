@@ -24,7 +24,12 @@ const RECOVERED: &str = "recovered_draft_of_deleted_or_missing_entry";
 pub(super) fn migrate_resolutions(db: &mut Connection) -> rusqlite::Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
-        "CREATE TABLE entry_draft_resolutions (
+        "CREATE TABLE entry_database_identity (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            value TEXT NOT NULL CHECK(length(value)=32)
+        );
+        INSERT INTO entry_database_identity(id,value) VALUES(1,lower(hex(randomblob(16))));
+        CREATE TABLE entry_draft_resolutions (
             revision TEXT PRIMARY KEY NOT NULL CHECK(length(revision) BETWEEN 1 AND 128),
             source_entry_id INTEGER NOT NULL CHECK(source_entry_id > 0),
             entry_id INTEGER NOT NULL REFERENCES time_entries(id),
@@ -43,7 +48,10 @@ pub(super) fn migrate_resolutions(db: &mut Connection) -> rusqlite::Result<()> {
 
 pub(super) fn validate_resolution_schema(db: &Connection) -> rusqlite::Result<()> {
     let valid = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('entry_draft_resolutions')
+        "SELECT (SELECT COUNT(*) FROM entry_database_identity)=1
+            AND EXISTS(SELECT 1 FROM entry_database_identity
+                       WHERE id=1 AND length(value)=32 AND value NOT GLOB '*[^0-9a-f]*')
+            AND EXISTS(SELECT 1 FROM pragma_table_info('entry_draft_resolutions')
                        WHERE name='revision' AND type='TEXT' AND pk=1 AND \"notnull\"=1)
             AND (SELECT COUNT(*) FROM pragma_table_info('entry_draft_resolutions') WHERE pk>0)=1
             AND (SELECT COUNT(*) FROM pragma_table_info('entry_draft_resolutions')
@@ -104,6 +112,8 @@ pub(super) struct EntryDraftOrigin {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DraftSource {
+    #[serde(default)]
+    database_id: String,
     entry_id: i64,
     client_id: i64,
     project_id: i64,
@@ -178,7 +188,8 @@ fn read_source(db: &Connection, entry_id: i64) -> Cmd<Option<DraftSource>> {
                 e.duration_seconds, COALESCE(d.description, ''), b.entry_id IS NOT NULL,
                 COALESCE((SELECT MAX(id) FROM entry_revisions WHERE entry_id=e.id), 0),
                 COALESCE((SELECT MAX(id) FROM description_revisions WHERE entry_id=e.id), 0),
-                COALESCE((SELECT MAX(id) FROM billing_revisions WHERE entry_id=e.id), 0)
+                COALESCE((SELECT MAX(id) FROM billing_revisions WHERE entry_id=e.id), 0),
+                (SELECT value FROM entry_database_identity WHERE id=1)
          FROM time_entries e
          JOIN projects p ON p.id=e.project_id
          LEFT JOIN entry_descriptions d ON d.entry_id=e.id
@@ -200,6 +211,7 @@ fn read_source(db: &Connection, entry_id: i64) -> Cmd<Option<DraftSource>> {
                 time_revision: row.get(9)?,
                 description_revision: row.get(10)?,
                 billing_revision: row.get(11)?,
+                database_id: row.get(12)?,
             })
         },
     )
@@ -212,7 +224,10 @@ fn source_status(db: &Connection, previous: &DraftSource) -> Cmd<DraftSourceStat
         return Ok(DraftSourceStatus::Missing);
     };
     // A restore can reuse an entry ID for a different client or project.
-    if current.client_id != previous.client_id || current.project_id != previous.project_id {
+    if current.database_id != previous.database_id
+        || current.client_id != previous.client_id
+        || current.project_id != previous.project_id
+    {
         return Ok(DraftSourceStatus::Missing);
     }
     Ok(if current == *previous {
@@ -409,6 +424,7 @@ fn resolve_draft(
             description,
         } => {
             if base.entry_id != origin
+                || base.database_id != draft.source.database_id
                 || base.project_id != draft.source.project_id
                 || base.client_id != draft.source.client_id
                 || !matches!(source_status(&tx, &base)?, DraftSourceStatus::Ready(_))
@@ -704,6 +720,11 @@ mod tests {
     fn detects_source_revisions_tombstones_and_identity_reuse() {
         let db = database();
         let original = read_source(&db, 1).unwrap().unwrap();
+        let other_db = database();
+        assert!(matches!(
+            source_status(&other_db, &original).unwrap(),
+            DraftSourceStatus::Missing
+        ));
         assert!(matches!(
             source_status(&db, &original).unwrap(),
             DraftSourceStatus::Ready(_)
@@ -850,8 +871,8 @@ mod tests {
     #[test]
     fn version_twelve_is_backed_up_before_creating_resolution_history() {
         let mut db = database();
-        let original = read_source(&db, 1).unwrap();
-        db.execute_batch("DROP TABLE entry_draft_resolutions; PRAGMA user_version=12;")
+        let mut original = read_source(&db, 1).unwrap().unwrap();
+        db.execute_batch("DROP TABLE entry_draft_resolutions; DROP TABLE entry_database_identity; PRAGMA user_version=12;")
             .unwrap();
         let dir = test_directory("migration");
         crate::initialise_with_backup(&mut db, &dir, true).unwrap();
@@ -860,7 +881,10 @@ mod tests {
                 .unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(read_source(&db, 1).unwrap(), original);
+        let migrated = read_source(&db, 1).unwrap().unwrap();
+        assert_ne!(migrated.database_id, original.database_id);
+        original.database_id = migrated.database_id.clone();
+        assert_eq!(migrated, original);
         let backup_path = fs::read_dir(dir.join("backups"))
             .unwrap()
             .next()
@@ -874,7 +898,16 @@ mod tests {
                 .unwrap(),
             12
         );
-        assert_eq!(read_source(&previous, 1).unwrap(), original);
+        assert_eq!(
+            previous
+                .query_row(
+                    "SELECT duration_seconds FROM time_entries WHERE id=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            original.duration_seconds
+        );
         drop(previous);
         fs::remove_file(backup_path).unwrap();
         fs::remove_dir(dir.join("backups")).unwrap();
