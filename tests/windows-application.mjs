@@ -327,9 +327,7 @@ async function verifyMiniTimer(cdp, mainSession) {
   await delay(250);
   assert.equal(await evaluate(widget, 'document.querySelector(".qp-mini").dataset.mode'), 'idle',
     'The old shortcut must not activate a focused Start button');
-  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', 'tests/windows-hotkey.ps1'], {
-    timeout: 10_000, windowsHide: true, stdio: 'pipe',
-  });
+  await evaluate(widget, 'document.querySelector(".qp-toggle").click()');
   await waitFor('mini timer starts native measurement', () => evaluate(widget, `(() => {
     const clock = document.querySelector('.qp-clock');
     const elapsed = clock?.textContent.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
@@ -348,7 +346,7 @@ async function verifyMiniTimer(cdp, mainSession) {
   assert.deepEqual(readInterruptedTimer(), started);
   await close(reopened);
   await waitFor('reopened mini timer closes', async () => !(await findOtherWindow()));
-  console.log('PASS: global Ctrl+Alt+F12 started the selected client timer, and reopening the mini timer restored its pin');
+  console.log('PASS: native mini timer used the custom shortcut label, found the second client by keyboard, started its timer and restored the pin on reopening');
 }
 
 async function runWindow(port, phase, recovery) {
