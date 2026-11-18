@@ -439,9 +439,10 @@ fn apply_backup_restore(app: tauri::AppHandle, state: State<'_, Shared>, restore
     if restore.sequence.to_string() != token || restore.pending.is_none() { return Err("Przygotowana kopia jest nieaktualna. Sprawdź ją ponownie.".into()); }
     let mut tracker = locked(&state)?;
     if snapshot(&tracker)?.active.is_some() { return Err("Najpierw zakończ lub rozlicz aktywny pomiar.".into()); }
-    let prepared = restore.pending.take().ok_or("Nie znaleziono przygotowanej kopii.")?;
-    let safety = storage_safety::restore_prepared(&mut tracker.db, &prepared, &data_dir)
+    let prepared = restore.pending.as_ref().ok_or("Nie znaleziono przygotowanej kopii.")?;
+    let safety = storage_safety::restore_prepared(&mut tracker.db, prepared, &data_dir)
         .map_err(|_| "Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.".to_string())?;
+    restore.pending = None;
     tracker.running_since = None;
     tracker.restored = true;
     Ok(safety.to_string_lossy().into_owned())
