@@ -437,7 +437,10 @@ async function verifyDraft(cdp, sessionId, phase) {
       const action = [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)}))?.querySelector('button[aria-label^="Popraw wpis:"]');
       if (action && !action.disabled) action.click();
       return false;
-    })()`));
+    })()`)).catch(async error => {
+      const alerts = await evaluate(`[...document.querySelectorAll('[role="alert"]')].map(node => node.textContent.trim())`);
+      throw new Error(`${error.message}; application alerts: ${JSON.stringify(alerts)}`);
+    });
     await evaluate(`(() => {
       const field = document.querySelector('#entry-draft-description');
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, ${JSON.stringify(text)});
