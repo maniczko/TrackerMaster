@@ -204,6 +204,8 @@ async function exercisePage(data, phase) {
     if (!historyRow(data.primaryDescription) || !historyRow(data.secondDescription)) fail('Archiving the project removed history');
     await click('restore the second client project', () => textButton(timer, 'Przywróć projekt'));
     await until('project is restored', () => enabled(textButton(timer, 'Archiwizuj projekt')));
+    await click('archive project before its client', () => textButton(timer, 'Archiwizuj projekt'));
+    await until('project is archived before its client', () => enabled(textButton(timer, 'Przywróć projekt')));
     await click('archive the second client', () => textButton(timer, 'Archiwizuj klienta'));
     await until('client is archived', () => enabled(textButton(timer, 'Przywróć klienta')));
     if (!historyRow(data.primaryDescription) || !historyRow(data.secondDescription)) fail('Archiving the client removed history');
