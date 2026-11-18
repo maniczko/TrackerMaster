@@ -1,0 +1,35 @@
+name: TECH-10 report/CSV contract
+
+on:
+  push:
+    paths:
+      - "tests/reportContract.test.ts"
+      - "docs/TECH-10-REPORT-CONTRACT.md"
+      - ".github/workflows/tech10-report-contract.yml"
+      - "src/reportTime.ts"
+      - "src/reportCsv.ts"
+      - "package-lock.json"
+  pull_request:
+    paths:
+      - "tests/reportContract.test.ts"
+      - "docs/TECH-10-REPORT-CONTRACT.md"
+      - ".github/workflows/tech10-report-contract.yml"
+      - "src/reportTime.ts"
+      - "src/reportCsv.ts"
+      - "package-lock.json"
+
+permissions:
+  contents: read
+
+jobs:
+  report-contract:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: node --test tests/reportContract.test.ts
