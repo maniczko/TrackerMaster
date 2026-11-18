@@ -1,10 +1,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $Executable,
-    [Parameter(Mandatory)] [string] $Output
+    [Parameter(Mandatory)] [string] $Output,
+    [version] $Version = '0.1.0.0'
 )
 
 $ErrorActionPreference = 'Stop'
+$parts = @($Version.Major, $Version.Minor, $Version.Build, $Version.Revision)
+if ($Version.Major -eq 0 -and $Version.Minor -eq 0 -and $Version.Build -eq 0 -and $Version.Revision -eq 0) {
+    throw 'Package version must be greater than 0.0.0.0.'
+}
+if (@($parts | Where-Object { $_ -lt 0 -or $_ -gt 65535 }).Count -ne 0) {
+    throw 'Use a four-part package version with values from 0 to 65535.'
+}
 $source = (Get-Item -LiteralPath $Executable).FullName
 $destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
 if ([IO.Path]::GetExtension($destination) -ine '.msix' -or (Test-Path -LiteralPath $destination)) {
@@ -36,10 +44,14 @@ $sdk = Get-ChildItem -LiteralPath $sdkRoot -Directory |
 if (!$sdk) { throw 'Windows SDK MakeAppx.exe was not found.' }
 
 $icons = Join-Path $PSScriptRoot '..\..\src-tauri\icons'
-$manifest = Join-Path $PSScriptRoot 'AppxManifest.test.xml'
+$manifestTemplate = Join-Path $PSScriptRoot 'AppxManifest.test.xml'
+[xml] $manifestXml = Get-Content -Raw -LiteralPath $manifestTemplate
+$manifestXml.Package.Identity.SetAttribute('Version', $Version.ToString())
+$manifest = New-TemporaryFile
 $mapping = New-TemporaryFile
 try {
-    $map = @('[Files]', ('"{0}" "AppxManifest.xml"' -f $manifest), ('"{0}" "tracker-master.exe"' -f $source))
+    $manifestXml.Save($manifest.FullName)
+    $map = @('[Files]', ('"{0}" "AppxManifest.xml"' -f $manifest.FullName), ('"{0}" "tracker-master.exe"' -f $source))
     foreach ($name in @('StoreLogo.png', 'Square44x44Logo.png', 'Square150x150Logo.png')) {
         $icon = (Get-Item -LiteralPath (Join-Path $icons $name)).FullName
         $map += ('"{0}" "Assets\{1}"' -f $icon, $name)
@@ -49,5 +61,5 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "MakeAppx failed ($LASTEXITCODE)." }
     Get-FileHash -LiteralPath $destination -Algorithm SHA256
 } finally {
-    Remove-Item -LiteralPath $mapping.FullName
+    Remove-Item -LiteralPath $mapping.FullName, $manifest.FullName
 }
