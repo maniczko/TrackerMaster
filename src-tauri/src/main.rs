@@ -4,6 +4,7 @@ mod storage_safety;
 mod sleep_periods;
 mod power_events;
 mod optional_task_migration;
+mod ui_preferences;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -493,11 +494,6 @@ async fn show_main(app: tauri::AppHandle) -> Cmd<()> {
     }
 }
 
-#[tauri::command]
-fn set_widget_on_top(app: tauri::AppHandle, on_top: bool) -> Cmd<()> {
-    app.get_webview_window("widget").ok_or("Nie znaleziono widgetu.")?
-        .set_always_on_top(on_top).map_err(|e| e.to_string())
-}
 fn add_client(db: &Connection, name: &str) -> Cmd<i64> {
     db.execute("INSERT INTO clients(name) VALUES(?1)", [valid_name(name)?]).map_err(db_err)?;
     Ok(db.last_insert_rowid())
@@ -828,17 +824,9 @@ fn valid_shortcut(value: &str) -> bool {
 }
 
 fn save_shortcut_preference(dir: &std::path::Path, value: &str) -> Cmd<()> {
-    use std::io::Write;
     if !valid_shortcut(value) { return Err("Nieprawidłowy skrót.".into()); }
-    let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "Błąd zegara ustawień.")?.as_nanos();
-    let temp = dir.join(format!("shortcut-{}-{suffix}.tmp", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
-        file.write_all(value.as_bytes())?; file.sync_all()?; drop(file);
-        std::fs::rename(&temp, dir.join("shortcut.txt"))
-    })();
-    if result.is_err() { let _ = std::fs::remove_file(&temp); }
-    result.map_err(|_| "Nie udało się zapisać ustawienia skrótu.".into())
+    ui_preferences::save_preference(dir, "shortcut.txt", value)
+        .map_err(|_| "Nie udało się zapisać ustawienia skrótu.".into())
 }
 
 fn replace_shortcut<R, P, U>(old: &str, new: &str, registered: bool, mut register: R, mut persist: P, mut unregister: U) -> Cmd<()>
@@ -1415,7 +1403,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }

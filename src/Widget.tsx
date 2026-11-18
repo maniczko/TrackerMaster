@@ -14,6 +14,8 @@ export default function Widget() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [onTop, setOnTop] = useState(false);
+  const [pinPending, setPinPending] = useState(true);
+  const [pinProblem, setPinProblem] = useState('');
   const [shortcut, setShortcut] = useState({ registered: false, message: '', shortcut: defaultShortcut });
   const [now, setNow] = useState(Date.now());
   const [open, setOpen] = useState(false);
@@ -25,12 +27,19 @@ export default function Widget() {
   const busyRef = useRef(false);
 
   useEffect(() => {
+    let disposed = false;
+    let legacyOnTop: boolean | null = null;
     try {
-      if (localStorage.getItem('widget-on-top') === 'true') {
-        invoke('set_widget_on_top', { onTop: true }).then(() => setOnTop(true))
-          .catch(() => setError('Nie udało się przywrócić przypięcia okna.'));
-      }
-    } catch { setError('Nie udało się odczytać ustawień widgetu.'); }
+      const value = localStorage.getItem('widget-on-top');
+      if (value === 'true' || value === 'false') legacyOnTop = value === 'true';
+    } catch {
+      // The previous browser profile may be unavailable after reinstalling.
+    }
+    void invoke<boolean>('restore_widget_on_top', { legacyOnTop })
+      .then(value => { if (!disposed) setOnTop(value); })
+      .catch(() => { if (!disposed) setPinProblem('Nie udało się przywrócić przypięcia okna.'); })
+      .finally(() => { if (!disposed) setPinPending(false); });
+    return () => { disposed = true; };
   }, []);
   const refresh = useCallback(async () => {
     try { setData(await invoke<Snapshot>('get_snapshot')); setError(''); }
@@ -107,8 +116,13 @@ export default function Widget() {
     window.addEventListener('keydown', handleKey); return () => window.removeEventListener('keydown', handleKey);
   }, [toggle, open, setPanel, shortcut.registered, shortcut.shortcut]);
   async function changePin() {
-    try { await invoke('set_widget_on_top', { onTop: !onTop }); setOnTop(!onTop); localStorage.setItem('widget-on-top', String(!onTop)); }
-    catch { setError('Nie udało się zmienić przypięcia okna.'); }
+    setPinPending(true);
+    try {
+      await invoke('set_widget_on_top', { onTop: !onTop });
+      setOnTop(!onTop);
+      setPinProblem('');
+    } catch { setPinProblem('Nie udało się zmienić przypięcia okna.'); }
+    finally { setPinPending(false); }
   }
   function selectTask(key: string) { setSelected(key); void setPanel(false); }
   const showApp = () => invoke('show_main').catch(() => setError('Nie udało się otworzyć aplikacji.'));
@@ -129,9 +143,9 @@ export default function Widget() {
         if (e.key === 'ArrowDown') { e.preventDefault(); setCursor(Math.min(cursor + 1, visible.length - 1)); }
         if (e.key === 'ArrowUp') { e.preventDefault(); setCursor(Math.max(cursor - 1, 0)); }
         if (e.key === 'Enter' && visible[cursor]) { e.preventDefault(); selectTask(visible[cursor].key); }
-      }}/></div><button className={`mini-pin ${onTop ? 'is-pinned' : ''}`} onClick={() => void changePin()} aria-pressed={onTop} title={onTop ? 'Odepnij od wierzchu' : 'Przypnij na wierzchu'} aria-label={onTop ? 'Odepnij od wierzchu' : 'Przypnij na wierzchu'}><svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><path d="M16 3c-.4 0-.8.2-1 .5l-1 1-3.9-.4-.9.9 2 3.1-4.1 4.1-2.8-.2-.8.8 4.1 4.1-4.3 4.3.7.7 4.3-4.3 4.1 4.1.8-.8-.2-2.8 4.1-4.1 3.1 2 .9-.9-.4-3.9 1-1a1.4 1.4 0 0 0 0-2l-2.7-2.7a1.4 1.4 0 0 0-1-.4Z"/></svg></button></div>
+      }}/></div><button className={`mini-pin ${onTop ? 'is-pinned' : ''}`} onClick={() => void changePin()} disabled={pinPending} aria-pressed={onTop} title={onTop ? 'Odepnij od wierzchu' : 'Przypnij na wierzchu'} aria-label={onTop ? 'Odepnij od wierzchu' : 'Przypnij na wierzchu'}><svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><path d="M16 3c-.4 0-.8.2-1 .5l-1 1-3.9-.4-.9.9 2 3.1-4.1 4.1-2.8-.2-.8.8 4.1 4.1-4.3 4.3.7.7 4.3-4.3 4.1 4.1.8-.8-.2-2.8 4.1-4.1 3.1 2 .9-.9-.4-3.9 1-1a1.4 1.4 0 0 0 0-2l-2.7-2.7a1.4 1.4 0 0 0-1-.4Z"/></svg></button></div>
       <div className="mini-results">{groups.length === 0 ? <div className="mini-empty">{choices.length ? 'Brak pasujących zadań.' : 'Brak projektów. Dodaj klienta i projekt w aplikacji.'} <button onClick={showApp}>Otwórz aplikację</button></div> : groups.map(group => <div key={group.id} className="mini-group"><button className="mini-group-header" aria-expanded={!collapsed.includes(group.id)} onClick={() => { setCollapsed(current => current.includes(group.id) ? current.filter(id => id !== group.id) : [...current, group.id]); setCursor(0); }}><svg className="mini-folder" aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2 6a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v1H2V6Zm0 5h20v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-7Z"/></svg><span className="mini-group-name">{group.name} <small>· {group.client}</small></span><small>{group.items.filter(item => item.task).length} {taskCountLabel(group.items.filter(item => item.task).length)}</small><span>{collapsed.includes(group.id) ? '⌄' : '⌃'}</span></button>{!collapsed.includes(group.id) && group.items.map(item => { const index = visible.findIndex(v => v.key === item.key); return <button key={item.key} className={`mini-result ${index === cursor ? 'highlighted' : ''}`} onMouseEnter={() => setCursor(index)} onClick={() => selectTask(item.key)}>{item.task?.name ?? 'Bez zadania'}</button>; })}</div>)}</div>
     </section>}
-    {(error || data?.active?.recovered || data?.active?.uncertain || shortcut.message) && <div className="mini-problem" role="alert" onClick={showApp}>{error || (data?.active?.recovered || data?.active?.uncertain ? 'Pomiar wymaga weryfikacji. Otwórz aplikację.' : shortcut.message)}</div>}
+    {(error || data?.active?.recovered || data?.active?.uncertain || pinProblem || shortcut.message) && <div className="mini-problem" role="alert" onClick={showApp}>{error || (data?.active?.recovered || data?.active?.uncertain ? 'Pomiar wymaga weryfikacji. Otwórz aplikację.' : pinProblem || shortcut.message)}</div>}
   </main>;
 }

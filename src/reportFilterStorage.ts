@@ -1,7 +1,7 @@
 import { Temporal } from '@js-temporal/polyfill';
 
 export type SavedReportFilter = { kind: 'today' | 'week' } | { kind: 'custom'; from: string; through: string };
-type StorageAccess = Pick<Storage, 'getItem' | 'setItem'>;
+type StorageAccess = Pick<Storage, 'getItem'>;
 const key = 'report-date-filter-v1';
 
 function validDate(value: unknown): value is string {
@@ -25,7 +25,3 @@ export function readReportFilter(storage: StorageAccess): { filter: SavedReportF
   } catch { return { filter: null, problem: true }; }
 }
 
-export function saveReportFilter(storage: StorageAccess, filter: SavedReportFilter): boolean {
-  if (!validReportFilter(filter)) return false;
-  try { storage.setItem(key, JSON.stringify(filter)); return true; } catch { return false; }
-}
