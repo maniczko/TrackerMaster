@@ -60,7 +60,7 @@ fn validate_database(db: &Connection) -> Result<()> {
         return Err(invalid());
     }
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if !(0..=12).contains(&version) {
+    if !(0..=crate::LATEST_SCHEMA_VERSION).contains(&version) {
         return Err(invalid());
     }
 
@@ -91,6 +91,7 @@ fn validate_database(db: &Connection) -> Result<()> {
     if version >= 10 { crate::validate_description_schema(db)?; }
     if version >= 11 { crate::optional_task_migration::validate(db)?; crate::validate_project_timer_activity(db)?; }
     if version >= 12 { crate::sleep_periods::validate(db)?; }
+    if version >= 13 { crate::entry_drafts::validate_resolution_schema(db)?; }
     // A PRAGMA integrity_check does not detect broken relationships, and
     // stored data may have been written with foreign_keys disabled.
     for (table, from, target, to) in [
@@ -415,7 +416,7 @@ mod tests {
         source.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES(41,NULL,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_descriptions VALUES(41,'Opis'); INSERT INTO billable_entries VALUES(41);").unwrap();
         let backup=create_backup(&source,&dir).unwrap();
         let prepared=prepare_restore(&backup).unwrap();
-        assert_eq!((prepared.health.schema_version,prepared.health.completed_entries),(12,1));
+        assert_eq!((prepared.health.schema_version,prepared.health.completed_entries),(crate::LATEST_SCHEMA_VERSION,1));
         let mut destination=Connection::open(&dest_path).unwrap();
         crate::initialise(&mut destination).unwrap();
         restore_prepared(&mut destination,&prepared,&dir).unwrap();
@@ -436,7 +437,7 @@ mod tests {
         assert!(prepare_restore(&invalid_path).is_err());
         let mut source = Connection::open(&source_path).unwrap();
         crate::initialise_v10(&mut source).unwrap();
-        source.pragma_update(None, "user_version", 13).unwrap();
+        source.pragma_update(None, "user_version", crate::LATEST_SCHEMA_VERSION + 1).unwrap();
         assert!(prepare_restore(&source_path).is_err());
         source.pragma_update(None, "user_version", 10).unwrap();
         let prepared = prepare_restore(&source_path).unwrap();
@@ -456,7 +457,7 @@ mod tests {
         crate::initialise_v10(&mut source).unwrap();
         source.execute_batch("INSERT INTO clients VALUES(1,'Legacy'); DROP TABLE description_revisions; DROP TABLE entry_descriptions; DROP TABLE task_archives; DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
         let prepared = prepare_restore(&path).unwrap();
-        assert_eq!((prepared.health.schema_version, prepared.health.clients), (12, 1));
+        assert_eq!((prepared.health.schema_version, prepared.health.clients), (crate::LATEST_SCHEMA_VERSION, 1));
         assert_eq!(source.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 3);
         assert!(!source.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entry_revisions')", [], |r| r.get::<_,bool>(0)).unwrap());
     }

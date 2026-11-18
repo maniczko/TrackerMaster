@@ -1,5 +1,5 @@
-use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension};
+use chrono::{DateTime, SecondsFormat, Utc};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -9,7 +9,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State};
 
-use crate::{db_err, locked, ui_preferences::save_preference, Cmd, Shared};
+use crate::{db_err, locked, ui_preferences::save_preference, Cmd, Shared, LATEST_SCHEMA_VERSION};
 
 const FORMAT_VERSION: u16 = 1;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -18,6 +18,88 @@ const WRITE_ERROR: &str =
     "Nie udało się zapisać szkicu. Ostatnie zmiany mogą nie przetrwać zamknięcia.";
 const STALE_ERROR: &str = "Szkic zmienił się. Otwórz listę szkiców ponownie.";
 const INVALID_ERROR: &str = "Szkic ma nieobsługiwany format lub nieprawidłowe dane.";
+const CORRECTION: &str = "correction";
+const RECOVERED: &str = "recovered_draft_of_deleted_or_missing_entry";
+
+pub(super) fn migrate_resolutions(db: &mut Connection) -> rusqlite::Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE entry_draft_resolutions (
+            revision TEXT PRIMARY KEY NOT NULL CHECK(length(revision) BETWEEN 1 AND 128),
+            source_entry_id INTEGER NOT NULL CHECK(source_entry_id > 0),
+            entry_id INTEGER NOT NULL REFERENCES time_entries(id),
+            kind TEXT NOT NULL CHECK(
+                (kind='correction' AND entry_id=source_entry_id) OR
+                (kind='recovered_draft_of_deleted_or_missing_entry' AND entry_id<>source_entry_id)
+            ),
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX entry_draft_resolutions_by_entry ON entry_draft_resolutions(entry_id);",
+    )?;
+    validate_resolution_schema(&tx)?;
+    tx.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)?;
+    tx.commit()
+}
+
+pub(super) fn validate_resolution_schema(db: &Connection) -> rusqlite::Result<()> {
+    let valid = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('entry_draft_resolutions')
+                       WHERE name='revision' AND type='TEXT' AND pk=1 AND \"notnull\"=1)
+            AND (SELECT COUNT(*) FROM pragma_table_info('entry_draft_resolutions') WHERE pk>0)=1
+            AND (SELECT COUNT(*) FROM pragma_table_info('entry_draft_resolutions')
+                 WHERE name IN ('source_entry_id','entry_id','kind','created_at') AND \"notnull\"=1)=4
+            AND (SELECT COUNT(*) FROM pragma_foreign_key_list('entry_draft_resolutions'))=1
+            AND EXISTS (SELECT 1 FROM pragma_foreign_key_list('entry_draft_resolutions')
+                        WHERE \"from\"='entry_id' AND \"table\"='time_entries' AND \"to\"='id'
+                          AND on_delete='NO ACTION')
+            AND NOT EXISTS (SELECT 1 FROM entry_draft_resolutions
+                            WHERE length(revision) NOT BETWEEN 1 AND 128 OR source_entry_id<=0
+                               OR julianday(created_at) IS NULL
+                               OR NOT ((kind='correction' AND entry_id=source_entry_id) OR
+                               (kind='recovered_draft_of_deleted_or_missing_entry' AND entry_id<>source_entry_id)))",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !valid {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DraftRange {
+    started_at: String,
+    ended_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub(super) enum DraftApplication {
+    Correction {
+        base: DraftSource,
+        range: Option<DraftRange>,
+        description: String,
+    },
+    NewEntry {
+        client_id: i64,
+        project_id: i64,
+        task_id: Option<i64>,
+        range: DraftRange,
+        description: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct EntryDraftOrigin {
+    source_entry_id: i64,
+    created_at: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,7 +246,7 @@ fn read_draft(dir: &Path, entry_id: i64) -> Cmd<Option<EntryDraft>> {
     if draft.format_version != FORMAT_VERSION
         || draft.source.entry_id != entry_id
         || !draft.fields.valid()
-        || draft.revision.is_empty()
+        || !(1..=128).contains(&draft.revision.len())
         || chrono::DateTime::parse_from_rfc3339(&draft.snapshot_updated_at).is_err()
     {
         return Err(INVALID_ERROR.into());
@@ -279,8 +361,176 @@ pub(super) fn get_entry_edit_source(state: State<'_, Shared>, entry_id: i64) -> 
 
 #[tauri::command]
 pub(super) fn get_entry_drafts(app: AppHandle, state: State<'_, Shared>) -> Cmd<DraftList> {
-    let _tracker = locked(&state)?;
-    list_drafts(&draft_directory(&app)?)
+    let tracker = locked(&state)?;
+    let mut list = list_drafts(&draft_directory(&app)?)?;
+    remove_resolved_from_list(&tracker.db, &mut list)?;
+    Ok(list)
+}
+
+fn remove_resolved_from_list(db: &Connection, list: &mut DraftList) -> Cmd<()> {
+    let mut unresolved = Vec::with_capacity(list.drafts.len());
+    for draft in list.drafts.drain(..) {
+        if find_resolution(db, draft.source.entry_id, &draft.revision)?.is_none() {
+            unresolved.push(draft);
+        }
+    }
+    list.drafts = unresolved;
+    Ok(())
+}
+
+fn find_resolution(db: &Connection, source_id: i64, revision: &str) -> Cmd<Option<i64>> {
+    db.query_row(
+        "SELECT entry_id FROM entry_draft_resolutions WHERE source_entry_id=?1 AND revision=?2",
+        params![source_id, revision],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+fn resolve_draft(
+    db: &mut Connection,
+    draft: &EntryDraft,
+    application: DraftApplication,
+    current: DateTime<Utc>,
+) -> Cmd<i64> {
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_err)?;
+    let origin = draft.source.entry_id;
+    if let Some(entry_id) = find_resolution(&tx, origin, &draft.revision)? {
+        return Ok(entry_id);
+    }
+    let changed_at = current.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let (entry_id, kind) = match application {
+        DraftApplication::Correction {
+            base,
+            range,
+            description,
+        } => {
+            if base.entry_id != origin
+                || base.project_id != draft.source.project_id
+                || base.client_id != draft.source.client_id
+                || !matches!(source_status(&tx, &base)?, DraftSourceStatus::Ready(_))
+            {
+                return Err("Oryginalny wpis zmienił się. Porównaj go ponownie ze szkicem.".into());
+            }
+            if let Some(range) = range {
+                crate::update_entry_time(
+                    &tx,
+                    origin,
+                    &base.started_at,
+                    &base.ended_at,
+                    &range.started_at,
+                    &range.ended_at,
+                    current,
+                )?;
+            }
+            crate::update_description(&tx, origin, &base.description, &description, &changed_at)?;
+            (origin, CORRECTION)
+        }
+        DraftApplication::NewEntry {
+            client_id,
+            project_id,
+            task_id,
+            range,
+            description,
+        } => {
+            if !matches!(
+                source_status(&tx, &draft.source)?,
+                DraftSourceStatus::Missing
+            ) {
+                return Err("Oryginalny wpis jest dostępny. Otwórz ponownie szkic.".into());
+            }
+            let owner: Option<i64> = tx
+                .query_row(
+                    "SELECT client_id FROM projects WHERE id=?1",
+                    [project_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            if owner != Some(client_id) {
+                return Err("Wybierz projekt należący do wybranego klienta.".into());
+            }
+            let last: i64 = tx
+                .query_row("SELECT COALESCE(MAX(id),0) FROM time_entries", [], |row| {
+                    row.get(0)
+                })
+                .map_err(db_err)?;
+            let id = last
+                .max(origin)
+                .checked_add(1)
+                .ok_or("Nie można przydzielić nowego numeru wpisu.")?;
+            let entry_id = crate::optional_task_migration::insert_manual_in(
+                &tx,
+                Some(id),
+                project_id,
+                task_id,
+                &range.started_at,
+                &range.ended_at,
+                current,
+                &description,
+            )?;
+            (entry_id, RECOVERED)
+        }
+    };
+    tx.execute(
+        "INSERT INTO entry_draft_resolutions(revision, source_entry_id, entry_id, kind, created_at)
+         VALUES(?1,?2,?3,?4,?5)",
+        params![draft.revision, origin, entry_id, kind, changed_at],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(entry_id)
+}
+
+#[tauri::command]
+pub(super) fn apply_entry_draft(
+    app: AppHandle,
+    state: State<'_, Shared>,
+    entry_id: i64,
+    revision: String,
+    application: DraftApplication,
+) -> Cmd<i64> {
+    let mut tracker = locked(&state)?;
+    let dir = draft_directory(&app)?;
+    if let Some(resolved) = find_resolution(&tracker.db, entry_id, &revision)? {
+        let _ = discard_draft(&dir, entry_id, &revision);
+        return Ok(resolved);
+    }
+    let draft = read_draft(&dir, entry_id)?.ok_or(STALE_ERROR)?;
+    if draft.revision != revision {
+        return Err(STALE_ERROR.into());
+    }
+    let applied = resolve_draft(&mut tracker.db, &draft, application, Utc::now())?;
+    // The receipt was committed with the entry. A failed cleanup cannot
+    // offer the same draft again or cause a duplicate on retry.
+    let _ = discard_draft(&dir, entry_id, &revision);
+    Ok(applied)
+}
+
+#[tauri::command]
+pub(super) fn get_entry_draft_origin(
+    state: State<'_, Shared>,
+    entry_id: i64,
+) -> Cmd<Option<EntryDraftOrigin>> {
+    let tracker = locked(&state)?;
+    tracker
+        .db
+        .query_row(
+            "SELECT source_entry_id, created_at FROM entry_draft_resolutions
+         WHERE entry_id=?1 AND kind=?2 LIMIT 1",
+            params![entry_id, RECOVERED],
+            |row| {
+                Ok(EntryDraftOrigin {
+                    source_entry_id: row.get(0)?,
+                    created_at: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_err)
 }
 
 #[tauri::command]
@@ -293,18 +543,29 @@ pub(super) fn save_entry_draft(
 ) -> Cmd<EntryDraft> {
     let tracker = locked(&state)?;
     let dir = draft_directory(&app)?;
+    let previous = read_draft(&dir, source.entry_id)?;
+    let mut revision = expected_revision.as_deref();
+    if let Some(previous) = &previous {
+        if find_resolution(&tracker.db, source.entry_id, &previous.revision)?.is_some() {
+            if revision.is_some() {
+                return Err(STALE_ERROR.into());
+            }
+            // A fresh edit can replace an already-resolved copy left after a
+            // failed file deletion, but a late write from that edit cannot.
+            revision = Some(&previous.revision);
+        }
+    }
     if !matches!(
         source_status(&tracker.db, &source)?,
         DraftSourceStatus::Ready(_)
     ) {
         // Keep recording changes to a previously saved draft even if its
         // original entry was changed or deleted while editing.
-        let previous = read_draft(&dir, source.entry_id)?;
         if previous.as_ref().map(|draft| &draft.source) != Some(&source) {
             return Err("Oryginalny wpis zmienił się. Otwórz edycję ponownie.".into());
         }
     }
-    persist_draft(&dir, source, fields, expected_revision.as_deref())
+    persist_draft(&dir, source, fields, revision)
 }
 
 #[tauri::command]
@@ -473,5 +734,150 @@ mod tests {
             source_status(&db, &second).unwrap(),
             DraftSourceStatus::Missing
         ));
+    }
+
+    fn range(end: &str) -> DraftRange {
+        DraftRange {
+            started_at: "2026-01-01T09:00:00.000Z".into(),
+            ended_at: end.into(),
+        }
+    }
+
+    fn test_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-02-01T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn correction_and_resolution_are_atomic_and_retry_safe() {
+        let mut db = database();
+        let source = read_source(&db, 1).unwrap().unwrap();
+        let dir = test_directory("correct");
+        let draft = persist_draft(&dir, source.clone(), fields("Odzyskany opis"), None).unwrap();
+        let application = || DraftApplication::Correction {
+            base: source.clone(),
+            range: Some(range("2026-01-01T10:30:00.000Z")),
+            description: "Odzyskany opis".into(),
+        };
+        db.execute_batch(
+            "CREATE TRIGGER reject_resolution BEFORE INSERT ON entry_draft_resolutions
+             BEGIN SELECT RAISE(ABORT, 'write failed'); END;",
+        )
+        .unwrap();
+        assert!(resolve_draft(&mut db, &draft, application(), test_now()).is_err());
+        assert_eq!(read_source(&db, 1).unwrap(), Some(source.clone()));
+        assert_eq!(list_drafts(&dir).unwrap().drafts, vec![draft.clone()]);
+        db.execute_batch("DROP TRIGGER reject_resolution").unwrap();
+
+        assert_eq!(
+            resolve_draft(&mut db, &draft, application(), test_now()).unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_draft(&mut db, &draft, application(), test_now()).unwrap(),
+            1
+        );
+        let edited = read_source(&db, 1).unwrap().unwrap();
+        assert_eq!(edited.description, "Odzyskany opis");
+        assert_eq!(edited.duration_seconds, 5400);
+        for table in [
+            "entry_revisions",
+            "description_revisions",
+            "entry_draft_resolutions",
+        ] {
+            let count: i64 = db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        let mut pending = list_drafts(&dir).unwrap();
+        remove_resolved_from_list(&db, &mut pending).unwrap();
+        assert!(pending.drafts.is_empty());
+        discard_draft(&dir, 1, &draft.revision).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn creating_from_missing_source_uses_new_id_and_preserves_audit_in_backup() {
+        let mut db = database();
+        let source = read_source(&db, 1).unwrap().unwrap();
+        let dir = test_directory("new");
+        let draft = persist_draft(&dir, source, fields("Odzyskany opis"), None).unwrap();
+        db.execute_batch(
+            "DELETE FROM entry_descriptions WHERE entry_id=1; DELETE FROM time_entries WHERE id=1;",
+        )
+        .unwrap();
+        let application = |client_id| DraftApplication::NewEntry {
+            client_id,
+            project_id: 1,
+            task_id: None,
+            range: range("2026-01-01T10:30:00.000Z"),
+            description: "Odzyskany opis".into(),
+        };
+        assert!(resolve_draft(&mut db, &draft, application(2), test_now()).is_err());
+        assert_eq!(find_resolution(&db, 1, &draft.revision).unwrap(), None);
+        let created = resolve_draft(&mut db, &draft, application(1), test_now()).unwrap();
+        assert_ne!(created, 1);
+        assert_eq!(
+            resolve_draft(&mut db, &draft, application(1), test_now()).unwrap(),
+            created
+        );
+        assert!(read_source(&db, 1).unwrap().is_none());
+        assert_eq!(
+            read_source(&db, created).unwrap().unwrap().duration_seconds,
+            5400
+        );
+        let path = crate::storage_safety::create_backup(&db, &dir).unwrap();
+        let backup = Connection::open(&path).unwrap();
+        let origin: (i64, String) = backup
+            .query_row(
+                "SELECT source_entry_id, kind FROM entry_draft_resolutions WHERE entry_id=?1",
+                [created],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(origin, (1, RECOVERED.into()));
+        drop(backup);
+        discard_draft(&dir, 1, &draft.revision).unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir.join("backups")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn version_twelve_is_backed_up_before_creating_resolution_history() {
+        let mut db = database();
+        let original = read_source(&db, 1).unwrap();
+        db.execute_batch("DROP TABLE entry_draft_resolutions; PRAGMA user_version=12;")
+            .unwrap();
+        let dir = test_directory("migration");
+        crate::initialise_with_backup(&mut db, &dir, true).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(read_source(&db, 1).unwrap(), original);
+        let backup_path = fs::read_dir(dir.join("backups"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let previous = Connection::open(&backup_path).unwrap();
+        assert_eq!(
+            previous
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(read_source(&previous, 1).unwrap(), original);
+        drop(previous);
+        fs::remove_file(backup_path).unwrap();
+        fs::remove_dir(dir.join("backups")).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 }

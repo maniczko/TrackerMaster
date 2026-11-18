@@ -7,6 +7,8 @@ mod optional_task_migration;
 mod ui_preferences;
 mod entry_drafts;
 
+const LATEST_SCHEMA_VERSION: i64 = 13;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -150,7 +152,7 @@ fn entry_project_sql(db: &Connection, alias: &str) -> Cmd<String> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     match version {
         10 => Ok(format!("(SELECT project_id FROM tasks WHERE id={alias}.task_id)")),
-        11 | 12 => Ok(format!("{alias}.project_id")),
+        11..=LATEST_SCHEMA_VERSION => Ok(format!("{alias}.project_id")),
         _ => Err("Nieobsługiwana wersja bazy danych.".into()),
     }
 }
@@ -550,16 +552,21 @@ fn set_entry_billing(db: &mut Connection, entry_id: i64, expected: bool, billabl
 }
 
 fn set_description(db: &mut Connection, entry_id: i64, expected: &str, description: &str, changed_at: &str) -> Cmd<()> {
-    let description = valid_description(description)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
-    let current: Option<String> = tx.query_row("SELECT COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| r.get(0)).optional().map_err(db_err)?;
+    update_description(&tx, entry_id, expected, description, changed_at)?;
+    tx.commit().map_err(db_err)
+}
+
+fn update_description(db: &rusqlite::Transaction<'_>, entry_id: i64, expected: &str, description: &str, changed_at: &str) -> Cmd<()> {
+    let description = valid_description(description)?;
+    let current: Option<String> = db.query_row("SELECT COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| r.get(0)).optional().map_err(db_err)?;
     if current.as_deref() != Some(expected) { return Err("Wpis lub opis zmienił się w innym oknie. Odśwież dane.".into()); }
     if expected != description {
-        if description.is_empty() { tx.execute("DELETE FROM entry_descriptions WHERE entry_id=?1", [entry_id]).map_err(db_err)?; }
-        else { tx.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2) ON CONFLICT(entry_id) DO UPDATE SET description=excluded.description", params![entry_id,description]).map_err(db_err)?; }
-        tx.execute("INSERT INTO description_revisions(entry_id,changed_at,before_description,after_description) VALUES(?1,?2,?3,?4)", params![entry_id,changed_at,expected,description]).map_err(db_err)?;
+        if description.is_empty() { db.execute("DELETE FROM entry_descriptions WHERE entry_id=?1", [entry_id]).map_err(db_err)?; }
+        else { db.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2) ON CONFLICT(entry_id) DO UPDATE SET description=excluded.description", params![entry_id,description]).map_err(db_err)?; }
+        db.execute("INSERT INTO description_revisions(entry_id,changed_at,before_description,after_description) VALUES(?1,?2,?3,?4)", params![entry_id,changed_at,expected,description]).map_err(db_err)?;
     }
-    tx.commit().map_err(db_err)
+    Ok(())
 }
 
 #[tauri::command]
@@ -666,7 +673,7 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
 
 fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Option<i64>, description: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
-    if version == 11 || version == 12 {
+    if (11..=LATEST_SCHEMA_VERSION).contains(&version) {
         let active: Option<i64> = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r|r.get(0)).optional().map_err(db_err)?;
         let action = match next_task {
             Some(task_id) => {
@@ -748,7 +755,7 @@ fn change_timer(tracker: &mut Tracker, end: &str, next_task: Option<i64>, descri
 
 fn resume_saved_entry(tracker: &mut Tracker, source_id: i64, expected_active_id: Option<i64>, at: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r|r.get(0)).map_err(db_err)?;
-    if version == 11 || version == 12 { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
+    if (11..=LATEST_SCHEMA_VERSION).contains(&version) { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
     if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != expected_active_id { return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into()); }
     change_timer(tracker, at, None, "", Some(source_id))
 }
@@ -956,7 +963,7 @@ fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended
 
 fn add_manual_entry_with_description(tracker: &mut Tracker, task_id: i64, started_at: &str, ended_at: &str, current: DateTime<Utc>, description: &str) -> Cmd<i64> {
     let version: i64=tracker.db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(db_err)?;
-    if version == 11 || version == 12 {
+    if (11..=LATEST_SCHEMA_VERSION).contains(&version) {
         let project_id: Option<i64>=tracker.db.query_row("SELECT project_id FROM tasks WHERE id=?1",[task_id],|r|r.get(0)).optional().map_err(db_err)?;
         return optional_task_migration::insert_manual(tracker,project_id.ok_or("Nie znaleziono zadania.")?,Some(task_id),started_at,ended_at,current,description);
     }
@@ -977,20 +984,25 @@ fn add_manual_entry_with_description(tracker: &mut Tracker, task_id: i64, starte
 }
 
 fn correct_entry(tracker: &mut Tracker, entry_id: i64, expected_start: &str, expected_end: &str, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<()> {
-    let (start, end) = parse_manual_range(started_at, ended_at, current)?;
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
-    let previous: Option<(String, String, i64)> = tx.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
+    update_entry_time(&tx, entry_id, expected_start, expected_end, started_at, ended_at, current)?;
+    tx.commit().map_err(db_err)
+}
+
+fn update_entry_time(db: &rusqlite::Transaction<'_>, entry_id: i64, expected_start: &str, expected_end: &str, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<()> {
+    let (start, end) = parse_manual_range(started_at, ended_at, current)?;
+    let previous: Option<(String, String, i64)> = db.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
     let (old_start, old_end, old_seconds) = previous.ok_or("Nie znaleziono zakończonego wpisu.")?;
-    ensure_no_sleep_periods(&tx, entry_id)?;
+    ensure_no_sleep_periods(db, entry_id)?;
     if old_start != expected_start || old_end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed korektą.".into()); }
-    ensure_no_overlap(&tx, start, end, Some(entry_id))?;
+    ensure_no_overlap(db, start, end, Some(entry_id))?;
     let new_start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
     let new_end = end.to_rfc3339_opts(SecondsFormat::Millis, true);
     let seconds = (end - start).num_seconds();
     if old_start == new_start && old_end == new_end { return Ok(()); }
-    tx.execute("INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![entry_id,current.to_rfc3339_opts(SecondsFormat::Millis, true),old_start,old_end,old_seconds,new_start,new_end,seconds]).map_err(db_err)?;
-    tx.execute("UPDATE time_entries SET started_at=?1,ended_at=?2,duration_seconds=?3,manually_resolved=1 WHERE id=?4", params![new_start,new_end,seconds,entry_id]).map_err(db_err)?;
-    tx.commit().map_err(db_err)
+    db.execute("INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![entry_id,current.to_rfc3339_opts(SecondsFormat::Millis, true),old_start,old_end,old_seconds,new_start,new_end,seconds]).map_err(db_err)?;
+    db.execute("UPDATE time_entries SET started_at=?1,ended_at=?2,duration_seconds=?3,manually_resolved=1 WHERE id=?4", params![new_start,new_end,seconds,entry_id]).map_err(db_err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1221,7 +1233,7 @@ fn initialise_v10(db: &mut Connection) -> rusqlite::Result<()> {
 fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = db.pragma_query_value(None,"user_version",|r|r.get(0))?;
-    if version > 12 { return Err(rusqlite::Error::InvalidQuery); }
+    if !(0..=LATEST_SCHEMA_VERSION).contains(&version) { return Err(rusqlite::Error::InvalidQuery); }
     if version <= 10 {
         initialise_v10(db)?;
         optional_task_migration::migrate(db)?;
@@ -1238,14 +1250,16 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     validate_task_archives_schema(db)?;
     validate_description_schema(db)?;
     optional_task_migration::validate(db)?;
-    validate_project_timer_activity(db)
+    validate_project_timer_activity(db)?;
+    if version <= 12 { entry_drafts::migrate_resolutions(db)?; }
+    entry_drafts::validate_resolution_schema(db)
 }
 
 // Existing databases are backed up and verified before any schema migration.
 // A failed backup prevents migration; a new installation needs no backup.
 fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: bool) -> rusqlite::Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if existing && (0..12).contains(&version) {
+    if existing && (0..LATEST_SCHEMA_VERSION).contains(&version) {
         storage_safety::create_backup(db, dir)?;
     }
     initialise(db)
@@ -1256,7 +1270,7 @@ fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: 
 fn start_project_from_shortcut(tracker: &mut Tracker, project_id: i64, task_id: Option<i64>, at: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     match version {
-        11 | 12 => optional_task_migration::transition(
+        11..=LATEST_SCHEMA_VERSION => optional_task_migration::transition(
             tracker, None, at,
             optional_task_migration::TimerAction::Start { project_id, task_id, description: "" },
         ),
@@ -1404,7 +1418,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::discard_entry_draft,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -1488,7 +1502,7 @@ mod tests {
             let mut tracker = seeded();
             initialise(&mut tracker.db).unwrap();
             let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-            assert_eq!(version, 12);
+            assert_eq!(version, LATEST_SCHEMA_VERSION);
             start_project_from_shortcut(&mut tracker, 1, task_id, &now()).unwrap();
             let active = snapshot(&tracker).unwrap().active.expect("Shortcut should create one running entry");
             assert_eq!(active.project_id, 1);
@@ -1864,7 +1878,7 @@ mod tests {
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         initialise_with_backup(&mut tracker.db, &dir, true).unwrap();
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 12);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
         let backups: Vec<_> = std::fs::read_dir(dir.join("backups")).unwrap().map(|entry| entry.unwrap().path()).collect();
         assert_eq!(backups.len(), 1);
         storage_safety::preflight_existing(&backups[0]).unwrap();

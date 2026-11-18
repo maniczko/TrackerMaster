@@ -92,18 +92,23 @@ pub fn insert_running(db: &Connection, project_id: i64, task_id: Option<i64>, st
 
 pub fn insert_manual(tracker: &mut crate::Tracker, project_id: i64, task_id: Option<i64>, started_at: &str, ended_at: &str, current: DateTime<Utc>, description: &str) -> std::result::Result<i64,String> {
     crate::ensure_available(tracker)?;
+    let tx=tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(crate::db_err)?;
+    let id=insert_manual_in(&tx,None,project_id,task_id,started_at,ended_at,current,description)?;
+    tx.commit().map_err(crate::db_err)?;
+    Ok(id)
+}
+
+pub(super) fn insert_manual_in(tx: &rusqlite::Transaction<'_>, reserved_id: Option<i64>, project_id: i64, task_id: Option<i64>, started_at: &str, ended_at: &str, current: DateTime<Utc>, description: &str) -> crate::Cmd<i64> {
     crate::valid_description(description)?;
     let (start,end)=crate::parse_manual_range(started_at,ended_at,current)?;
-    let tx=tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(crate::db_err)?;
-    let billable=target_billing(&tx,project_id,task_id)?;
-    crate::ensure_no_overlap(&tx,start,end,None)?;
+    let billable=target_billing(tx,project_id,task_id)?;
+    crate::ensure_no_overlap(tx,start,end,None)?;
     let start_text=start.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
     let end_text=end.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
-    tx.execute("INSERT INTO time_entries(task_id,project_id,started_at,ended_at,duration_seconds,manually_resolved) VALUES(?1,?2,?3,?4,?5,1)",params![task_id,project_id,start_text,end_text,(end-start).num_seconds()]).map_err(crate::db_err)?;
+    tx.execute("INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds,manually_resolved) VALUES(?1,?2,?3,?4,?5,?6,1)",params![reserved_id,task_id,project_id,start_text,end_text,(end-start).num_seconds()]).map_err(crate::db_err)?;
     let id=tx.last_insert_rowid();
     if billable { tx.execute("INSERT INTO billable_entries(entry_id) VALUES(?1)",[id]).map_err(crate::db_err)?; }
     if !description.is_empty() { tx.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2)",params![id,description]).map_err(crate::db_err)?; }
-    tx.commit().map_err(crate::db_err)?;
     Ok(id)
 }
 
@@ -325,7 +330,7 @@ mod tests {
         crate::initialise_v10(&mut db).unwrap();
         db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO tasks(id,project_id,name) VALUES(1,1,'Zadanie'); INSERT INTO time_entries(id,task_id,started_at,ended_at,duration_seconds) VALUES(41,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_descriptions VALUES(41,'Zachowany opis');").unwrap();
         crate::initialise(&mut db).unwrap();
-        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),12);
+        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),crate::LATEST_SCHEMA_VERSION);
         assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(db.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(),"Zachowany opis");
         crate::initialise(&mut db).unwrap();
@@ -348,7 +353,7 @@ mod tests {
         let old=Connection::open_with_flags(&backups[0],rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(old.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),10);
         assert_eq!(old.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41",[],|r|r.get::<_,String>(0)).unwrap(),"Zachowany opis");
-        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),12);
+        assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),crate::LATEST_SCHEMA_VERSION);
         assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
     #[test]
