@@ -91,8 +91,39 @@ function Install-TestVersion([string] $Path, [version] $Version, [switch] $Updat
     $instance
 }
 
+function Test-PackageRelaunch($Process, [string] $AppId, [string] $ExpectedExe, [IntPtr] $Window) {
+    if (!$Process.CloseMainWindow()) { throw 'Could not close the main test window.' }
+    $hidden = $false
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+        $Process.Refresh()
+        if ($Process.HasExited) { throw 'Closing the test window ended the application.' }
+        if ($Process.MainWindowHandle -eq [IntPtr]::Zero) {
+            $hidden = $true
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    if (!$hidden) { throw 'Closing the main window did not hide it.' }
+
+    [void] [TestPackageActivation]::Launch($AppId)
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        $Process.Refresh()
+        if ($Process.HasExited) { throw 'Package reactivation ended the original process.' }
+        $matching = @(Get-Process -Name 'tracker-master' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -ieq $ExpectedExe })
+        if ($Process.MainWindowHandle -eq $Window -and $matching.Count -eq 1 -and
+            $matching[0].Id -eq $Process.Id) {
+            Write-Host 'PASS: package reactivation restored the original window and left one packaged process.'
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw 'Package reactivation did not restore the original window with exactly one packaged process.'
+}
+
 function Start-TestVersion($Instance) {
-    $processId = [TestPackageActivation]::Launch("$($Instance.PackageFamilyName)!TrackerMaster")
+    $appId = "$($Instance.PackageFamilyName)!TrackerMaster"
+    $processId = [TestPackageActivation]::Launch($appId)
     $process = Get-Process -Id $processId
     $expectedExe = Join-Path $Instance.InstallLocation 'tracker-master.exe'
     if ($process.Path -ine $expectedExe) { throw "Unexpected process from test package activation." }
@@ -100,7 +131,11 @@ function Start-TestVersion($Instance) {
         for ($attempt = 0; $attempt -lt 30; $attempt++) {
             $process.Refresh()
             if ($process.HasExited) { throw "Packaged application exited with code $($process.ExitCode)." }
-            if ($process.MainWindowHandle -ne 0 -and (Test-Path -LiteralPath $database)) { return }
+            $window = $process.MainWindowHandle
+            if ($window -ne [IntPtr]::Zero -and (Test-Path -LiteralPath $database)) {
+                Test-PackageRelaunch $process $appId $expectedExe $window
+                return
+            }
             Start-Sleep -Seconds 1
         }
         throw 'Packaged application did not open a window and database in the test profile.'
