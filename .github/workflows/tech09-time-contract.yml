@@ -1,0 +1,29 @@
+name: TECH-09 time contract
+
+on:
+  push:
+    paths:
+      - "tests/contracts/time-segmentation.mjs"
+      - "tests/time-segmentation-contract.test.mjs"
+      - "docs/TECH-09-TIME-SEGMENTATION-CONTRACT.md"
+      - ".github/workflows/tech09-time-contract.yml"
+      - "package-lock.json"
+  pull_request:
+    paths:
+      - "tests/contracts/time-segmentation.mjs"
+      - "tests/time-segmentation-contract.test.mjs"
+      - "docs/TECH-09-TIME-SEGMENTATION-CONTRACT.md"
+      - ".github/workflows/tech09-time-contract.yml"
+      - "package-lock.json"
+
+jobs:
+  contract:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: node --test tests/time-segmentation-contract.test.mjs
