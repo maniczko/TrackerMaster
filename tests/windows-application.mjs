@@ -266,7 +266,10 @@ async function verifySecondLaunch(primary, env) {
 async function verifyMiniTimer(cdp, mainSession) {
   const evaluate = async (session, expression) => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, session);
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    if (result.exceptionDetails) {
+      const cause = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
+      throw new Error(`${cause} while checking ${expression.slice(0, 120)}`);
+    }
     return result.result.value;
   };
   const findOtherWindow = async () => {
@@ -287,9 +290,9 @@ async function verifyMiniTimer(cdp, mainSession) {
     return sessionId;
   };
   const widget = await openWidget();
-  await evaluate(widget, 'document.querySelector("[aria-label=\"Rozwiń panel\"]").click()');
+  await evaluate(widget, `document.querySelector('[aria-label="Rozwiń panel"]').click()`);
   await waitFor('mini timer opens the focused project search', () => evaluate(widget,
-    'document.activeElement === document.querySelector("[role=\"combobox\"]")'));
+    `document.activeElement === document.querySelector('[role="combobox"]')`));
   await evaluate(widget, `(() => {
     const input = document.activeElement;
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(secondClient)});
@@ -302,7 +305,7 @@ async function verifyMiniTimer(cdp, mainSession) {
   const press = key => evaluate(widget, `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }))`);
   await press('ArrowDown');
   await waitFor('keyboard highlights the search result', () => evaluate(widget,
-    'Boolean(document.querySelector("[role=\"combobox\"]")?.getAttribute("aria-activedescendant"))'));
+    `Boolean(document.querySelector('[role="combobox"]')?.getAttribute('aria-activedescendant'))`));
   await press('Enter');
   await waitFor('keyboard selection focuses the description', () => evaluate(widget, 'document.activeElement.id === "qp-description"'));
   await evaluate(widget, `(() => {
@@ -318,7 +321,7 @@ async function verifyMiniTimer(cdp, mainSession) {
     `document.querySelector(${JSON.stringify(pin)})?.getAttribute('aria-pressed') === 'true'`));
   assert.equal(await readFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'widget-on-top.txt'), 'utf8'), 'true');
   await evaluate(widget, 'document.querySelector(".qp-toggle").focus()');
-  const oldShortcut = { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, modifiers: 2 | 8 };
+  const oldShortcut = { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, modifiers: 2 | 8 }; // CDP: Control and Shift
   await cdp.send('Input.dispatchKeyEvent', { ...oldShortcut, type: 'keyDown' }, widget);
   await cdp.send('Input.dispatchKeyEvent', { ...oldShortcut, type: 'keyUp' }, widget);
   await delay(250);
