@@ -1,4 +1,5 @@
 use chrono::NaiveDate;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -9,7 +10,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State};
 
-use crate::{locked, validate_report_scope, Cmd, Shared};
+use crate::{entry_drafts::database_identity, locked, validate_report_scope, Cmd, Shared};
 
 const REPORT_FILTER_FILE: &str = "report-date-filter.txt";
 const REPORT_SCOPE_FILE: &str = "report-scope.json";
@@ -205,30 +206,43 @@ impl ReportScope {
     }
 }
 
-fn get_report_scope_at(dir: &Path) -> Cmd<Option<ReportScope>> {
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReportScopePreference {
+    database_id: String,
+    scope: ReportScope,
+}
+
+fn get_report_scope_at(dir: &Path, db: &Connection) -> Cmd<Option<ReportScope>> {
     let Some(stored) = read_preference(dir, REPORT_SCOPE_FILE)? else {
         return Ok(None);
     };
-    let scope: ReportScope = serde_json::from_str(&stored)
+    let preference: ReportScopePreference = serde_json::from_str(&stored)
         .map_err(|_| "Nieprawidłowy zapis filtra klienta, projektu i zadania.")?;
-    scope.validate_ids()?;
-    Ok(Some(scope))
+    preference.scope.validate_ids()?;
+    if preference.scope != ReportScope::default() && preference.database_id != database_identity(db)? {
+        return Err("Zapisany filtr klienta, projektu lub zadania dotyczy innej bazy danych.".into());
+    }
+    Ok(Some(preference.scope))
 }
 
-fn set_report_scope_at(dir: &Path, scope: ReportScope) -> Cmd<()> {
-    let stored = serde_json::to_string(&scope)
+fn set_report_scope_at(dir: &Path, db: &Connection, scope: ReportScope) -> Cmd<()> {
+    validate_report_scope(db, scope)?;
+    let preference = ReportScopePreference { database_id: database_identity(db)?, scope };
+    let stored = serde_json::to_string(&preference)
         .map_err(|_| "Nie udało się przygotować zapisu filtra raportu.")?;
     save_preference(dir, REPORT_SCOPE_FILE, &stored)
         .map_err(|_| "Nie udało się zapamiętać klienta, projektu i zadania.".into())
 }
 
 #[tauri::command]
-pub(super) fn get_report_scope(app: AppHandle) -> Cmd<Option<ReportScope>> {
+pub(super) fn get_report_scope(app: AppHandle, state: State<'_, Shared>) -> Cmd<Option<ReportScope>> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
-    get_report_scope_at(&dir)
+    let tracker = locked(&state)?;
+    get_report_scope_at(&dir, &tracker.db)
 }
 
 #[tauri::command]
@@ -238,8 +252,7 @@ pub(super) fn set_report_scope(app: AppHandle, state: State<'_, Shared>, scope: 
         .app_data_dir()
         .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
     let tracker = locked(&state)?;
-    validate_report_scope(&tracker.db, scope)?;
-    set_report_scope_at(&dir, scope)
+    set_report_scope_at(&dir, &tracker.db, scope)
 }
 
 fn widget_pin_at(dir: &Path, legacy_on_top: Option<bool>) -> Cmd<bool> {
@@ -350,21 +363,45 @@ mod tests {
     #[test]
     fn report_scope_distinguishes_an_absent_file_from_corrupt_or_missing_ids() {
         let dir = test_directory("report-scope");
-        assert_eq!(get_report_scope_at(&dir).unwrap(), None);
-        let scope = ReportScope { client_id: Some(3), project_id: Some(7), task_id: Some(11) };
-        set_report_scope_at(&dir, scope).unwrap();
-        assert_eq!(get_report_scope_at(&dir).unwrap(), Some(scope));
-        for corrupt in [
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute("INSERT INTO clients(id,name) VALUES(3,'A')", []).unwrap();
+        let identity = database_identity(&db).unwrap();
+        assert_eq!(get_report_scope_at(&dir, &db).unwrap(), None);
+        let scope = ReportScope { client_id: Some(3), ..ReportScope::default() };
+        set_report_scope_at(&dir, &db, scope).unwrap();
+        assert_eq!(get_report_scope_at(&dir, &db).unwrap(), Some(scope));
+        for corrupt_scope in [
             "{}",
             r#"{"clientId":3,"taskId":11}"#,
             r#"{"clientId":3,"projectId":7,"taskId":"11"}"#,
             r#"{"clientId":3,"projectId":7,"taskId":0}"#,
         ] {
+            let corrupt = format!(r#"{{"databaseId":"{identity}","scope":{corrupt_scope}}}"#);
             fs::write(dir.join(REPORT_SCOPE_FILE), corrupt).unwrap();
-            assert!(get_report_scope_at(&dir).is_err(), "{corrupt}");
+            assert!(get_report_scope_at(&dir, &db).is_err(), "{corrupt_scope}");
         }
-        set_report_scope_at(&dir, ReportScope::default()).unwrap();
-        assert_eq!(get_report_scope_at(&dir).unwrap(), Some(ReportScope::default()));
+        set_report_scope_at(&dir, &db, ReportScope::default()).unwrap();
+        assert_eq!(get_report_scope_at(&dir, &db).unwrap(), Some(ReportScope::default()));
+        clean_up(&dir, REPORT_SCOPE_FILE);
+    }
+
+    #[test]
+    fn report_scope_requires_confirmation_after_restoring_a_different_database_with_matching_ids() {
+        let dir = test_directory("report-scope-restore");
+        let mut original = Connection::open_in_memory().unwrap();
+        let mut restored = Connection::open_in_memory().unwrap();
+        for (db, name) in [(&mut original, "A"), (&mut restored, "B")] {
+            crate::initialise(db).unwrap();
+            db.execute("INSERT INTO clients(id,name) VALUES(1,?1)", [name]).unwrap();
+        }
+        let scope = ReportScope { client_id: Some(1), ..ReportScope::default() };
+        set_report_scope_at(&dir, &original, scope).unwrap();
+        assert!(validate_report_scope(&restored, scope).is_ok());
+        assert_eq!(get_report_scope_at(&dir, &restored).unwrap_err(), "Zapisany filtr klienta, projektu lub zadania dotyczy innej bazy danych.");
+        assert_eq!(get_report_scope_at(&dir, &original).unwrap(), Some(scope));
+        set_report_scope_at(&dir, &restored, scope).unwrap();
+        assert_eq!(get_report_scope_at(&dir, &restored).unwrap(), Some(scope));
         clean_up(&dir, REPORT_SCOPE_FILE);
     }
 

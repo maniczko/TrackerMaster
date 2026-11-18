@@ -249,14 +249,17 @@ fn read_source(db: &Connection, entry_id: i64) -> Cmd<Option<DraftSource>> {
     .map_err(db_err)
 }
 
+pub(super) fn database_identity(db: &Connection) -> Cmd<String> {
+    db.query_row(
+        "SELECT value FROM entry_database_identity WHERE id=1",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_err)
+}
+
 fn source_status(db: &Connection, previous: &DraftSource) -> Cmd<DraftSourceStatus> {
-    let database_id: String = db
-        .query_row(
-            "SELECT value FROM entry_database_identity WHERE id=1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_err)?;
+    let database_id = database_identity(db)?;
     if database_id != previous.database_id {
         return Ok(DraftSourceStatus::Missing { database_id });
     }
