@@ -223,18 +223,11 @@ async function exercisePage(data, phase) {
     await until('client CSV preview', () => pick('.export-preview tbody')?.textContent.includes(data.primaryDescription));
     if (pick('.export-preview tbody').rows.length !== 1) fail('CSV preview returned a foreign entry');
   } else {
-    async function selectTimerOption(index, label) {
-      const selector = `${timer} select`;
-      const choice = await until(label, () => [...(document.querySelectorAll(selector)[index]?.options ?? [])]
-        .find(option => option.textContent === label));
-      await setValue(selector, choice.value, 'change', index);
-    }
-    await selectTimerOption(0, data.secondClient);
-    await selectTimerOption(1, data.project);
-    await setValue(`${timer} .timer-description input`, data.interruptedDescription, 'input');
-    await click('start timer for forced interruption', () => pick(`${timer} .timer-start button`));
-    await waitForMeasurement();
-    if (historyRow(data.interruptedDescription)) fail('The active entry already appeared as completed work');
+    const settings = '[aria-label="Skrót klawiaturowy"]';
+    await setValue(`${settings} select`, 'Alt', 'change');
+    await setValue(`${settings} select`, 'F12', 'change', 1);
+    await click('save custom mini timer shortcut', () => textButton(settings, 'Zapisz skrót'));
+    await until('custom shortcut saved', () => pick(`${settings} [role="status"]`)?.textContent.includes('Ctrl + Alt + F12'));
   }
   return contribution.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
 }
@@ -268,6 +261,82 @@ async function verifySecondLaunch(primary, env) {
   assert.equal(primary.exitCode, null);
   assert.deepEqual(readInterruptedTimer(), original);
   console.log(`PASS: X hid the original window, second launch restored it, and active entry #${original.id} was unchanged`);
+}
+
+async function verifyMiniTimer(cdp, mainSession) {
+  const evaluate = async (session, expression) => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, session);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const findOtherWindow = async () => {
+    const { targetInfos } = await cdp.send('Target.getTargets');
+    return targetInfos.find(target => target.type === 'page' && target.targetId !== cdp.pageId &&
+      /^https?:\/\/tauri\.localhost(?::\d+)?\//.test(target.url));
+  };
+  const openWidget = async () => {
+    await evaluate(mainSession, 'document.querySelector(".widget-open").click()');
+    const target = await waitFor('native mini timer WebView2', findOtherWindow);
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
+    await waitFor('mini timer reads the configured shortcut', () => evaluate(sessionId,
+      'document.querySelector(".qp-toggle")?.title.includes("Ctrl + Alt + F12") ?? false'
+    ).catch(error => {
+      if (!/Execution context was destroyed|Cannot find context/i.test(error.message)) throw error;
+      return false;
+    }));
+    return sessionId;
+  };
+  const widget = await openWidget();
+  await evaluate(widget, 'document.querySelector("[aria-label=\"Rozwiń panel\"]").click()');
+  await waitFor('mini timer opens the focused project search', () => evaluate(widget,
+    'document.activeElement === document.querySelector("[role=\"combobox\"]")'));
+  await evaluate(widget, `(() => {
+    const input = document.activeElement;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(secondClient)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await waitFor('search returns the second client project only', () => evaluate(widget, `(() => {
+    const options = [...document.querySelectorAll('[role="option"]')];
+    return options.length === 1 && options[0].getAttribute('aria-label') === ${JSON.stringify(`Bez zadania — ${secondClient} / ${project}`)};
+  })()`));
+  const press = key => evaluate(widget, `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }))`);
+  await press('ArrowDown');
+  await waitFor('keyboard highlights the search result', () => evaluate(widget,
+    'Boolean(document.querySelector("[role=\"combobox\"]")?.getAttribute("aria-activedescendant"))'));
+  await press('Enter');
+  await waitFor('keyboard selection focuses the description', () => evaluate(widget, 'document.activeElement.id === "qp-description"'));
+  await evaluate(widget, `(() => {
+    const input = document.activeElement;
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, ${JSON.stringify(interruptedDescription)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const pin = '[aria-label="Przypięcie na wierzchu"]';
+  await waitFor('native pin preference is loaded', () => evaluate(widget,
+    `document.querySelector(${JSON.stringify(pin)})?.getAttribute('aria-disabled') === 'false'`));
+  await evaluate(widget, `document.querySelector(${JSON.stringify(pin)}).click()`);
+  await waitFor('pinning succeeds', () => evaluate(widget,
+    `document.querySelector(${JSON.stringify(pin)})?.getAttribute('aria-pressed') === 'true'`));
+  assert.equal(await readFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'widget-on-top.txt'), 'utf8'), 'true');
+  await evaluate(widget, 'document.querySelector(".qp-toggle").click()');
+  await waitFor('mini timer starts native measurement', () => evaluate(widget, `(() => {
+    const clock = document.querySelector('.qp-clock');
+    const elapsed = clock?.textContent.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
+    return document.querySelector('.qp-mini')?.dataset.mode === 'running' && elapsed >= 5;
+  })()`));
+  const started = readInterruptedTimer();
+  const close = session => evaluate(session, `document.querySelector('[aria-label="Zamknij mini timer"]').click()`)
+    .catch(error => { if (!/Execution context was destroyed|Target closed|Session with given id not found/i.test(error.message)) throw error; });
+  await close(widget);
+  await waitFor('mini timer closes without stopping the timer', async () => !(await findOtherWindow()));
+  const reopened = await openWidget();
+  await waitFor('native pin and running timer restore in the reopened mini timer', () => evaluate(reopened, `(
+    document.querySelector(${JSON.stringify(pin)})?.getAttribute('aria-pressed') === 'true'
+    && document.querySelector('.qp-mini')?.dataset.mode === 'running'
+  )`));
+  assert.deepEqual(readInterruptedTimer(), started);
+  await close(reopened);
+  await waitFor('reopened mini timer closes', async () => !(await findOtherWindow()));
+  console.log('PASS: native mini timer used the custom shortcut label, found the second client by keyboard, started its timer and restored the pin on reopening');
 }
 
 async function runWindow(port, phase, recovery) {
@@ -343,7 +412,10 @@ async function runWindow(port, phase, recovery) {
     } else {
       assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.csv')).length, 1);
     }
-    if (phase === 'interrupt') await verifySecondLaunch(child, env);
+    if (phase === 'interrupt') {
+      await verifyMiniTimer(cdp, sessionId);
+      await verifySecondLaunch(child, env);
+    }
     return seconds;
   } finally {
     cdp?.close();

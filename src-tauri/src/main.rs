@@ -455,6 +455,10 @@ fn exit_after_restore(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<()
     Ok(())
 }
 
+const WIDGET_WIDTH: f64 = 440.0;
+const WIDGET_COMPACT_HEIGHT: f64 = 76.0;
+const WIDGET_EXPANDED_HEIGHT: f64 = 390.0;
+
 #[tauri::command]
 async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
     if let Some(window) = app.get_webview_window("widget") {
@@ -464,7 +468,7 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
     } else {
         if let Ok(mut hotkey) = app.state::<Hotkey>().lock() { hotkey.widget_ready = false; }
         let window = tauri::WebviewWindowBuilder::new(&app, "widget", tauri::WebviewUrl::default())
-            .title("TrackerMaster — mini timer").inner_size(520.0, 76.0)
+            .title("TrackerMaster — mini timer").inner_size(WIDGET_WIDTH, WIDGET_COMPACT_HEIGHT)
             .decorations(false).resizable(false).build().map_err(|e| e.to_string())?;
         let position_path = app.path().app_data_dir().map_err(|e| e.to_string())?.join("widget-position.txt");
         if let Ok(saved) = std::fs::read_to_string(&position_path) {
@@ -494,7 +498,7 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
 #[tauri::command]
 async fn widget_panel(app: tauri::AppHandle, expanded: bool) -> Cmd<()> {
     let window = app.get_webview_window("widget").ok_or("Widget nie jest otwarty.")?;
-    let height = if expanded { 390.0 } else { 76.0 };
+    let height = if expanded { WIDGET_EXPANDED_HEIGHT } else { WIDGET_COMPACT_HEIGHT };
     if expanded {
         if let (Ok(Some(monitor)), Ok(position), Ok(scale)) = (window.current_monitor(), window.outer_position(), window.scale_factor()) {
             let bottom = i64::from(monitor.position().y) + i64::from(monitor.size().height);
@@ -505,7 +509,7 @@ async fn widget_panel(app: tauri::AppHandle, expanded: bool) -> Cmd<()> {
             }
         }
     }
-    window.set_size(tauri::LogicalSize::new(520.0, height)).map_err(|e| e.to_string())
+    window.set_size(tauri::LogicalSize::new(WIDGET_WIDTH, height)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

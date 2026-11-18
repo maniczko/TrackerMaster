@@ -1,151 +1,269 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { formatDuration, same } from './App';
 import type { Snapshot } from './App';
+import { MiniTimerTaskPicker, TimerIcon } from './MiniTimerPanel';
+import { activeContext, choicesFor, clockState, createRequestGate, descriptionCommand, projectPath, readLegacyPin, recentChoices, taskName, toggleCommand } from './miniTimerModel';
+import type { DescriptionDraft } from './miniTimerModel';
 import { defaultShortcut, matchesShortcut, shortcutLabel } from './shortcut';
+import './miniTimer.css';
 
-const taskCountLabel = (count: number) => count === 1 ? 'zadanie' : count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 12 || count % 100 > 14) ? 'zadania' : 'zadań';
+type ShortcutStatus = { registered: boolean; message: string; shortcut: string };
+type Notice = { text: string; tone: 'error' | 'warn' | 'quiet'; action?: string; run?: () => void };
 
 export default function Widget() {
   const [data, setData] = useState<Snapshot | null>(null);
+  const [loadedOnce, setLoadedOnce] = useState(false);
   const [selected, setSelected] = useState('');
   const [draft, setDraft] = useState('');
+  const [edit, setEdit] = useState<DescriptionDraft | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [verify, setVerify] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [windowError, setWindowError] = useState('');
   const [onTop, setOnTop] = useState(false);
   const [pinPending, setPinPending] = useState(true);
-  const [pinProblem, setPinProblem] = useState('');
-  const [shortcut, setShortcut] = useState({ registered: false, message: '', shortcut: defaultShortcut });
+  const [shortcut, setShortcut] = useState<ShortcutStatus | null>(null);
+  const [shortcutError, setShortcutError] = useState('');
   const [now, setNow] = useState(Date.now());
   const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const [cursor, setCursor] = useState(0);
-  const [collapsed, setCollapsed] = useState<string[]>([]);
+  const [panelPending, setPanelPending] = useState(false);
+  const [details, setDetails] = useState(false);
+  const gate = useRef(createRequestGate()).current;
+  const connecting = useRef(false);
   const search = useRef<HTMLInputElement>(null);
-  const toggleRef = useRef<() => Promise<void>>(async () => {});
-  const busyRef = useRef(false);
+  const description = useRef<HTMLTextAreaElement>(null);
+  const disclosure = useRef<HTMLButtonElement>(null);
+  const contextButton = useRef<HTMLButtonElement>(null);
+  const fullContext = useRef<HTMLDivElement>(null);
+  const returnFocus = useRef<'context' | 'disclosure' | null>(null);
+  const panelLock = useRef(false);
+  const pinLock = useRef(true);
+  const pinRestore = useRef<Promise<boolean> | null>(null);
+  const toggleRef = useRef<() => void>(() => {});
 
-  useEffect(() => {
-    let disposed = false;
-    let legacyOnTop: boolean | null = null;
+  const refresh = useCallback(async (afterWrite = false) => {
+    if ((gate.writing || connecting.current) && !afterWrite) return false;
+    const ticket = gate.beginRead();
+    connecting.current = true;
     try {
-      const value = localStorage.getItem('widget-on-top');
-      if (value === 'true' || value === 'false') legacyOnTop = value === 'true';
+      const next = await invoke<Snapshot>('get_snapshot');
+      if (gate.isCurrent(ticket)) { setData(next); setNow(Date.now()); }
+      return gate.isCurrent(ticket);
     } catch {
-      // The previous browser profile may be unavailable after reinstalling.
+      if (gate.isCurrent(ticket)) setData(null);
+      return false;
+    } finally {
+      connecting.current = false;
+      if (gate.isCurrent(ticket)) setLoadedOnce(true);
     }
-    void invoke<boolean>('restore_widget_on_top', { legacyOnTop })
-      .then(value => { if (!disposed) setOnTop(value); })
-      .catch(() => { if (!disposed) setPinProblem('Nie udało się przywrócić przypięcia okna.'); })
-      .finally(() => { if (!disposed) setPinPending(false); });
-    return () => { disposed = true; };
-  }, []);
-  const refresh = useCallback(async () => {
-    try { setData(await invoke<Snapshot>('get_snapshot')); setError(''); }
-    catch { setData(null); setError('Nie można odczytać danych. Otwórz aplikację i ponów próbę.'); }
-  }, []);
+  }, [gate]);
   useEffect(() => {
     void refresh();
     const clock = window.setInterval(() => setNow(Date.now()), 1000);
     const sync = window.setInterval(() => void refresh(), 2500);
-    return () => { window.clearInterval(clock); window.clearInterval(sync); };
+    const onFocus = () => { void refresh(); };
+    window.addEventListener('focus', onFocus);
+    return () => { window.clearInterval(clock); window.clearInterval(sync); window.removeEventListener('focus', onFocus); };
   }, [refresh]);
-  const choices = useMemo(() => (data?.projects ?? []).flatMap(project => {
-    const client = data?.clients.find(item => same(item.id, project.client_id));
-    if (project.archived || !client || client.archived) return [];
-    const tasks = (data?.tasks ?? []).filter(task => same(task.project_id, project.id) && !task.archived);
-    return [{ task: null, project, client, key: `project:${project.id}` }, ...tasks.map(task => ({ task, project, client, key: `task:${task.id}` }))];
-  }), [data]);
-  const latest = data?.active ?? data?.entries[0];
-  const latestKey = latest ? (latest.task_id === null ? `project:${latest.project_id}` : `task:${latest.task_id}`) : '';
-  const choiceKey = data?.active ? latestKey : selected || latestKey;
-  const choice = choices.find(item => item.key === choiceKey);
-  useEffect(() => { void invoke('set_shortcut_task', { projectId: choice ? Number(choice.project.id) : null, taskId: choice?.task ? Number(choice.task.id) : null }); }, [choice?.project.id, choice?.task?.id]);
-  useEffect(() => {
-    const check = () => { void invoke<{ registered: boolean; message: string; shortcut: string }>('shortcut_status').then(next => setShortcut({ ...next, shortcut: next.shortcut || defaultShortcut })).catch(() => {}); };
-    check(); const timer = window.setInterval(check, 1500); return () => window.clearInterval(timer);
-  }, []);
-  const elapsed = data?.active ? (now - new Date(data.active.started_at).getTime() - (data.active.excluded_sleep_ms ?? 0)) / 1000 : 0;
-  const filtered = choices.filter(({ task, project, client }) => `${task?.name ?? 'Bez zadania'} ${project.name} ${client.name}`.toLocaleLowerCase('pl').includes(query.trim().toLocaleLowerCase('pl')));
-  const groups = filtered.reduce<{ id: string; name: string; client: string; items: typeof choices }[]>((all, item) => {
-    let group = all.find(g => g.id === String(item.project.id));
-    if (!group) { group = { id: String(item.project.id), name: item.project.name, client: item.client.name, items: [] }; all.push(group); }
-    group.items.push(item); return all;
-  }, []);
-  const visible = groups.flatMap(group => collapsed.includes(group.id) ? [] : group.items);
 
-  const setPanel = useCallback(async (value: boolean) => {
-    try { await invoke('widget_panel', { expanded: value }); setOpen(value); if (value) { setQuery(''); setCursor(0); setCollapsed([]); } }
-    catch { setError('Nie udało się otworzyć panelu zadań.'); }
+  useEffect(() => {
+    let disposed = false;
+    pinRestore.current ??= invoke<boolean>('restore_widget_on_top', { legacyOnTop: readLegacyPin() });
+    void pinRestore.current.then(pinned => { if (!disposed) setOnTop(pinned); })
+      .catch(() => { if (!disposed) setWindowError('Nie przywrócono przypięcia.'); })
+      .finally(() => { if (!disposed) { pinLock.current = false; setPinPending(false); } });
+    return () => { disposed = true; };
   }, []);
-  useEffect(() => { if (open) search.current?.focus(); }, [open]);
-  const toggle = useCallback(async () => {
-    if (busyRef.current || !data || data.active?.recovered || (!data.active && !choice)) return;
-    busyRef.current = true;
-    setBusy(true); setError('');
-    try {
-      if (data.active) await invoke('widget_stop', { entryId: Number(data.active.id) });
-      else { await invoke('widget_project_start', { projectId: Number(choice!.project.id), taskId: choice!.task ? Number(choice!.task.id) : null, description: draft }); setDraft(''); }
-      await refresh();
-    } catch (e) { await refresh(); setError(`Nie udało się wykonać operacji: ${String(e)}`); }
-    finally { busyRef.current = false; setBusy(false); }
-  }, [data, choice, draft, refresh]);
-  toggleRef.current = toggle;
+
+  const choices = useMemo(() => choicesFor(data), [data]);
+  const recent = useMemo(() => recentChoices(choices, data?.entries ?? []), [choices, data]);
+  const choice = selected ? choices.find(item => item.key === selected) : recent[0];
+  const active = data?.active ?? null;
+  const context = data && active ? activeContext(data, active) : { title: choice ? taskName(choice) : 'Wybierz projekt lub zadanie', path: choice ? projectPath(choice) : data ? 'Gotowy do nowego pomiaru' : 'Mini timer' };
+  const clock = clockState(data, now);
+  const retainedEdit = edit !== null && edit.entryId !== String(active?.id);
+  const dirtyEdit = edit !== null && edit.value !== edit.expected && !retainedEdit;
+  const conflict = dirtyEdit && edit !== null && active?.description !== edit.expected;
+  const command = toggleCommand(clock.mode, active, choice, draft);
+  const controlsLocked = !data || busy || verify || clock.mode === 'recovered' || clock.mode === 'unavailable';
+  const shortcutChoice = active ? choices.find(item => String(item.project.id) === String(active.project_id) && (item.task === null ? active.task_id === null : String(item.task.id) === String(active.task_id))) : choice;
+  const shortcutProjectId = shortcutChoice?.project.id;
+  const shortcutTaskId = shortcutChoice?.task?.id;
+  useEffect(() => {
+    void invoke('set_shortcut_task', { projectId: shortcutProjectId == null ? null : Number(shortcutProjectId), taskId: shortcutTaskId == null ? null : Number(shortcutTaskId) })
+      .catch(() => setShortcutError('Nie zapisano wyboru dla skrótu.'));
+  }, [shortcutProjectId, shortcutTaskId]);
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listen('tracker-shortcut', () => { void toggleRef.current(); }).then(async remove => {
+    const check = () => { void invoke<ShortcutStatus>('shortcut_status').then(next => { if (!disposed) setShortcut(next); }).catch(() => {}); };
+    check();
+    const poll = window.setInterval(check, 1500);
+    void listen('tracker-shortcut', () => toggleRef.current()).then(async remove => {
       if (disposed) { remove(); return; }
       unlisten = remove;
       await invoke('widget_shortcut_ready');
-    }).catch(() => { if (!disposed) setError('Nie udało się przygotować skrótu w mini timerze. Użyj przycisku Start / Stop.'); });
-    return () => { disposed = true; unlisten?.(); };
+      check();
+    }).catch(() => { if (!disposed) setShortcutError('Skrót nie jest gotowy. Użyj Start / Stop.'); });
+    return () => { disposed = true; unlisten?.(); window.clearInterval(poll); };
   }, []);
-  useEffect(() => {
-    const handleKey = (event: KeyboardEvent) => {
-      if (!shortcut.registered && matchesShortcut(event, shortcut.shortcut)) {
-        event.preventDefault();
-        void invoke<{ registered: boolean; message: string; shortcut: string }>('shortcut_status').then(next => {
-          setShortcut({ ...next, shortcut: next.shortcut || defaultShortcut });
-          if (!next.registered && next.shortcut === shortcut.shortcut) void toggleRef.current();
-        }).catch(() => setError('Nie udało się sprawdzić skrótu. Użyj przycisku Start / Stop.'));
-      }
-      if (event.key === 'Escape' && open) { event.preventDefault(); void setPanel(false); }
-    };
-    window.addEventListener('keydown', handleKey); return () => window.removeEventListener('keydown', handleKey);
-  }, [toggle, open, setPanel, shortcut.registered, shortcut.shortcut]);
-  async function changePin() {
-    setPinPending(true);
+
+  async function write(name: string, args: Record<string, unknown>, nextSnapshot: boolean, landed?: () => void) {
+    if (!gate.beginWrite()) return;
+    setBusy(true); setNotice(''); setWindowError('');
     try {
-      await invoke('set_widget_on_top', { onTop: !onTop });
-      setOnTop(!onTop);
-      setPinProblem('');
-    } catch { setPinProblem('Nie udało się zmienić przypięcia okna.'); }
-    finally { setPinPending(false); }
+      const next = await invoke<Snapshot>(name, args);
+      landed?.();
+      if (nextSnapshot) { setData(next); setNow(Date.now()); }
+      else if (!await refresh(true)) { setNotice('Zapis potwierdzony. Ponów odczyt.'); return; }
+      setNotice(name === 'widget_project_start' ? '' : 'Zapisano.');
+    } catch {
+      setVerify(true);
+      await refresh(true);
+    } finally { gate.endWrite(); setBusy(false); }
   }
-  function selectTask(key: string) { setSelected(key); void setPanel(false); }
-  const showApp = () => invoke('show_main').catch(() => setError('Nie udało się otworzyć aplikacji.'));
-  return <main className="mini-shell">
-    <div className="mini-bar">
-      <button className="mini-drag" title="Przeciągnij widget" aria-label="Przeciągnij widget" onMouseDown={e => { if (e.button === 0) void invoke('widget_drag'); }}>⠿</button>
-      <div className="mini-details">
-        <input className="mini-title mini-description" aria-label="Opis pomiaru" placeholder="Nad czym pracujesz?" maxLength={2000} value={data?.active ? data.active.description : draft} readOnly={!!data?.active} disabled={!data || busy} onChange={e => setDraft(e.target.value)} title={data?.active ? 'Opis zmienisz w pełnej aplikacji' : 'Opcjonalny opis pomiaru'} />
-        <button className="mini-project" disabled={!data || !!data.active} onClick={() => void setPanel(!open)} aria-expanded={open} title={data?.active ? 'Zatrzymaj pomiar, aby zmienić zadanie' : choice ? `${choice.client.name} / ${choice.project.name}` : 'Wybierz projekt lub zadanie'}><span className="mini-plus">＋</span><span>{choice ? `${choice.client.name} / ${choice.project.name}` : 'Projekt lub zadanie'}</span></button>
+  toggleRef.current = () => {
+    if (controlsLocked || !command || dirtyEdit) return;
+    void write(command.name, command.args, true, command.name === 'widget_project_start' ? () => setDraft('') : undefined);
+  };
+  async function checkState() {
+    if (await refresh()) setVerify(false);
+  }
+  useEffect(() => {
+    if (!notice) return;
+    const timeout = window.setTimeout(() => setNotice(''), 2600);
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
+
+  const setPanel = useCallback(async (expanded: boolean, from: 'context' | 'disclosure' = 'disclosure') => {
+    if (panelLock.current) return;
+    if (expanded === open) {
+      if (expanded && from === 'context') { setDetails(true); fullContext.current?.focus(); }
+      return;
+    }
+    panelLock.current = true; setPanelPending(true); setWindowError('');
+    try {
+      await invoke('widget_panel', { expanded });
+      if (expanded) { returnFocus.current = from; setDetails(from === 'context'); }
+      setOpen(expanded);
+    } catch { setWindowError('Nie zmieniono rozmiaru okna.'); }
+    finally { panelLock.current = false; setPanelPending(false); }
+  }, [open]);
+  useEffect(() => {
+    if (open) {
+      if (returnFocus.current === 'context') fullContext.current?.focus();
+      else (search.current && !search.current.disabled ? search.current : fullContext.current)?.focus();
+    } else if (returnFocus.current) {
+      (returnFocus.current === 'context' ? contextButton : disclosure).current?.focus();
+      returnFocus.current = null;
+    }
+  }, [open]);
+  useEffect(() => { if (open && details) fullContext.current?.focus(); }, [open, details]);
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.defaultPrevented || event.isComposing || event.repeat) return;
+      if (event.key === 'Escape' && open) { event.preventDefault(); void setPanel(false); }
+      if (shortcut?.registered === false && matchesShortcut(event, shortcut.shortcut)) {
+        event.preventDefault();
+        void invoke<ShortcutStatus>('shortcut_status').then(next => {
+          setShortcut(next);
+          if (!next.registered && next.shortcut === shortcut.shortcut) toggleRef.current();
+        }).catch(() => setShortcutError('Nie udało się sprawdzić skrótu. Użyj Start / Stop.'));
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, setPanel, shortcut]);
+
+  async function changePin() {
+    if (pinLock.current) return;
+    pinLock.current = true; setPinPending(true); setWindowError('');
+    try {
+      const next = !onTop;
+      await invoke('set_widget_on_top', { onTop: next });
+      setOnTop(next);
+    } catch { setWindowError('Nie zmieniono przypięcia.'); }
+    finally { pinLock.current = false; setPinPending(false); }
+  }
+  const showApp = () => { void invoke('show_main').catch(() => setWindowError('Nie otwarto aplikacji.')); };
+  const close = () => { if (!gate.writing) void invoke('close_widget').catch(() => setWindowError('Nie zamknięto mini timera.')); };
+  const saveDescription = () => {
+    const change = descriptionCommand(active, edit);
+    if (change && !controlsLocked) void write(change.name, change.args, false, () => setEdit(null));
+  };
+  const cancelEdit = () => setEdit(null);
+  const selectedChoice = (key: string) => {
+    if (gate.writing || controlsLocked || active || !choices.some(item => item.key === key)) return;
+    setSelected(key);
+    description.current?.focus();
+  };
+
+  let status: Notice | undefined;
+  if (busy) status = { text: 'Zapisywanie…', tone: 'quiet' };
+  else if (clock.mode === 'recovered') status = { text: 'Czas wymaga weryfikacji', tone: 'warn', action: 'Rozstrzygnij czas', run: showApp };
+  else if (!data) status = loadedOnce ? { text: 'Brak odczytu danych', tone: 'error', action: 'Ponów odczyt', run: () => void checkState() } : { text: 'Łączenie z aplikacją…', tone: 'quiet' };
+  else if (verify) status = { text: 'Nie potwierdzono zapisu', tone: 'error', action: 'Sprawdź stan', run: () => void checkState() };
+  else if (clock.mode === 'unavailable') status = { text: 'Czas jest niedostępny', tone: 'warn', action: 'Otwórz aplikację', run: showApp };
+  else if (dirtyEdit) status = { text: conflict ? 'Opis zmieniono w innym oknie' : 'Niezapisany opis', tone: 'warn', action: open ? undefined : 'Pokaż opis', run: () => void setPanel(true) };
+  else if (windowError || shortcutError || shortcut?.message) status = { text: windowError || shortcutError || shortcut!.message, tone: 'error' };
+  else if (notice) status = { text: notice, tone: 'quiet' };
+  const toggleLabel = active ? 'Zatrzymaj pomiar' : 'Rozpocznij pomiar';
+  const pinLabel = onTop ? 'Odepnij od wierzchu' : 'Przypnij na wierzchu';
+  const expandLabel = open ? 'Zwiń panel' : 'Rozwiń panel';
+
+  return <main className="qp-mini" data-mode={clock.mode} aria-label="TrackerMaster – mini timer">
+    <header className="qp-bar">
+      <span className="qp-grip" title="Przeciągnij okno" aria-hidden="true" onMouseDown={event => { if (event.button === 0) void invoke('widget_drag').catch(() => setWindowError('Nie przesunięto mini timera.')); }}><TimerIcon name="grip" /></span>
+      <button type="button" className={`qp-toggle${clock.mode === 'running' ? ' qp-running' : ''}`} aria-label={toggleLabel} title={`${toggleLabel} · ${shortcutLabel(shortcut?.shortcut || defaultShortcut)}${shortcut?.registered ? ' (globalnie)' : ' (w tym oknie)'}`} aria-disabled={controlsLocked || !command || dirtyEdit} onClick={() => toggleRef.current()}><TimerIcon name={active ? 'stop' : 'play'} /></button>
+      <span className="qp-clock" title={clock.mode === 'running' ? 'Orientacyjny czas pomiaru' : 'Czas pomiaru'} aria-live="off">{clock.text}</span>
+      <button type="button" ref={contextButton} className="qp-context" title={`${context.title} — ${context.path}`} aria-label={`${context.title} — ${context.path}. Pokaż pełne informacje`} aria-expanded={open && details} aria-controls={open ? 'qp-panel' : undefined} onClick={() => void setPanel(true, 'context')}>
+        <strong>{context.title}</strong><small>{context.path}</small>
+      </button>
+      <div className="qp-tools">
+        <button type="button" className="qp-icon" aria-label="Przypięcie na wierzchu" aria-pressed={onTop} title={pinLabel} aria-disabled={pinPending} onClick={() => void changePin()}><TimerIcon name="pin" /></button>
+        <button type="button" className="qp-icon" ref={disclosure} aria-label={expandLabel} title={expandLabel} aria-expanded={open} aria-controls={open ? 'qp-panel' : undefined} aria-disabled={panelPending} onClick={() => void setPanel(!open)}><TimerIcon name={open ? 'collapse' : 'expand'} /></button>
+        <button type="button" className="qp-icon" aria-label="Zamknij mini timer" title="Zamknij mini timer (pomiar trwa dalej)" aria-disabled={busy} onClick={close}><TimerIcon name="close" /></button>
       </div>
-      <span className="mini-time" title={data?.active?.recovered || data?.active?.uncertain ? 'Pomiar wymaga weryfikacji w aplikacji' : 'Czas bieżącego pomiaru'}>{!data || data.active?.recovered || data.active?.uncertain ? '—:—:—' : formatDuration(Number.isFinite(elapsed) ? elapsed : 0)}</span>
-      <button className={`mini-play ${data?.active ? 'is-running' : ''}`} aria-label={data?.active ? 'Zatrzymaj pomiar' : 'Rozpocznij pomiar'} title={`Start / stop · ${shortcutLabel(shortcut.shortcut)} ${shortcut.registered ? 'globalnie' : 'w tym oknie'}`} disabled={busy || !data || !!data.active?.recovered || (!data.active && !choice)} onClick={() => void toggle()}>{data?.active ? <span className="mini-stop-icon" /> : <span className="mini-play-icon" />}</button>
-      <button className="mini-icon mini-expand" onClick={showApp} title="Otwórz pełną aplikację" aria-label="Otwórz pełną aplikację">⤢</button>
-      <button className="mini-close" onClick={() => invoke('close_widget')} title="Zamknij widget" aria-label="Zamknij widget">×</button>
-    </div>
-    {open && <section className="mini-panel" aria-label="Wybór zadania">
-      <div className="mini-search-row"><div className="mini-search"><span aria-hidden="true">⌕</span><input ref={search} value={query} placeholder="Szukaj projektu, zadania lub klienta" aria-label="Szukaj projektu, zadania lub klienta" onChange={e => { setQuery(e.target.value); setCursor(0); }} onKeyDown={e => {
-        if (e.key === 'ArrowDown') { e.preventDefault(); setCursor(Math.min(cursor + 1, visible.length - 1)); }
-        if (e.key === 'ArrowUp') { e.preventDefault(); setCursor(Math.max(cursor - 1, 0)); }
-        if (e.key === 'Enter' && visible[cursor]) { e.preventDefault(); selectTask(visible[cursor].key); }
-      }}/></div><button className={`mini-pin ${onTop ? 'is-pinned' : ''}`} onClick={() => void changePin()} disabled={pinPending} aria-pressed={onTop} title={onTop ? 'Odepnij od wierzchu' : 'Przypnij na wierzchu'} aria-label={onTop ? 'Odepnij od wierzchu' : 'Przypnij na wierzchu'}><svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><path d="M16 3c-.4 0-.8.2-1 .5l-1 1-3.9-.4-.9.9 2 3.1-4.1 4.1-2.8-.2-.8.8 4.1 4.1-4.3 4.3.7.7 4.3-4.3 4.1 4.1.8-.8-.2-2.8 4.1-4.1 3.1 2 .9-.9-.4-3.9 1-1a1.4 1.4 0 0 0 0-2l-2.7-2.7a1.4 1.4 0 0 0-1-.4Z"/></svg></button></div>
-      <div className="mini-results">{groups.length === 0 ? <div className="mini-empty">{choices.length ? 'Brak pasujących zadań.' : 'Brak projektów. Dodaj klienta i projekt w aplikacji.'} <button onClick={showApp}>Otwórz aplikację</button></div> : groups.map(group => <div key={group.id} className="mini-group"><button className="mini-group-header" aria-expanded={!collapsed.includes(group.id)} onClick={() => { setCollapsed(current => current.includes(group.id) ? current.filter(id => id !== group.id) : [...current, group.id]); setCursor(0); }}><svg className="mini-folder" aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2 6a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v1H2V6Zm0 5h20v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-7Z"/></svg><span className="mini-group-name">{group.name} <small>· {group.client}</small></span><small>{group.items.filter(item => item.task).length} {taskCountLabel(group.items.filter(item => item.task).length)}</small><span>{collapsed.includes(group.id) ? '⌄' : '⌃'}</span></button>{!collapsed.includes(group.id) && group.items.map(item => { const index = visible.findIndex(v => v.key === item.key); return <button key={item.key} className={`mini-result ${index === cursor ? 'highlighted' : ''}`} onMouseEnter={() => setCursor(index)} onClick={() => selectTask(item.key)}>{item.task?.name ?? 'Bez zadania'}</button>; })}</div>)}</div>
+    </header>
+    {status && <div className="qp-status" data-tone={status.tone}>
+      <span role={status.tone === 'quiet' ? 'status' : 'alert'} title={status.text}>{status.text}</span>
+      {status.action && <button type="button" className="qp-text-button" onClick={status.run}>{status.action}</button>}
+    </div>}
+    {open && <section id="qp-panel" className="qp-panel" aria-label="Panel mini timera">
+      <div className="qp-panel-header"><strong>{active ? 'Bieżący pomiar' : 'Nowy pomiar'}</strong><button type="button" className="qp-text-button" onClick={showApp}>Otwórz aplikację</button></div>
+      <div className="qp-full" ref={fullContext} tabIndex={-1} aria-label="Pełny kontekst pomiaru">
+        {details && <><strong>{context.title}</strong><span>{context.path}</span></>}
+        {active && <p className="qp-hint">Klient, projekt i zadanie pozostają bez zmian podczas pomiaru.</p>}
+        {clock.mode === 'recovered' && <p className="qp-hint">Mini timer nie wylicza czasu z nierozstrzygniętej przerwy. Sprawdź zakończenie pomiaru w aplikacji.</p>}
+        {!data && <p className="qp-hint">Dane pojawią się po połączeniu z aplikacją. Szkic nie został usunięty.</p>}
+        {verify && !!data && clock.mode !== 'recovered' && <p className="qp-hint">Przed kolejną zmianą sprawdź aktualny stan. Nie ponawiamy zapisu automatycznie.</p>}
+        {(windowError || shortcutError || shortcut?.message) && <p className="qp-hint">{windowError || shortcutError || shortcut!.message}</p>}
+      </div>
+      {retainedEdit && <div className="qp-lost-edit"><label className="qp-field-label" htmlFor="qp-retained">Zachowany szkic opisu poprzedniego wpisu</label><textarea id="qp-retained" readOnly value={edit.value} rows={2} /><button type="button" className="qp-text-button" onClick={cancelEdit}>Usuń szkic z mini timera</button></div>}
+      {!active && <MiniTimerTaskPicker input={search} choices={choices} recent={recent} selected={choice?.key} disabled={controlsLocked} onSelect={selectedChoice} />}
+      <div className="qp-fields">
+        <label className="qp-field-label" htmlFor="qp-description">{active ? 'Opis pomiaru' : 'Opis nowego pomiaru (opcjonalnie)'}</label>
+        <textarea id="qp-description" ref={description} rows={2} maxLength={2000} value={active ? (!retainedEdit && edit ? edit.value : active.description) : draft} readOnly={controlsLocked || (!!active && retainedEdit)} placeholder="Nad czym pracujesz?" onChange={event => {
+          const value = event.target.value;
+          if (active) setEdit(current => {
+            const entryId = String(active.id);
+            const expected = current?.entryId === entryId ? current.expected : active.description;
+            return value === expected ? null : { entryId, expected, value };
+          });
+          else setDraft(value);
+        }} />
+        {conflict && <p className="qp-hint qp-current">Aktualnie zapisany opis: {active!.description || '(brak opisu)'}</p>}
+        {dirtyEdit && <div className="qp-field-actions">
+          {!conflict && <button type="button" className="qp-save" disabled={controlsLocked} onClick={saveDescription}>Zapisz opis</button>}
+          {conflict && <button type="button" className="qp-save" disabled={controlsLocked} onClick={() => setEdit(edit!.value === active!.description ? null : { ...edit!, expected: active!.description })}>Użyj aktualnego opisu jako podstawy</button>}
+          <button type="button" className="qp-text-button" disabled={busy} onClick={cancelEdit}>Odrzuć szkic</button>
+        </div>}
+        {active && <label className="qp-billing"><input type="checkbox" checked={active.billable} disabled={controlsLocked} onChange={event => {
+          if (!controlsLocked) void write('set_entry_billable', { entryId: Number(active.id), expected: active.billable, billable: event.target.checked }, false);
+        }} /> Rozliczalny</label>}
+        {!active && choice && <p className="qp-hint">Nowy pomiar będzie {choice.project.billable ? 'rozliczalny' : 'nierozliczalny'} (ustawienie projektu).</p>}
+      </div>
     </section>}
-    {(error || data?.active?.recovered || data?.active?.uncertain || pinProblem || shortcut.message) && <div className="mini-problem" role="alert" onClick={showApp}>{error || (data?.active?.recovered || data?.active?.uncertain ? 'Pomiar wymaga weryfikacji. Otwórz aplikację.' : pinProblem || shortcut.message)}</div>}
   </main>;
 }
