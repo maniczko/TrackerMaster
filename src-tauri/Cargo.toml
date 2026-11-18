@@ -13,3 +13,7 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 tauri-plugin-global-shortcut = "2"
+
+[target.'cfg(windows)'.dependencies]
+sha2 = "0.10"
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_System_Threading"] }

@@ -7,6 +7,8 @@ mod optional_task_migration;
 mod ui_preferences;
 mod entry_drafts;
 mod editor_close;
+#[cfg(windows)]
+mod instance_activation;
 
 const LATEST_SCHEMA_VERSION: i64 = 13;
 
@@ -1382,18 +1384,22 @@ fn main() {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             #[cfg(windows)]
-            {
-                let guard = lock_instance(&dir).map_err(|err| {
-                    let message = if err.raw_os_error() == Some(32) {
-                        "TrackerMaster jest już uruchomiony. Otwórz jego istniejące okno."
+            let activation = match instance_activation::start(&dir) {
+                Ok(instance_activation::Startup::Primary { guard, activation }) => {
+                    app.manage(guard);
+                    activation
+                }
+                Ok(instance_activation::Startup::Activated) => std::process::exit(0),
+                Err(err) => {
+                    let message = if err.raw_os_error() == Some(instance_activation::SHARING_VIOLATION) {
+                        "TrackerMaster jest już uruchomiony. Otwórz jego okno z ikony w zasobniku systemowym."
                     } else {
                         "Nie można zabezpieczyć dostępu do danych. Sprawdź uprawnienia katalogu aplikacji."
                     };
                     show_start_error(message);
-                    err
-                })?;
-                app.manage(guard);
-            }
+                    return Err(err.into());
+                }
+            };
             let database_path = dir.join("tracker.sqlite3");
             let existing_database = database_path.exists();
             storage_safety::preflight_existing(&database_path).map_err(|err| {
@@ -1449,6 +1455,8 @@ fn main() {
                 }).build(app)?;
             let window_config = app.config().app.windows.first().ok_or("Brak konfiguracji okna aplikacji")?;
             tauri::WebviewWindowBuilder::from_config(app, window_config)?.build()?;
+            #[cfg(windows)]
+            activation.listen(app.handle().clone())?;
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -239,12 +239,44 @@ async function exercisePage(data, phase) {
   return contribution.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
 }
 
+function inspectWindow(action, primaryPid, windowHandle = '0') {
+  return execFileSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-File', 'tests/windows-window.ps1', action, String(primaryPid), windowHandle,
+  ], { encoding: 'utf8', timeout: 10_000, windowsHide: true }).trim();
+}
+
+async function verifySecondLaunch(primary, env) {
+  const original = readInterruptedTimer();
+  const window = await waitFor('native main window', () => inspectWindow('Find', primary.pid) || null);
+  assert.equal(inspectWindow('Close', primary.pid, window), 'posted');
+  await waitFor('X hides the existing window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
+  assert.deepEqual(readInterruptedTimer(), original);
+
+  const secondary = spawn(exe, [], { env, stdio: 'ignore', windowsHide: true });
+  try {
+    const exit = await once(secondary, 'exit', { signal: AbortSignal.timeout(12_000) });
+    assert.deepEqual(exit, [0, null], 'The second launch should activate the first process and exit');
+  } finally {
+    if (secondary.pid && secondary.exitCode === null && secondary.signalCode === null) {
+      const stopped = once(secondary, 'exit');
+      secondary.kill();
+      await stopped;
+    }
+  }
+  await waitFor('second launch restores the original window', () =>
+    inspectWindow('Visibility', primary.pid, window) === 'visible');
+  assert.equal(primary.exitCode, null);
+  assert.deepEqual(readInterruptedTimer(), original);
+  console.log(`PASS: X hid the original window, second launch restored it, and active entry #${original.id} was unchanged`);
+}
+
 async function runWindow(port, phase, recovery) {
+  const env = {
+    ...process.env,
+    WEBVIEW2_USER_DATA_FOLDER: await mkdtemp(join(temp, 'profile-')),
+  };
   const child = spawn(exe, [], {
-    env: {
-      ...process.env,
-      WEBVIEW2_USER_DATA_FOLDER: await mkdtemp(join(temp, 'profile-')),
-    },
+    env,
     stdio: 'ignore',
     windowsHide: true,
   });
@@ -311,6 +343,7 @@ async function runWindow(port, phase, recovery) {
     } else {
       assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.csv')).length, 1);
     }
+    if (phase === 'interrupt') await verifySecondLaunch(child, env);
     return seconds;
   } finally {
     cdp?.close();
