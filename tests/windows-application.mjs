@@ -186,12 +186,12 @@ async function exercisePage(data, restarted) {
     await click('prepare CSV', () => textButton(report, 'Przygotuj podgląd CSV'));
     await until('client CSV preview', () => pick('.export-preview tbody')?.textContent.includes(data.primaryDescription));
     if (pick('.export-preview tbody').rows.length !== 1) fail('CSV preview returned a foreign entry');
-    await click('confirm CSV download', () => textButton(report, 'Potwierdź i pobierz CSV'));
   }
   return contribution.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
 }
 
 async function runWindow(port, restarted) {
+  const phase = restarted ? 'Restarted window' : 'First window';
   const child = spawn(exe, [], {
     env: {
       ...process.env,
@@ -205,6 +205,19 @@ async function runWindow(port, restarted) {
     await once(child, 'spawn');
     cdp = await connect(port, child);
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: cdp.pageId, flatten: true });
+    await waitFor(`${phase}: rendered and ready`, async () => {
+      const ready = await cdp.send('Runtime.evaluate', {
+        expression: `document.readyState === 'complete'
+          && !!document.querySelector('[role="note"]')?.textContent.includes('Wersja testowa.')
+          && document.querySelector('#new-client')?.disabled === false`,
+        returnByValue: true,
+      }, sessionId).catch(error => {
+        if (!/Execution context was destroyed|Cannot find context/i.test(error.message)) throw error;
+        return null;
+      });
+      return ready?.result.value === true;
+    });
+    console.log(`${phase}: connected to the test app`);
     if (!restarted) await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory });
     const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription };
     const result = await cdp.send('Runtime.evaluate', {
@@ -215,8 +228,24 @@ async function runWindow(port, restarted) {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
     const seconds = result.result.value;
     assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
+    console.log(`${phase}: report matched the selected client (${seconds} s)`);
     await access(testDb);
     if (!restarted) {
+      const download = await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          const button = [...document.querySelectorAll('.export-preview button')].find(item => item.textContent === 'Potwierdź i pobierz CSV');
+          if (!button || button.disabled) return false;
+          button.click();
+          return true;
+        })()`,
+        userGesture: true,
+        returnByValue: true,
+      }, sessionId).catch(error => {
+        // A download can dispose of the page context. Check the file, without clicking again.
+        if (!/Execution context was destroyed/i.test(error.message)) throw error;
+        return null;
+      });
+      if (download) assert.equal(download.result.value, true, 'CSV confirmation disappeared before download');
       const file = await waitFor('completed CSV file', async () => (await readdir(csvDirectory)).find(name => name.endsWith('.csv')));
       const bytes = await readFile(join(csvDirectory, file));
       assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
@@ -225,6 +254,7 @@ async function runWindow(port, restarted) {
       assert.ok(rows[1].includes(primaryClient) && rows[1].includes(primaryDescription));
       assert.ok(!rows[1].includes(secondClient) && !rows[1].includes(secondDescription));
       assert.equal(Number(rows[1].split(';')[10].replaceAll('"', '')), seconds);
+      console.log('First window: downloaded CSV matched Report Details');
     } else {
       assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.csv')).length, 1);
     }
@@ -259,6 +289,16 @@ registry('add', ['/t', 'REG_SZ', '/d', `--remote-debugging-port=${port} --remote
 let seconds;
 try {
   seconds = await runWindow(port, false);
+  await waitFor('first WebView2 instance stopped', async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1_000) });
+      const pages = await response.json();
+      return Array.isArray(pages) && pages.every(page => page.type !== 'page');
+    } catch (error) {
+      if (error.cause?.code === 'ECONNREFUSED') return true;
+      return false;
+    }
+  });
   assert.equal(await runWindow(port, true), seconds);
 } finally {
   registry('delete', ['/f']);
