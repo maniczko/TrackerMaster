@@ -67,3 +67,16 @@ jobs:
           path: src-tauri/target/release/tracker-master.exe
           if-no-files-found: error
           retention-days: 7
+      - name: Build unsigned test MSIX
+        shell: pwsh
+        run: >
+          ./packaging/msix/New-TestMsix.ps1
+          -Executable ./src-tauri/target/release/tracker-master.exe
+          -Output ./TrackerMaster-test-x64.msix
+      - name: Save unsigned test MSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackerMaster-Windows-isolated-test-msix-unsigned
+          path: TrackerMaster-test-x64.msix
+          if-no-files-found: error
+          retention-days: 7
