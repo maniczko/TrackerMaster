@@ -161,7 +161,16 @@ export default function App() {
     try {
       const safetyPath = await invoke<string>('apply_backup_restore', { token: restorePreview.token, confirmed: true });
       setRestoreDone(safetyPath); setRestorePreview(null); setRestoreConfirmed(false);
-    } catch (e) { setRestorePreview(null); setRestoreConfirmed(false); setError(`${String(e)} Sprawdź kopię ponownie przed kolejną próbą.`); }
+    } catch (e) {
+      const message = String(e);
+      setRestoreConfirmed(false);
+      if (message === 'Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.') {
+        setError(message);
+      } else {
+        setRestorePreview(null);
+        setError(`${message} Sprawdź kopię ponownie przed kolejną próbą.`);
+      }
+    }
     finally { setBusy(false); }
   }
   const create = (kind: 'client' | 'project' | 'task') => async (event: FormEvent) => {
