@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { access, mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -7,10 +7,10 @@ import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 
-// This test launches the compiled test build in a fresh hosted Windows profile.
-// The WebView2 debugging option is scoped to that child process.
+// Registry settings are temporary, scoped to the test executable on a disposable runner.
 assert.equal(process.platform, 'win32');
 assert.equal(process.env.GITHUB_ACTIONS, 'true');
+assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 assert.ok(process.env.RUNNER_TEMP && process.env.APPDATA);
 const exe = resolve('src-tauri/target/release/tracker-master.exe');
 const testDb = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'tracker.sqlite3');
@@ -24,6 +24,7 @@ const csvDirectory = await mkdtemp(join(temp, 'download-'));
 const primaryClient = 'Klient Żuraw QA';
 const secondClient = 'Klient Beta QA';
 const project = 'Projekt kontrolny';
+const task = 'Zadanie QA';
 const primaryDescription = 'Pomiar klienta Żuraw';
 const secondDescription = 'Pomiar wyłącznie klienta Beta';
 
@@ -47,18 +48,21 @@ async function waitFor(label, operation) {
 }
 
 async function connect(port, child) {
+  let lastObservation = 'No response received';
   const endpoints = await waitFor('TrackerMaster WebView2 endpoints', async () => {
-    assert.equal(child.exitCode, null, 'TrackerMaster exited before its window was available');
+    assert.equal(child.exitCode ?? child.signalCode, null, 'TrackerMaster exited before its window was available');
     try {
       const base = `http://127.0.0.1:${port}/json`;
       const json = name => fetch(`${base}/${name}`, { signal: AbortSignal.timeout(1_000), redirect: 'error' }).then(r => r.json());
       const [browser, pages] = await Promise.all([json('version'), json('list')]);
-      const page = pages.find(target => target.type === 'page' && /^https?:\/\/tauri\.localhost\//.test(target.url));
+      const page = pages.find(target => target.type === 'page' && /^https?:\/\/tauri\.localhost(?::\d+)?(?:\/|$)/.test(target.url));
+      lastObservation = `${browser.Browser ?? 'WebView2'} responded with ${pages.length} targets, isolated page found: ${Boolean(page)}`;
       return browser.webSocketDebuggerUrl && page ? { browser: browser.webSocketDebuggerUrl, id: page.id } : null;
-    } catch {
+    } catch (error) {
+      lastObservation = `${error.name}: ${error.cause?.code ?? error.message}`;
       return null;
     }
-  });
+  }).catch(error => { throw new Error(`${error.message}. Last observation: ${lastObservation}`); });
   const endpoint = new URL(endpoints.browser);
   assert.equal(endpoint.protocol, 'ws:');
   assert.ok(['127.0.0.1', 'localhost'].includes(endpoint.hostname));
@@ -140,20 +144,21 @@ async function exercisePage(data, restarted) {
       await click(`create ${kind}`, () => pick(input)?.form?.querySelector('button'));
       await until(`selected ${kind} ${name}`, () => selected(document.querySelectorAll(`${timer} select`)[selectedIndex]) === name);
     }
-    async function measure(client, description) {
+    async function measure(client, description, taskName) {
       await create('client', client, 0);
       await create('project', data.project, 1);
+      if (taskName) await create('task', taskName, 2);
       await setValue(`${timer} .timer-description input`, description, 'input');
       await click('start timer', () => pick(`${timer} .timer-start button`));
       await until('running timer', () => pick(`${timer} .status.running`));
-      await until('at least two measured seconds', () => {
+      await until('at least five measured seconds', () => {
         const digits = pick(`${timer} .clock`).textContent.split(':').map(Number);
-        return digits.length === 3 && digits.reduce((seconds, field) => seconds * 60 + field, 0) >= 2;
+        return digits.length === 3 && digits.reduce((seconds, field) => seconds * 60 + field, 0) >= 5;
       });
       await click('stop timer', () => pick(`${timer} .timer-stop button`));
       await until('completed entry in History', () => [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(description)));
     }
-    await measure(data.primaryClient, data.primaryDescription);
+    await measure(data.primaryClient, data.primaryDescription, data.task);
     await measure(data.secondClient, data.secondDescription);
   }
 
@@ -175,20 +180,21 @@ async function exercisePage(data, restarted) {
   await until('client A entry in Detailed', () => pick('.report-detail tbody')?.textContent.includes(data.primaryDescription));
   const detailed = pick('.report-detail tbody');
   if (detailed.rows.length !== 1 || detailed.textContent.includes(data.secondDescription)) fail('Detailed report returned a foreign entry');
+  const contribution = detailed.querySelectorAll('.duration')[1]?.textContent.trim();
+  if (!/^\d{2,}:\d{2}:\d{2}$/.test(contribution)) fail('Missing detailed duration');
   if (!restarted) {
     await click('prepare CSV', () => textButton(report, 'Przygotuj podgląd CSV'));
     await until('client CSV preview', () => pick('.export-preview tbody')?.textContent.includes(data.primaryDescription));
     if (pick('.export-preview tbody').rows.length !== 1) fail('CSV preview returned a foreign entry');
     await click('confirm CSV download', () => textButton(report, 'Potwierdź i pobierz CSV'));
   }
+  return contribution.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
 }
 
-async function runWindow(restarted) {
-  const port = await availablePort();
+async function runWindow(port, restarted) {
   const child = spawn(exe, [], {
     env: {
       ...process.env,
-      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`,
       WEBVIEW2_USER_DATA_FOLDER: await mkdtemp(join(temp, 'profile-')),
     },
     stdio: 'ignore',
@@ -200,13 +206,15 @@ async function runWindow(restarted) {
     cdp = await connect(port, child);
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: cdp.pageId, flatten: true });
     if (!restarted) await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory });
-    const input = { primaryClient, secondClient, project, primaryDescription, secondDescription };
+    const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription };
     const result = await cdp.send('Runtime.evaluate', {
       expression: `(${exercisePage.toString()})(${JSON.stringify(input)}, ${restarted})`,
       awaitPromise: true,
       returnByValue: true,
     }, sessionId);
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    const seconds = result.result.value;
+    assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
     await access(testDb);
     if (!restarted) {
       const file = await waitFor('completed CSV file', async () => (await readdir(csvDirectory)).find(name => name.endsWith('.csv')));
@@ -216,13 +224,14 @@ async function runWindow(restarted) {
       assert.equal(rows.length, 2);
       assert.ok(rows[1].includes(primaryClient) && rows[1].includes(primaryDescription));
       assert.ok(!rows[1].includes(secondClient) && !rows[1].includes(secondDescription));
-      assert.ok(Number(rows[1].split(';')[10].replaceAll('"', '')) >= 2);
+      assert.equal(Number(rows[1].split(';')[10].replaceAll('"', '')), seconds);
     } else {
       assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.csv')).length, 1);
     }
+    return seconds;
   } finally {
     cdp?.close();
-    if (child.pid && child.exitCode === null) {
+    if (child.pid && child.exitCode === null && child.signalCode === null) {
       const closed = once(child, 'exit');
       child.kill();
       await closed;
@@ -231,15 +240,38 @@ async function runWindow(restarted) {
   }
 }
 
-await runWindow(false);
-await runWindow(true);
+function registry(action, extra = []) {
+  const key = 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments';
+  return execFileSync('reg.exe', [action, key, '/v', 'tracker-master.exe', ...extra], { stdio: 'pipe', windowsHide: true });
+}
+
+let existingPolicy = false;
+try {
+  registry('query');
+  existingPolicy = true;
+} catch (error) {
+  if (error.status !== 1) throw error;
+}
+assert.equal(existingPolicy, false, 'Expected a fresh runner without a TrackerMaster WebView2 policy');
+const port = await availablePort();
+// Elevated WebView2 hosts ignore the environment variable for additional browser arguments.
+registry('add', ['/t', 'REG_SZ', '/d', `--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`, '/f']);
+let seconds;
+try {
+  seconds = await runWindow(port, false);
+  assert.equal(await runWindow(port, true), seconds);
+} finally {
+  registry('delete', ['/f']);
+}
 const db = new DatabaseSync(testDb, { readOnly: true });
 try {
   const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
-    e.task_id AS task FROM time_entries e JOIN projects p ON p.id=e.project_id
-    JOIN clients c ON c.id=p.client_id ORDER BY e.id`).all();
+    t.name AS task FROM time_entries e JOIN projects p ON p.id=e.project_id
+    JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id`).all();
   assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient]);
-  assert.ok(rows.every(row => row.project === project && row.task === null && row.duration >= 2));
+  assert.deepEqual(rows.map(row => row.task), [task, null]);
+  assert.ok(rows.every(row => row.project === project && row.duration >= 5));
+  assert.equal(rows[0].duration, seconds);
 } finally {
   db.close();
 }
