@@ -31,6 +31,8 @@ jobs:
         run: npm ci
       - name: Check frontend
         run: npm run build
+      - name: Check mini timer model and keyboard transitions
+        run: node --test tests/miniTimer.test.ts
       - name: Check report calculations
         run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts tests/reportPresets.test.ts tests/reportFilterStorage.test.ts tests/reportCsv.test.ts tests/localDateTime.test.ts tests/sleepTime.test.ts
       - name: Run Rust tests
