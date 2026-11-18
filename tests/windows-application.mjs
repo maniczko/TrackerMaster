@@ -317,6 +317,13 @@ async function verifyMiniTimer(cdp, mainSession) {
   await waitFor('pinning succeeds', () => evaluate(widget,
     `document.querySelector(${JSON.stringify(pin)})?.getAttribute('aria-pressed') === 'true'`));
   assert.equal(await readFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'widget-on-top.txt'), 'utf8'), 'true');
+  await evaluate(widget, 'document.querySelector(".qp-toggle").focus()');
+  const oldShortcut = { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, modifiers: 2 | 8 };
+  await cdp.send('Input.dispatchKeyEvent', { ...oldShortcut, type: 'keyDown' }, widget);
+  await cdp.send('Input.dispatchKeyEvent', { ...oldShortcut, type: 'keyUp' }, widget);
+  await delay(250);
+  assert.equal(await evaluate(widget, 'document.querySelector(".qp-mini").dataset.mode'), 'idle',
+    'The old shortcut must not activate a focused Start button');
   await evaluate(widget, 'document.querySelector(".qp-toggle").click()');
   await waitFor('mini timer starts native measurement', () => evaluate(widget, `(() => {
     const clock = document.querySelector('.qp-clock');

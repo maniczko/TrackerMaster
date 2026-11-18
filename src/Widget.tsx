@@ -170,6 +170,10 @@ export default function Widget() {
           setShortcut(next);
           if (!next.registered && next.shortcut === shortcut.shortcut) toggleRef.current();
         }).catch(() => setShortcutError('Nie udało się sprawdzić skrótu. Użyj Start / Stop.'));
+      } else if (event.code === 'Space' && (event.ctrlKey || event.altKey || event.metaKey) &&
+                 event.target instanceof HTMLButtonElement) {
+        // The WebView can otherwise click the focused button using a retired shortcut.
+        event.preventDefault();
       }
     }
     window.addEventListener('keydown', onKey);
