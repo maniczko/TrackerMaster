@@ -147,7 +147,7 @@ async function exercisePage(data, phase) {
   const testProfileVisible = () => document.querySelector('[role="note"]')?.textContent.includes('Wersja testowa.');
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled && pick('#new-client'));
 
-  if (phase === 'recover' || phase === 'verify-recovery') {
+  if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
       await until('interrupted timer requires verification', recoveryMessage);
       if (!pick(`${timer} .active-info`)?.textContent.includes(data.interruptedDescription) ||
@@ -419,6 +419,49 @@ async function verifyRestoreRetry(cdp, sessionId) {
   }
 }
 
+async function verifyDraft(cdp, sessionId, phase) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const text = 'Szkic po przerwaniu aplikacji';
+  if (phase === 'verify-recovery') {
+    await waitFor('history row for the first client', () => evaluate(`Boolean([...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)})))`));
+    await evaluate(`[...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)})).querySelector('button[aria-label^="Popraw wpis:"]').click()`);
+    await waitFor('entry editor opens', () => evaluate(`Boolean(document.querySelector('#entry-draft-description'))`));
+    await evaluate(`(() => {
+      const field = document.querySelector('#entry-draft-description');
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, ${JSON.stringify(text)});
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`);
+    const path = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'entry-drafts', 'entry-1.json');
+    await waitFor('draft snapshot saved to test profile', async () => {
+      try { return JSON.parse(await readFile(path, 'utf8')).fields.description === text; }
+      catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return false; throw error; }
+    });
+    const db = new DatabaseSync(testDb, { readOnly: true });
+    try { assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, primaryDescription); }
+    finally { db.close(); }
+    console.log('draft: uncommitted snapshot saved while original entry remained unchanged');
+    return;
+  }
+  const button = `[...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Przejdź do szkiców')`;
+  await waitFor('draft reminder after process restart', () => evaluate(`Boolean(${button})`));
+  await evaluate(`${button}.click()`);
+  await waitFor('restore draft button', () => evaluate(`Boolean([...document.querySelectorAll('[aria-label="Szkice wpisów"] button')].find(button => button.textContent.trim() === 'Przywróć szkic' && !button.disabled))`));
+  await evaluate(`[...document.querySelectorAll('[aria-label="Szkice wpisów"] button')].find(button => button.textContent.trim() === 'Przywróć szkic').click()`);
+  await waitFor('draft content restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
+  await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
+  await waitFor('draft applied once to history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(text)}))`));
+  const db = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, text);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=1').get().count, 1);
+  } finally { db.close(); }
+  console.log('PASS: draft survived process interruption and applied once to the original entry');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -496,7 +539,8 @@ async function runWindow(port, phase, recovery) {
       await verifyMiniTimer(cdp, sessionId);
       await verifySecondLaunch(child, env);
     }
-    if (phase === 'verify-recovery') await verifyRestoreRetry(cdp, sessionId);
+    if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase);
+    if (phase === 'draft-reopen') await verifyRestoreRetry(cdp, sessionId);
     return seconds;
   } finally {
     cdp?.close();
@@ -573,6 +617,8 @@ try {
   await runWindow(port, 'recover', recovery);
   await waitForWindowClosed(port);
   await runWindow(port, 'verify-recovery', recovery);
+  await waitForWindowClosed(port);
+  await runWindow(port, 'draft-reopen', recovery);
 } finally {
   registry('delete', ['/f']);
 }
