@@ -27,6 +27,7 @@ const project = 'Projekt kontrolny';
 const task = 'Zadanie QA';
 const primaryDescription = 'Pomiar klienta Żuraw';
 const secondDescription = 'Pomiar wyłącznie klienta Beta';
+const interruptedDescription = 'Pomiar przerwany przez zakończenie procesu';
 
 async function availablePort() {
   const server = createServer();
@@ -105,7 +106,7 @@ async function connect(port, child) {
   };
 }
 
-async function exercisePage(data, restarted) {
+async function exercisePage(data, phase) {
   const fail = message => { throw new Error(message); };
   async function until(label, read) {
     const deadline = Date.now() + 12_000;
@@ -134,9 +135,48 @@ async function exercisePage(data, restarted) {
   }
   const selected = select => select?.selectedOptions[0]?.textContent;
   const reportClient = () => pick('#report-client');
+  const historyRow = description => [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(description));
+  const recoveryMessage = () => [...document.querySelectorAll('[role="alert"] strong')].find(node => node.textContent === 'Pomiar wymaga weryfikacji.');
+  async function waitForMeasurement() {
+    await until('running timer', () => pick(`${timer} .status.running`));
+    await until('at least five measured seconds', () => {
+      const digits = pick(`${timer} .clock`).textContent.split(':').map(Number);
+      return digits.length === 3 && digits.reduce((seconds, field) => seconds * 60 + field, 0) >= 5;
+    });
+  }
   const testProfileVisible = () => document.querySelector('[role="note"]')?.textContent.includes('Wersja testowa.');
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled && pick('#new-client'));
 
+  if (phase === 'recover' || phase === 'verify-recovery') {
+    if (phase === 'recover') {
+      await until('interrupted timer requires verification', recoveryMessage);
+      if (!pick(`${timer} .active-info`)?.textContent.includes(data.interruptedDescription) ||
+          pick(`${timer} .clock`)?.textContent !== '—:—:—' || historyRow(data.interruptedDescription)) {
+        fail('Restart presented the interrupted entry as confirmed work');
+      }
+      async function submitEnd(utc) {
+        const date = new Date(utc);
+        const pad = value => String(value).padStart(2, '0');
+        const day = [date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join('-');
+        const time = [date.getHours(), date.getMinutes(), date.getSeconds()].map(pad).join(':');
+        await setValue('[role="alert"] input[type="datetime-local"]', `${day}T${time}`, 'input');
+        await click('submit recovery end', () => textButton('.app-shell', 'Zapisz zakończenie'));
+      }
+      await submitEnd(data.recovery.invalidEnd);
+      await until('end before start rejected', () => [...document.querySelectorAll('[role="alert"]')]
+        .some(node => node.textContent.includes('Zakończenie nie może być przed rozpoczęciem pomiaru.')));
+      if (!recoveryMessage() || historyRow(data.interruptedDescription)) fail('Rejected recovery changed the interrupted entry');
+      await submitEnd(data.recovery.end);
+    }
+    const row = await until('resolved entry visible in History', () => historyRow(data.interruptedDescription));
+    if (recoveryMessage() || !row.textContent.includes('wskazane ręcznie') ||
+        row.querySelector('.duration')?.textContent !== data.recovery.displayDuration) {
+      fail('History did not retain the manual recovery and its duration');
+    }
+    return null;
+  }
+
+  const restarted = phase !== 'initial';
   if (!restarted) {
     async function create(kind, name, selectedIndex) {
       const input = `#new-${kind}`;
@@ -150,13 +190,9 @@ async function exercisePage(data, restarted) {
       if (taskName) await create('task', taskName, 2);
       await setValue(`${timer} .timer-description input`, description, 'input');
       await click('start timer', () => pick(`${timer} .timer-start button`));
-      await until('running timer', () => pick(`${timer} .status.running`));
-      await until('at least five measured seconds', () => {
-        const digits = pick(`${timer} .clock`).textContent.split(':').map(Number);
-        return digits.length === 3 && digits.reduce((seconds, field) => seconds * 60 + field, 0) >= 5;
-      });
+      await waitForMeasurement();
       await click('stop timer', () => pick(`${timer} .timer-stop button`));
-      await until('completed entry in History', () => [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(description)));
+      await until('completed entry in History', () => historyRow(description));
     }
     await measure(data.primaryClient, data.primaryDescription, data.task);
     await measure(data.secondClient, data.secondDescription);
@@ -186,12 +222,24 @@ async function exercisePage(data, restarted) {
     await click('prepare CSV', () => textButton(report, 'Przygotuj podgląd CSV'));
     await until('client CSV preview', () => pick('.export-preview tbody')?.textContent.includes(data.primaryDescription));
     if (pick('.export-preview tbody').rows.length !== 1) fail('CSV preview returned a foreign entry');
+  } else {
+    async function selectTimerOption(index, label) {
+      const selector = `${timer} select`;
+      const choice = await until(label, () => [...(document.querySelectorAll(selector)[index]?.options ?? [])]
+        .find(option => option.textContent === label));
+      await setValue(selector, choice.value, 'change', index);
+    }
+    await selectTimerOption(0, data.secondClient);
+    await selectTimerOption(1, data.project);
+    await setValue(`${timer} .timer-description input`, data.interruptedDescription, 'input');
+    await click('start timer for forced interruption', () => pick(`${timer} .timer-start button`));
+    await waitForMeasurement();
+    if (historyRow(data.interruptedDescription)) fail('The active entry already appeared as completed work');
   }
   return contribution.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
 }
 
-async function runWindow(port, restarted) {
-  const phase = restarted ? 'Restarted window' : 'First window';
+async function runWindow(port, phase, recovery) {
   const child = spawn(exe, [], {
     env: {
       ...process.env,
@@ -218,19 +266,24 @@ async function runWindow(port, restarted) {
       return ready?.result.value === true;
     });
     console.log(`${phase}: connected to the test app`);
-    if (!restarted) await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory });
-    const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription };
+    if (phase === 'initial') await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory });
+    const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription, interruptedDescription, recovery };
     const result = await cdp.send('Runtime.evaluate', {
-      expression: `(${exercisePage.toString()})(${JSON.stringify(input)}, ${restarted})`,
+      expression: `(${exercisePage.toString()})(${JSON.stringify(input)}, ${JSON.stringify(phase)})`,
       awaitPromise: true,
       returnByValue: true,
     }, sessionId);
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
     const seconds = result.result.value;
-    assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
-    console.log(`${phase}: report matched the selected client (${seconds} s)`);
+    if (phase === 'initial' || phase === 'interrupt') {
+      assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
+      console.log(`${phase}: report matched the selected client (${seconds} s)`);
+    } else {
+      assert.equal(seconds, null);
+      console.log(`${phase}: history showed the manually recovered entry`);
+    }
     await access(testDb);
-    if (!restarted) {
+    if (phase === 'initial') {
       const download = await cdp.send('Runtime.evaluate', {
         expression: `(() => {
           const button = [...document.querySelectorAll('.export-preview button')].find(item => item.textContent === 'Potwierdź i pobierz CSV');
@@ -270,6 +323,34 @@ async function runWindow(port, restarted) {
   }
 }
 
+async function waitForWindowClosed(port) {
+  await waitFor('previous WebView2 instance stopped', async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1_000) });
+      const pages = await response.json();
+      return Array.isArray(pages) && pages.every(page => page.type !== 'page');
+    } catch (error) {
+      return error.cause?.code === 'ECONNREFUSED';
+    }
+  });
+}
+
+function readInterruptedTimer() {
+  const db = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    const active = db.prepare(`SELECT e.id, e.started_at, e.duration_seconds, e.manually_resolved, d.description
+      FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE e.ended_at IS NULL`).all();
+    assert.equal(active.length, 1);
+    assert.equal(active[0].description, interruptedDescription);
+    assert.equal(active[0].duration_seconds, null);
+    assert.equal(active[0].manually_resolved, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM time_entries').get().count, 3);
+    return active[0];
+  } finally {
+    db.close();
+  }
+}
+
 function registry(action, extra = []) {
   const key = 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments';
   return execFileSync('reg.exe', [action, key, '/v', 'tracker-master.exe', ...extra], { stdio: 'pipe', windowsHide: true });
@@ -286,33 +367,45 @@ assert.equal(existingPolicy, false, 'Expected a fresh runner without a TrackerMa
 const port = await availablePort();
 // Elevated WebView2 hosts ignore the environment variable for additional browser arguments.
 registry('add', ['/t', 'REG_SZ', '/d', `--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`, '/f']);
-let seconds;
+let seconds, interrupted, recovery;
 try {
-  seconds = await runWindow(port, false);
-  await waitFor('first WebView2 instance stopped', async () => {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1_000) });
-      const pages = await response.json();
-      return Array.isArray(pages) && pages.every(page => page.type !== 'page');
-    } catch (error) {
-      if (error.cause?.code === 'ECONNREFUSED') return true;
-      return false;
-    }
-  });
-  assert.equal(await runWindow(port, true), seconds);
+  seconds = await runWindow(port, 'initial');
+  await waitForWindowClosed(port);
+  assert.equal(await runWindow(port, 'interrupt'), seconds);
+  interrupted = readInterruptedTimer();
+  const start = Date.parse(interrupted.started_at);
+  const end = Math.floor(start / 1000) * 1000 + 3_000;
+  const duration = Math.floor((end - start) / 1000);
+  recovery = {
+    invalidEnd: new Date(end - 60_000).toISOString(),
+    end: new Date(end).toISOString(),
+    duration,
+    displayDuration: `00:00:${String(duration).padStart(2, '0')}`,
+  };
+  console.log(`interrupt: retained open entry #${interrupted.id} without assigning a duration`);
+  await waitForWindowClosed(port);
+  await runWindow(port, 'recover', recovery);
+  await waitForWindowClosed(port);
+  await runWindow(port, 'verify-recovery', recovery);
 } finally {
   registry('delete', ['/f']);
 }
 const db = new DatabaseSync(testDb, { readOnly: true });
 try {
   const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
-    t.name AS task FROM time_entries e JOIN projects p ON p.id=e.project_id
+    t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id
     JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id`).all();
-  assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient]);
-  assert.deepEqual(rows.map(row => row.task), [task, null]);
-  assert.ok(rows.every(row => row.project === project && row.duration >= 5));
+  assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient, secondClient]);
+  assert.deepEqual(rows.map(row => row.task), [task, null, null]);
+  assert.ok(rows.every(row => row.project === project));
+  assert.ok(rows.slice(0, 2).every(row => row.duration >= 5 && row.manually_resolved === 0));
   assert.equal(rows[0].duration, seconds);
+  assert.equal(rows[2].id, interrupted.id);
+  assert.equal(rows[2].started_at, interrupted.started_at);
+  assert.equal(rows[2].ended_at, recovery.end);
+  assert.equal(rows[2].duration, recovery.duration);
+  assert.equal(rows[2].manually_resolved, 1);
 } finally {
   db.close();
 }
-console.log('PASS: two clients, project timers, History, isolated report and CSV, restart and SQLite verification');
+console.log('PASS: two clients, project timers, History, isolated report and CSV, and explicit recovery of the original entry after a forced exit');
