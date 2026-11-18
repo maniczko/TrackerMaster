@@ -196,6 +196,25 @@ async function exercisePage(data, phase) {
     }
     await measure(data.primaryClient, data.primaryDescription, data.task);
     await measure(data.secondClient, data.secondDescription);
+    const archiveToggle = await until('show archived records', () =>
+      [...document.querySelectorAll(`${timer} label`)].find(label => label.textContent.includes('Pokaż archiwum'))?.querySelector('input'));
+    archiveToggle.click();
+    await click('archive the second client project', () => textButton(timer, 'Archiwizuj projekt'));
+    await until('project is archived', () => enabled(textButton(timer, 'Przywróć projekt')));
+    if (!historyRow(data.primaryDescription) || !historyRow(data.secondDescription)) fail('Archiving the project removed history');
+    await click('restore the second client project', () => textButton(timer, 'Przywróć projekt'));
+    await until('project is restored', () => enabled(textButton(timer, 'Archiwizuj projekt')));
+    await click('archive the second client', () => textButton(timer, 'Archiwizuj klienta'));
+    await until('client is archived', () => enabled(textButton(timer, 'Przywróć klienta')));
+    if (!historyRow(data.primaryDescription) || !historyRow(data.secondDescription)) fail('Archiving the client removed history');
+    await click('restore the second client', () => textButton(timer, 'Przywróć klienta'));
+    await until('client is restored', () => enabled(textButton(timer, 'Archiwizuj klienta')));
+    await until('client project remains archived', () => enabled(textButton(timer, 'Przywróć projekt')));
+    await click('restore project after client', () => textButton(timer, 'Przywróć projekt'));
+    await until('project restored after its client', () => enabled(textButton(timer, 'Archiwizuj projekt')));
+    if (!historyRow(data.primaryDescription) || !historyRow(data.secondDescription)) fail('Restoring the client or project changed history');
+    archiveToggle.click();
+    console.log('PASS: archived and restored a project and client without removing either client history');
   }
 
   await click('open report', () => textButton(report, 'Otwórz raport'));
