@@ -229,17 +229,62 @@ test('Detailed, Summary and independently fetched CSV agree on finalized work in
     [1, 'finalized', 1800], [2, 'pending', 7200], [4, 'running', 2700],
   ]);
   assert.equal(view.finalizedSeconds, 1800);
-  assert.equal(view.liveSeconds, 4500);
+  assert.equal(view.liveSeconds, 11700);
   assert.equal(view.billableSeconds, 1800);
   assert.equal(view.pendingSeconds, 3600);
   assert.equal(view.awaitingSeconds, 7200);
-  assert.deepEqual(view.liveDays, [{ date: '2026-01-31', seconds: 4500 }]);
+  assert.deepEqual(view.liveDays, [{ date: '2026-01-31', seconds: 11700 }]);
 
   const backing = [awaiting, midnight].map(entry => ({ ...entry, client: 'Alfa', project: 'Wspólny', task: '' }));
   const csvRows = makeClientExportRows(backing, 'Alfa', '2026-01-31', '2026-01-31', 'UTC');
   assert.ok(sameExportRows(csvRows, view.finalizedRows));
   assert.equal(parseSemicolonCsv(exportCsv(csvRows, 'UTC'))[1][10], '1800');
   assert.ok(!sameExportRows([{ ...csvRows[0], source: { ...csvRows[0].source, description: 'Zmieniony opis' } }], view.finalizedRows));
+});
+
+test('known work remains in report totals while each pending sleep period is decided separately', () => {
+  const span = (id: number, started: string, ended: string) => ({
+    id, entryId: 11, startedMs: Date.parse(started), endedMs: Date.parse(ended), decision: 'pending' as const,
+  });
+  const sleep = [
+    span(1, '2026-01-01T23:00:00Z', '2026-01-01T23:20:00Z'),
+    span(2, '2026-01-01T23:20:00Z', '2026-01-02T00:00:00Z'),
+    span(3, '2026-01-02T00:00:00Z', '2026-01-02T00:15:00Z'),
+  ];
+  const later = reportEntry(12, '2026-01-02T13:00:00Z', '2026-01-02T13:30:00Z', 1800);
+  const foreign = reportEntry(13, '2026-01-02T09:00:00Z', '2026-01-02T12:00:00Z', 10800, { project_id: 2 });
+  const scope = { ...allReportClients, clientId: 1 };
+  const decisions = [
+    { values: ['pending', 'pending', 'pending'], work: 3600, pending: 4500, count: 3, finalized: 1800 },
+    { values: ['included', 'pending', 'pending'], work: 4800, pending: 3300, count: 2, finalized: 1800 },
+    { values: ['included', 'excluded', 'pending'], work: 4800, pending: 900, count: 1, finalized: 1800 },
+    { values: ['included', 'excluded', 'included'], work: 5700, pending: 0, count: 0, finalized: 7500 },
+  ] as const;
+  for (const step of decisions) {
+    const entry = reportEntry(11, '2026-01-01T22:00:00Z', '2026-01-02T00:15:00Z', step.work, {
+      billable: true, sleep_periods: sleep.map((period, index) => ({ ...period, decision: step.values[index] })),
+    });
+    const data = { entries: [entry, later, foreign], active: null, time_zone: 'UTC' };
+    const view = makeReportView(data, reportsCatalog, scope, '2026-01-01', '2026-01-02');
+    assert.equal(view.liveSeconds, step.work + 1800);
+    assert.equal(view.billableSeconds, step.work);
+    assert.equal(view.averageSeconds, (step.work + 1800) / 2);
+    assert.equal(view.pendingSeconds, step.pending);
+    assert.equal(view.pendingPeriodCount, step.count);
+    assert.equal(view.finalizedSeconds, step.finalized);
+    assert.deepEqual(view.rows.map(row => row.source.id), [11, 12]);
+    const exportSource = [entry, later].map(source => ({ ...source, client: 'Alfa', project: 'Wspólny', task: '' }));
+    const csv = makeClientExportRows(exportSource, 'Alfa', '2026-01-01', '2026-01-02', 'UTC');
+    assert.ok(sameExportRows(csv, view.finalizedRows));
+    assert.equal(csv.reduce((sum, row) => sum + row.contribution, 0), step.finalized);
+
+    if (step.count === 3) {
+      const dayTwo = makeReportView(data, reportsCatalog, scope, '2026-01-02', '2026-01-02');
+      assert.equal(dayTwo.pendingPeriodCount, 1);
+      assert.equal(dayTwo.pendingSeconds, 900);
+      assert.equal(dayTwo.liveSeconds, 1800);
+    }
+  }
 });
 
 test('Detailed hides names from an unrelated task and stays stable when sorting equal values', () => {

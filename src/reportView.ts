@@ -1,6 +1,6 @@
 import { filterByClient } from './reportClientFilter.ts';
 import { reportByDay, reportOverlaps } from './reportTime.ts';
-import type { ReportDay, ReportEntry } from './reportTime.ts';
+import type { ReportEntry } from './reportTime.ts';
 import type { ExportEntry, ExportRow } from './reportCsv.ts';
 import type { ReportCatalog, ReportScope } from './reportScope.ts';
 
@@ -47,7 +47,6 @@ export function makeReportView(data: ReportData, catalog: ReportCatalog, scope: 
   const overlaps = reportOverlaps(eligible, from, through, data.time_zone);
   const rows: ReportDetailRow[] = [];
   const finalizedRows: ExportRow[] = [];
-  const days = new Map<string, number>();
   let finalizedSeconds = 0;
   let activeSeconds = 0;
   let billableSeconds = 0;
@@ -57,25 +56,19 @@ export function makeReportView(data: ReportData, catalog: ReportCatalog, scope: 
     if (!source) continue;
     const status = item.id === active?.id ? 'running' : item.hasPendingSleep ? 'pending' : 'finalized';
     rows.push({ source, status, contribution: item.seconds, pendingSeconds: item.pendingSeconds });
-    if (status === 'pending') {
-      awaitingSeconds += item.seconds;
-      continue;
-    }
-    if (status === 'running') activeSeconds += item.seconds;
+    if (status === 'pending') awaitingSeconds += item.seconds;
+    else if (status === 'running') activeSeconds += item.seconds;
     else {
       finalizedSeconds += item.seconds;
       finalizedRows.push({ source, contribution: item.seconds });
     }
     if (source.billable) billableSeconds += item.seconds;
-    for (const day of item.days) days.set(day.date, (days.get(day.date) ?? 0) + day.seconds);
   }
-  const liveSeconds = finalizedSeconds + activeSeconds;
-  const liveDays: ReportDay[] = Array.from(days, ([date, seconds]) => ({ date, seconds }))
-    .sort((a, b) => a.date.localeCompare(b.date));
   return {
-    rows, finalizedRows, liveDays, finalizedSeconds, liveSeconds, activeSeconds, billableSeconds, awaitingSeconds,
+    rows, finalizedRows, finalizedSeconds, activeSeconds, billableSeconds, awaitingSeconds,
+    liveDays: report.days, liveSeconds: report.totalSeconds, averageSeconds: report.averageSeconds,
     active, overlaps, missingRelations, excludedEntryIds: report.excludedEntryIds,
-    pendingSeconds: report.pendingSeconds, averageSeconds: days.size ? liveSeconds / days.size : null,
+    pendingSeconds: report.pendingSeconds, pendingPeriodCount: report.pendingPeriodCount,
   };
 }
 

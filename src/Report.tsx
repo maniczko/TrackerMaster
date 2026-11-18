@@ -285,9 +285,11 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
           {view.overlaps.truncated && <p>Wyświetlono tylko część powiązanych wpisów.</p>}
           {view.active && view.overlaps.entryIds.includes(view.active.id) && <p>Zatrzymaj aktywny pomiar, aby go poprawić.</p>}
         </div>}
-        {view.pendingSeconds > 0 && <p role="status" className="alert">Uśpienie do rozstrzygnięcia <strong>{duration(view.pendingSeconds)}</strong></p>}
+        {view.pendingPeriodCount > 0 && <p role="status" className="alert">
+          Okresy uśpienia do rozstrzygnięcia ({view.pendingPeriodCount}) <strong>{duration(view.pendingSeconds)}</strong>
+        </p>}
         {view.awaitingSeconds > 0 && <p role="status" className="alert">
-          Praca we wpisach z nierozstrzygniętą przerwą <strong>{duration(view.awaitingSeconds)}</strong>. Pojawi się w zatwierdzonej sumie po rozstrzygnięciu przerwy.
+          W łącznym czasie uwzględniono <strong>{duration(view.awaitingSeconds)}</strong> pracy z wpisów oczekujących na decyzję o uśpieniu. Wpisy będą dostępne w CSV po rozstrzygnięciu przerw.
         </p>}
         {view.active?.unresolved && <div role="alert" className="alert error">Aktywny pomiar wymaga weryfikacji lub sprawdzenia zegara.</div>}
         <div className="report-presets" role="group" aria-label="Widok raportu">
@@ -298,16 +300,16 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
           <div className="report-summary">
             <div><small>Zatwierdzony czas{incomplete ? ' · suma niepełna' : ''}</small><strong>{duration(view.finalizedSeconds)}</strong></div>
             <div><small>Aktywny pomiar · orientacyjnie</small><strong>{duration(view.activeSeconds)}</strong></div>
-            <div><small>Łącznie z aktywnym pomiarem</small><strong>{duration(view.liveSeconds)}</strong></div>
+            <div><small>Czas pracy z aktywnym pomiarem</small><strong>{duration(view.liveSeconds)}</strong></div>
             <div><small>Średnio na dzień z pracą</small><strong>{view.averageSeconds === null ? 'Brak danych' : duration(view.averageSeconds)}</strong></div>
             <div><small>Czas rozliczalny</small><strong>{duration(view.billableSeconds)}</strong>
               <small>{view.liveSeconds ? `${new Intl.NumberFormat('pl-PL', { maximumFractionDigits: 1 }).format(100 * view.billableSeconds / view.liveSeconds)}% czasu` : 'Brak danych'}</small></div>
           </div>
-          {view.liveDays.length === 0 ? <p className="muted">Brak zatwierdzonego lub aktywnego czasu w wybranym zakresie.</p> :
+          {view.liveDays.length === 0 ? <p className="muted">Brak czasu pracy w wybranym zakresie.</p> :
             <div className="table-wrap"><table><thead><tr><th scope="col">Dzień</th><th scope="col">Czas z aktywnym pomiarem</th></tr></thead>
               <tbody>{view.liveDays.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
         </> : <ReportDetails key={`details:${viewKey}`} rows={view.rows}
-          finalizedSeconds={view.finalizedSeconds} zone={data.time_zone} onEdit={onEditEntry} onHistory={onShowHistory} />}
+          finalizedSeconds={view.finalizedSeconds} liveSeconds={view.liveSeconds} zone={data.time_zone} onEdit={onEditEntry} onHistory={onShowHistory} />}
         <ReportExport key={`export:${viewKey}`} scope={reportScope} from={range.from}
           through={range.through} zone={data.time_zone} expectedRows={view.finalizedRows} incomplete={incomplete} />
       </>}

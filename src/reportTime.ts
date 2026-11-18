@@ -5,7 +5,7 @@ import type { SleepPeriod } from './sleepTime.ts';
 export type ReportEntry = { id: number; started_at: string; ended_at: string; duration_seconds: number; sleep_periods?: readonly SleepPeriod[] };
 export type ReportDay = { date: string; seconds: number };
 export type EntryContribution = { id: number; days: ReportDay[]; seconds: number; pendingSeconds: number; hasPendingSleep: boolean };
-export type ReportResult = { days: ReportDay[]; totalSeconds: number; averageSeconds: number | null; excludedEntryIds: number[]; pendingSeconds: number; contributions: EntryContribution[] };
+export type ReportResult = { days: ReportDay[]; totalSeconds: number; averageSeconds: number | null; excludedEntryIds: number[]; pendingSeconds: number; pendingPeriodCount: number; contributions: EntryContribution[] };
 export type OverlapWarning = { entryIds: number[]; truncated: boolean };
 
 export function validTimeZone(timeZone: string): boolean {
@@ -94,6 +94,7 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
   const excludedEntryIds: number[] = [];
   const contributions: EntryContribution[] = [];
   let pendingSeconds = 0;
+  let pendingPeriodCount = 0;
   const ids = new Set<number>();
   const { lower, upper } = utcEnvelope(from, through);
   const inRange = (date: string) => date >= from && date <= through;
@@ -123,22 +124,27 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
         // The native source must supply work duration, excluding pending and rejected sleep.
         if (entry.duration_seconds !== Math.floor(split.workMs / 1000)) throw new Error('Niespójny czas pracy.');
         if (end < lower || start >= upper) continue;
-        let workElapsed = 0, pendingElapsed = 0, entryPendingSeconds = 0;
+        let workElapsed = 0, pendingElapsed = 0, entryPendingSeconds = 0, entryPendingPeriods = 0;
         const entryTotals = new Map<string, number>();
         for (const part of split.segments) {
           if (part.kind === 'excluded') continue;
           const elapsed = part.kind === 'work' ? workElapsed : pendingElapsed;
           if (part.endedMs >= lower && part.startedMs < upper) {
+            let intersectsRange = false;
             for (const day of pieces(part.startedMs, part.endedMs, part.startedMs - elapsed)) {
-              if (!inRange(day.date) || day.seconds <= 0) continue;
+              if (!inRange(day.date)) continue;
+              intersectsRange = true;
+              if (day.seconds <= 0) continue;
               if (part.kind === 'work') entryTotals.set(day.date, (entryTotals.get(day.date) ?? 0) + day.seconds);
               else entryPendingSeconds += day.seconds;
             }
+            if (part.kind === 'pending' && intersectsRange) entryPendingPeriods++;
           }
           if (part.kind === 'work') workElapsed += part.endedMs - part.startedMs;
           else pendingElapsed += part.endedMs - part.startedMs;
         }
-        if (entryTotals.size || entryPendingSeconds || (start === end && inRange(dateInZone(start, timeZone)))) {
+        pendingPeriodCount += entryPendingPeriods;
+        if (entryTotals.size || entryPendingPeriods || (start === end && inRange(dateInZone(start, timeZone)))) {
           addEntry(entry.id, Array.from(entryTotals, ([date, seconds]) => ({ date, seconds })),
             entryPendingSeconds, entry.sleep_periods.some(period => period.decision === 'pending'));
         }
@@ -167,7 +173,7 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
   }
   const days = [...totals].sort(([a], [b]) => a.localeCompare(b)).map(([date, seconds]) => ({ date, seconds }));
   const totalSeconds = days.reduce((sum, day) => sum + day.seconds, 0);
-  return { days, totalSeconds, averageSeconds: days.length ? totalSeconds / days.length : null, excludedEntryIds, pendingSeconds, contributions };
+  return { days, totalSeconds, averageSeconds: days.length ? totalSeconds / days.length : null, excludedEntryIds, pendingSeconds, pendingPeriodCount, contributions };
 }
 
 export const reportByWarsawDay = (entries: ReportEntry[], from: string, through: string) => reportByDay(entries, from, through, 'Europe/Warsaw');

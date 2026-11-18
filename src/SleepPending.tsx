@@ -64,8 +64,8 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
     try {
       await invoke('resolve_sleep_period', { entryId: item.entryId, periodId: item.id, include });
       saved = true;
-      await refresh();
       await onResolved();
+      await refresh();
     } catch {
       await refresh();
       setError(saved ? 'Decyzja została zapisana, ale nie udało się odświeżyć danych.' : 'Nie udało się zapisać decyzji. Sprawdź listę i spróbuj ponownie.');
@@ -81,8 +81,8 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
       await invoke('set_sleep_resume', { entryId: item.entryId, periodId: item.id, endedAt: end.toISOString() });
       saved = true;
       setResumeInput(current => { const next = { ...current }; delete next[item.id]; return next; });
-      await refresh();
       await onResolved();
+      await refresh();
     } catch {
       await refresh();
       setError(saved ? 'Czas wybudzenia zapisano, ale nie udało się odświeżyć danych.' : 'Nie udało się zapisać czasu wybudzenia. Sprawdź datę i zakres pomiaru.');

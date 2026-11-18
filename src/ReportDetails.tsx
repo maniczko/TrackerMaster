@@ -7,6 +7,7 @@ type Props = {
   rows: ReportDetailRow[];
   zone: string;
   finalizedSeconds: number;
+  liveSeconds: number;
   onEdit: (entryId: number) => void;
   onHistory: (entryId: number) => void;
 };
@@ -24,7 +25,7 @@ function ReportTimestamp({ value, zone }: { value: string; zone: string }) {
   return <time dateTime={value}>{day}<small>{clock}</small></time>;
 }
 
-export default function ReportDetails({ rows, zone, finalizedSeconds, onEdit, onHistory }: Props) {
+export default function ReportDetails({ rows, zone, finalizedSeconds, liveSeconds, onEdit, onHistory }: Props) {
   const [sort, setSort] = useState<{ field: ReportSortField; descending: boolean }>({ field: 'start', descending: true });
   const [page, setPage] = useState(0);
   const [hidden, setHidden] = useState<OptionalColumn[]>([]);
@@ -60,6 +61,7 @@ export default function ReportDetails({ rows, zone, finalizedSeconds, onEdit, on
     </div>
     {rows.length === 0 ? <p className="muted">Brak wpisów w wybranym zakresie.</p> : <>
       <p className="muted">Zatwierdzony czas w okresie <strong>{formatDuration(finalizedSeconds)}</strong></p>
+      {liveSeconds !== finalizedSeconds && <p className="muted">Czas pracy z aktywnym pomiarem <strong>{formatDuration(liveSeconds)}</strong></p>}
       <div className="table-wrap"><table>
         <thead><tr>
           <th scope="col">Wpis</th>
