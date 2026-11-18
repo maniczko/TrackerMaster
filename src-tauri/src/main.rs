@@ -6,6 +6,7 @@ mod power_events;
 mod optional_task_migration;
 mod ui_preferences;
 mod entry_drafts;
+mod editor_close;
 
 const LATEST_SCHEMA_VERSION: i64 = 13;
 
@@ -1282,6 +1283,40 @@ fn start_project_from_shortcut(tracker: &mut Tracker, project_id: i64, task_id: 
     }
 }
 
+fn request_quit(app: &tauri::AppHandle) {
+    let shared = app.state::<Shared>();
+    let guard = shared.lock();
+    let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
+        .and_then(|tracker| snapshot(tracker).map(|s| s.active));
+    if matches!(active, Ok(None)) { app.exit(0); }
+    else {
+        // Do not hold the tracker lock or block the UI thread during a dialog.
+        drop(guard);
+        let main_app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(main_app).await; });
+        #[cfg(windows)]
+        {
+            let app = app.clone();
+            std::thread::spawn(move || match active {
+                Ok(Some(entry)) if !entry.recovered => {
+                    if !confirm_stop_and_exit() { return; }
+                    let shared = app.state::<Shared>();
+                    let mut tracker = match shared.lock() {
+                        Ok(tracker) => tracker,
+                        Err(_) => { show_start_error("Nie można odczytać pomiaru. Aplikacja pozostaje otwarta."); return; }
+                    };
+                    if let Err(err) = stop_expected_for_exit(&mut tracker, entry.id) {
+                        drop(tracker);
+                        show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta."));
+                    } else { app.exit(0); }
+                }
+                Ok(Some(_)) => show_start_error("Pomiar wymaga ręcznej weryfikacji. Rozlicz go przed zakończeniem aplikacji."),
+                Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
+                Ok(None) => {}
+            });
+        }
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| {
@@ -1348,6 +1383,7 @@ fn main() {
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(HotkeyChange(Mutex::new(())));
             app.manage(Mutex::new(RestoreState::default()));
+            app.manage(editor_close::EditorClose::default());
             let saved = std::fs::read_to_string(dir.join("shortcut.txt")).ok().filter(|value| valid_shortcut(value)).unwrap_or_else(|| DEFAULT_SHORTCUT.into());
             let registered = app.global_shortcut().register(saved.as_str());
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
@@ -1366,36 +1402,8 @@ fn main() {
                     "show" => { let app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(app).await; }); }
                     "widget" => { let app = app.clone(); tauri::async_runtime::spawn(async move { let _ = open_widget(app).await; }); }
                     "quit" => {
-                        let shared = app.state::<Shared>();
-                        let guard = shared.lock();
-                        let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
-                            .and_then(|tracker| snapshot(tracker).map(|s| s.active));
-                        if matches!(active, Ok(None)) { app.exit(0); }
-                        else {
-                            // Do not hold the tracker lock or block the UI thread during a dialog.
-                            drop(guard);
-                            let main_app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(main_app).await; });
-                            #[cfg(windows)]
-                            {
-                                let app = app.clone();
-                                std::thread::spawn(move || match active {
-                                    Ok(Some(entry)) if !entry.recovered => {
-                                        if !confirm_stop_and_exit() { return; }
-                                        let shared = app.state::<Shared>();
-                                        let mut tracker = match shared.lock() {
-                                            Ok(tracker) => tracker,
-                                            Err(_) => { show_start_error("Nie można odczytać pomiaru. Aplikacja pozostaje otwarta."); return; }
-                                        };
-                                        if let Err(err) = stop_expected_for_exit(&mut tracker, entry.id) {
-                                            drop(tracker);
-                                            show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta."));
-                                        } else { app.exit(0); }
-                                    }
-                                    Ok(Some(_)) => show_start_error("Pomiar wymaga ręcznej weryfikacji. Rozlicz go przed zakończeniem aplikacji."),
-                                    Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
-                                    Ok(None) => {}
-                                });
-                            }
+                        if !editor_close::intercept(app, editor_close::CloseAction::Quit) {
+                            request_quit(app);
                         }
                     }
                     _ => {}
@@ -1414,11 +1422,13 @@ fn main() {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    let _ = window.hide();
+                    if !editor_close::intercept(window.app_handle(), editor_close::CloseAction::Hide) {
+                        let _ = window.hide();
+                    }
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }

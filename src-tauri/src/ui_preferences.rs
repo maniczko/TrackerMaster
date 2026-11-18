@@ -13,6 +13,7 @@ use crate::Cmd;
 
 const REPORT_FILTER_FILE: &str = "report-date-filter.txt";
 const WIDGET_PIN_FILE: &str = "widget-on-top.txt";
+const DRAFT_SORT_FILE: &str = "draft-sort.txt";
 const INVALID_REPORT_FILTER: &str = "Nieprawidłowy zakres raportu.";
 
 pub(super) fn save_preference(dir: &Path, name: &str, value: &str) -> io::Result<()> {
@@ -47,6 +48,40 @@ fn read_preference(dir: &Path, name: &str) -> Cmd<Option<String>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err("Nie udało się odczytać ustawienia.".into()),
     }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum DraftSort {
+    Newest,
+    Oldest,
+}
+
+#[tauri::command]
+pub(super) fn get_draft_sort(app: AppHandle) -> Cmd<DraftSort> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    match read_preference(&dir, DRAFT_SORT_FILE)?.as_deref() {
+        None | Some("newest") => Ok(DraftSort::Newest),
+        Some("oldest") => Ok(DraftSort::Oldest),
+        Some(_) => Err("Nieprawidłowy zapis kolejności szkiców.".into()),
+    }
+}
+
+#[tauri::command]
+pub(super) fn set_draft_sort(app: AppHandle, order: DraftSort) -> Cmd<()> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    let value = match order {
+        DraftSort::Newest => "newest",
+        DraftSort::Oldest => "oldest",
+    };
+    save_preference(&dir, DRAFT_SORT_FILE, value)
+        .map_err(|_| "Nie udało się zapamiętać sortowania.".into())
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
