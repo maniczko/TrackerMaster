@@ -95,16 +95,16 @@ test('TECH-10: London January reports 1800+1200 seconds; source duration and UTC
     [['10', '1800'], ['11', '1200']]);
   assert.equal(a1.started_at, '2026-01-31T23:30:00Z');
 });
-test('TECH-10: CSV header has 12 columns and every completed entry contributes one source row', () => {
+test('TECH-10: CSV uses the exact D12 header and every completed entry contributes one source row', () => {
   const csv = exportCsv(makeClientExportRows([a1, a2], 'Alfa', '2026-01-01', '2026-02-28', 'Europe/Warsaw'), 'Europe/Warsaw');
+  assert.equal(csv.slice(0, csv.indexOf('\n') + 1),
+    '\ufeff"ID wpisu";"Klient";"Projekt";"Zadanie";"Opis";"Start";"Koniec";"Rozliczalność";' +
+    '"Czas całkowity w sekundach";"Czas całkowity HH:MM:SS";' +
+    '"Czas w wybranym okresie w sekundach";"Czas w wybranym okresie HH:MM:SS"\r\n');
   const rows = parseSemicolonCsv(csv);
-  assert.equal(rows[0].length, 12);
   assert.equal(rows.length, 3);
   assert.deepEqual(rows.slice(1).map(row => row[0]), ['10', '11']);
   assert.ok(rows.every(row => row.length === 12));
-  assert.deepEqual(rows[0].slice(0, 8), ['ID wpisu', 'Klient', 'Projekt', 'Zadanie',
-    'Opis', 'Start', 'Koniec', 'Rozliczalność']);
-  assert.ok(rows[0][8].includes('sekundy') && rows[0][10].includes('sekundy'));
   assert.equal(rows[1][7], 'Tak');
   assert.equal(rows[2][7], 'Nie');
   assert.equal(rows[1][8], '3600');
