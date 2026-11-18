@@ -903,6 +903,9 @@ async fn set_global_shortcut(app: tauri::AppHandle, shortcut: String, expected: 
         if hotkey.shortcut != expected { return Err("Ustawienie zmieniło się w innym oknie. Odśwież i spróbuj ponownie.".into()); }
         (hotkey.shortcut.clone(), hotkey.registered)
     };
+    if shortcut.ends_with("+F12") && shortcut != old {
+        return Err("Klawisz F12 jest zarezerwowany przez system Windows. Wybierz inny klawisz.".into());
+    }
     if old == shortcut && registered { return shortcut_status(app.state::<Hotkey>()); }
     let dir = app.path().app_data_dir().map_err(|_| "Nie można ustalić katalogu ustawień.")?;
     replace_shortcut(&old, &shortcut, registered,

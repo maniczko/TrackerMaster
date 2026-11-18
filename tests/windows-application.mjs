@@ -225,9 +225,9 @@ async function exercisePage(data, phase) {
   } else {
     const settings = '[aria-label="Skrót klawiaturowy"]';
     await setValue(`${settings} select`, 'Alt', 'change');
-    await setValue(`${settings} select`, 'F12', 'change', 1);
+    await setValue(`${settings} select`, 'F11', 'change', 1);
     await click('save custom mini timer shortcut', () => textButton(settings, 'Zapisz skrót'));
-    await until('custom shortcut saved', () => pick(`${settings} [role="status"]`)?.textContent.includes('Ctrl + Alt + F12'));
+    await until('custom shortcut saved', () => pick(`${settings} [role="status"]`)?.textContent.includes('Ctrl + Alt + F11'));
   }
   return contribution.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
 }
@@ -282,7 +282,7 @@ async function verifyMiniTimer(cdp, mainSession) {
     const target = await waitFor('native mini timer WebView2', findOtherWindow);
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
     await waitFor('mini timer reads the configured shortcut', () => evaluate(sessionId,
-      'document.querySelector(".qp-toggle")?.title.includes("Ctrl + Alt + F12") ?? false'
+      'document.querySelector(".qp-toggle")?.title.includes("Ctrl + Alt + F11") ?? false'
     ).catch(error => {
       if (!/Execution context was destroyed|Cannot find context/i.test(error.message)) throw error;
       return false;
@@ -327,7 +327,9 @@ async function verifyMiniTimer(cdp, mainSession) {
   await delay(250);
   assert.equal(await evaluate(widget, 'document.querySelector(".qp-mini").dataset.mode'), 'idle',
     'The old shortcut must not activate a focused Start button');
-  await evaluate(widget, 'document.querySelector(".qp-toggle").click()');
+  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', 'tests/windows-hotkey.ps1'], {
+    timeout: 10_000, windowsHide: true, stdio: 'pipe',
+  });
   await waitFor('mini timer starts native measurement', () => evaluate(widget, `(() => {
     const clock = document.querySelector('.qp-clock');
     const elapsed = clock?.textContent.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
