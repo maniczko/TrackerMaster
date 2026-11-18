@@ -92,12 +92,15 @@ function Install-TestVersion([string] $Path, [version] $Version, [switch] $Updat
 }
 
 function Test-PackageRelaunch($Process, [string] $AppId, [string] $ExpectedExe, [IntPtr] $Window) {
-    if (!$Process.CloseMainWindow()) { throw 'Could not close the main test window.' }
+    $inspect = Join-Path $PSScriptRoot '../../tests/windows-window.ps1'
+    if ((& $inspect -Action Close -PrimaryPid $Process.Id -WindowHandle $Window.ToInt64()) -ne 'posted') {
+        throw 'Could not close the main test window.'
+    }
     $hidden = $false
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         $Process.Refresh()
         if ($Process.HasExited) { throw 'Closing the test window ended the application.' }
-        if ($Process.MainWindowHandle -eq [IntPtr]::Zero) {
+        if ((& $inspect -Action Visibility -PrimaryPid $Process.Id -WindowHandle $Window.ToInt64()) -eq 'hidden') {
             $hidden = $true
             break
         }
@@ -111,7 +114,8 @@ function Test-PackageRelaunch($Process, [string] $AppId, [string] $ExpectedExe, 
         if ($Process.HasExited) { throw 'Package reactivation ended the original process.' }
         $matching = @(Get-Process -Name 'tracker-master' -ErrorAction SilentlyContinue |
             Where-Object { $_.Path -ieq $ExpectedExe })
-        if ($Process.MainWindowHandle -eq $Window -and $matching.Count -eq 1 -and
+        $visibility = & $inspect -Action Visibility -PrimaryPid $Process.Id -WindowHandle $Window.ToInt64()
+        if ($visibility -eq 'visible' -and $matching.Count -eq 1 -and
             $matching[0].Id -eq $Process.Id) {
             Write-Host 'PASS: package reactivation restored the original window and left one packaged process.'
             return

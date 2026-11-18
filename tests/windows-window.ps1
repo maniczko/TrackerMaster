@@ -17,7 +17,8 @@ if ($Action -eq 'Find') {
     return
 }
 
-Add-Type -TypeDefinition @'
+if (!('TrackerTestWindow' -as [type])) {
+    Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -32,6 +33,7 @@ public static class TrackerTestWindow {
     public static extern bool PostMessageW(IntPtr window, uint message, UIntPtr wParam, IntPtr lParam);
 }
 '@
+}
 
 $window = [IntPtr]::new($WindowHandle)
 [uint32] $owner = 0
