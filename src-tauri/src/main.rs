@@ -436,11 +436,15 @@ fn apply_backup_restore(app: tauri::AppHandle, state: State<'_, Shared>, restore
     if !confirmed { return Err("Potwierdź przywrócenie kopii.".into()); }
     let data_dir = app.path().app_data_dir().map_err(|_| "Nie można ustalić katalogu danych aplikacji.".to_string())?;
     let mut restore = restore.lock().map_err(|_| "Nie można odczytać przygotowanej kopii.".to_string())?;
-    if restore.sequence.to_string() != token || restore.pending.is_none() { return Err("Przygotowana kopia jest nieaktualna. Sprawdź ją ponownie.".into()); }
     let mut tracker = locked(&state)?;
-    if snapshot(&tracker)?.active.is_some() { return Err("Najpierw zakończ lub rozlicz aktywny pomiar.".into()); }
+    apply_prepared_restore(&mut tracker, &mut restore, &token, &data_dir)
+}
+
+fn apply_prepared_restore(tracker: &mut Tracker, restore: &mut RestoreState, token: &str, data_dir: &std::path::Path) -> Cmd<String> {
+    if restore.sequence.to_string() != token || restore.pending.is_none() { return Err("Przygotowana kopia jest nieaktualna. Sprawdź ją ponownie.".into()); }
+    if snapshot(tracker)?.active.is_some() { return Err("Najpierw zakończ lub rozlicz aktywny pomiar.".into()); }
     let prepared = restore.pending.as_ref().ok_or("Nie znaleziono przygotowanej kopii.")?;
-    let safety = storage_safety::restore_prepared(&mut tracker.db, prepared, &data_dir)
+    let safety = storage_safety::restore_prepared(&mut tracker.db, prepared, data_dir)
         .map_err(|_| "Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.".to_string())?;
     restore.pending = None;
     tracker.running_since = None;
@@ -1485,6 +1489,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_backup_restore_can_be_retried_with_the_same_preview() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tracker-restore-retry-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let source_path = dir.join("source.sqlite3");
+        let mut source = Connection::open(&source_path).unwrap();
+        initialise(&mut source).unwrap();
+        source.execute("INSERT INTO clients(name) VALUES('Copied')", []).unwrap();
+        drop(source);
+
+        let prepared = storage_safety::prepare_restore(&source_path).unwrap();
+        let mut restore = RestoreState { sequence: 1, pending: Some(prepared) };
+        let mut tracker = seeded();
+        let obstacle = dir.join("backups");
+        std::fs::write(&obstacle, b"test").unwrap();
+        assert!(apply_prepared_restore(&mut tracker, &mut restore, "1", &dir).is_err());
+        assert!(restore.pending.is_some());
+        assert!(!tracker.restored);
+        assert_eq!(tracker.db.query_row("SELECT name FROM clients WHERE id=1", [], |row| row.get::<_, String>(0)).unwrap(), "A");
+        std::fs::remove_file(&obstacle).unwrap();
+
+        let safety = apply_prepared_restore(&mut tracker, &mut restore, "1", &dir).unwrap();
+        assert!(std::path::Path::new(&safety).is_file());
+        assert!(restore.pending.is_none());
+        assert!(tracker.restored);
+        assert_eq!(tracker.db.query_row("SELECT name FROM clients WHERE id=1", [], |row| row.get::<_, String>(0)).unwrap(), "Copied");
+        drop(tracker);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]
