@@ -17,8 +17,7 @@ if ($Action -eq 'Find') {
     return
 }
 
-if (!('TrackerTestWindow' -as [type])) {
-    Add-Type -TypeDefinition @'
+Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -33,12 +32,11 @@ public static class TrackerTestWindow {
     public static extern bool PostMessageW(IntPtr window, uint message, UIntPtr wParam, IntPtr lParam);
 }
 '@
-}
 
 $window = [IntPtr]::new($WindowHandle)
 [uint32] $owner = 0
 if ([TrackerTestWindow]::GetWindowThreadProcessId($window, [ref] $owner) -eq 0 -or $owner -ne $PrimaryPid) {
-    throw "Cannot apply ${Action} to test window $WindowHandle. Expected process $PrimaryPid, found $owner."
+    throw 'The original test window no longer belongs to the launched application.'
 }
 if ($Action -eq 'Close') {
     if (![TrackerTestWindow]::PostMessageW($window, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)) {
