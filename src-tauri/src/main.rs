@@ -1621,13 +1621,13 @@ mod tests {
             INSERT INTO clients(id,name) VALUES(2,'B');
             INSERT INTO projects(id,client_id,name) VALUES(2,2,'Wspólny'),(3,1,'Wspólny');
             UPDATE projects SET archived=1,name='Zmieniony' WHERE id=1;
-            INSERT INTO tasks(id,project_id,name) VALUES(2,2,'Zadanie'),(3,3,'Zadanie');
+            INSERT INTO tasks(id,project_id,name) VALUES(22,2,'Zadanie'),(33,3,'Zadanie');
             INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES
               (1,1,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600),
               (2,NULL,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600),
-              (3,2,2,'2026-01-01T11:00:00Z','2026-01-01T12:00:00Z',3600),
-              (4,3,3,'2026-01-01T12:00:00Z','2026-01-01T13:00:00Z',3600),
-              (5,2,2,'2026-01-01T13:00:00Z',NULL,NULL);").unwrap();
+              (3,22,2,'2026-01-01T11:00:00Z','2026-01-01T12:00:00Z',3600),
+              (4,33,3,'2026-01-01T12:00:00Z','2026-01-01T13:00:00Z',3600),
+              (5,22,2,'2026-01-01T13:00:00Z',NULL,NULL);").unwrap();
         let selected = ReportScope { client_id: Some(1), project_id: Some(1), task_id: Some(1) };
         let by_project = ReportScope { task_id: None, ..selected };
         let by_client = ReportScope { project_id: None, task_id: None, ..selected };
@@ -1646,7 +1646,7 @@ mod tests {
             ReportScope { project_id: Some(99), ..by_project },
             ReportScope { task_id: Some(99), ..selected },
             ReportScope { project_id: Some(2), ..selected },
-            ReportScope { task_id: Some(3), ..selected },
+            ReportScope { task_id: Some(33), ..selected },
             ReportScope { client_id: None, ..selected },
         ] {
             assert!(report_data_for_scope(&tracker, Utc::now(), Err("unused".into()), invalid).is_err());
