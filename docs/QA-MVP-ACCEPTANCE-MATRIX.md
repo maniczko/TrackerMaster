@@ -1,9 +1,9 @@
 # TECH-06 — Macierz testów i odbioru MVP TrackerMaster
 
 **Data opracowania:** 2026-11-17  
-**Źródła:** Notion „Backlog — Personal Time Tracker”: PTT-01–PTT-41, TECH-06, DEV-15, QA-01 oraz decyzje D1–D12; GitHub `main` bazowo `d9f70423d9cb2ffff0ed22d6308fb08c7da3de8c`.  
-**Status dokumentu:** PLAN DO NIEZALEŻNEGO REVIEW. Wszystkie wyniki wykonania niżej są **NOT RUN** — ten dokument nie jest protokołem przetestowania instalatora.  
-**Kryterium pokrycia:** 30 wymaganych w backlogu pozycji oznaczonych *MVP + Must* (PTT-05 i PTT-21 mają priorytet Should, więc nie są bramką Must). „Must” to priorytet wpisu, nie dowód zatwierdzonej akceptacji — właściwość `Akceptacja` wymaga odrębnego rozstrzygnięcia.
+**Źródła:** Notion „Backlog — Personal Time Tracker”: PTT-01–PTT-41, TECH-06, DEV-15, QA-01 oraz decyzje D1–D13; GitHub `main` bazowo `d9f70423d9cb2ffff0ed22d6308fb08c7da3de8c`.  
+**Status dokumentu:** PLAN QA zaktualizowany o finalne D11/D12 — do niezależnego odbioru TECH-06. Wszystkie wyniki testów aplikacji to **NOT RUN**; dokument nie jest protokołem odbioru DEV-15/QA-01.  
+**Kryterium pokrycia:** 30 wymaganych w backlogu pozycji oznaczonych *MVP + Must* (PTT-05 i PTT-21 mają priorytet Should, więc nie są bramką Must). „Must” to priorytet wpisu, nie dowód zatwierdzonej akceptacji każdej karty PTT — właściwość Akceptacja wymaga odrębnego rozstrzygnięcia. Decyzje biznesowe D11/D12 są finalnie zatwierdzone od 17.11.2026; wykonanie DEV i QA to osobne bramki.
 
 ## 1. Środowisko, dane i zasady
 
@@ -25,33 +25,33 @@
 | PTT-06 Konfiguracja/konflikt skrótu | Must / MVP | T03 |
 | PTT-07 Praca w tle i tray | Must / MVP | T04, T21 |
 | PTT-08 Widoczny stan i kontekst pomiaru | Must / MVP | T01, T04 |
-| PTT-09 Odzyskiwanie po awarii | Must / MVP | T05 |
-| PTT-10 Uśpienie komputera | Must / MVP | T06 |
+| PTT-09 Odzyskiwanie po awarii | Must / MVP | T05, T26 |
+| PTT-10 Uśpienie komputera | Must / MVP | T06, T23 |
 | PTT-11 Lokalni klienci | Must / MVP | T07, T16 |
 | PTT-12 Projekty przypisane do klienta | Must / MVP | T07 |
 | PTT-13 Zadania w projekcie | Must / MVP | T07 |
 | PTT-14 Archiwizacja z historią | Must / MVP | T08, T09 |
 | PTT-16 Historia pomiarów | Must / MVP | T09 |
 | PTT-17 Ręczny wpis czasu | Must / MVP | T10 |
-| PTT-18 Korekta i historia zmian | Must / MVP | T11 |
+| PTT-18 Korekta i historia zmian | Must / MVP | T11, T26 |
 | PTT-19 Nakładanie się przedziałów | Must / MVP | T10, T11 |
-| PTT-20 Raport czasu klienta | Must / MVP | T12, T19 |
-| PTT-22 CSV jednego klienta | Must / MVP | T13, T22 |
-| PTT-23 Podgląd przed CSV | Must / MVP | T13 |
+| PTT-20 Raport czasu klienta | Must / MVP | T12, T19, T24, T25 |
+| PTT-22 CSV jednego klienta | Must / MVP | T13, T22, T25 |
+| PTT-23 Podgląd przed CSV | Must / MVP | T13, T25 |
 | PTT-25 Kopia i odtworzenie | Must / MVP | T14 |
 | PTT-26 Ochrona danych/poświadczeń | Must / MVP | T15, R01, R02 |
 | PTT-32 Pełne offline | Must / MVP | T16 |
 | PTT-33 Pojedyncza instancja | Must / MVP | T17 |
-| PTT-34 Zmiana zegara/strefy | Must / MVP | T18 |
-| PTT-35 Północ/granice raportu | Must / MVP | T19 |
-| PTT-36 Błąd zapisu/brak miejsca | Must / MVP | T20 |
+| PTT-34 Zmiana zegara/strefy | Must / MVP | T18, T24 |
+| PTT-35 Północ/granice raportu | Must / MVP | T19, T24, T25 |
+| PTT-36 Błąd zapisu/brak miejsca | Must / MVP | T20, T26 |
 | PTT-37 Jawne zakończenie podczas pomiaru | Must / MVP | T21 |
-| PTT-38 Dokładność/format eksportu | Must / MVP | T13, T19 |
+| PTT-38 Dokładność/format eksportu | Must / MVP | T13, T19, T25 |
 | PTT-39 Bezpieczny tekst w eksporcie | Must / MVP | T22 |
 
-**Wynik macierzy:** 30/30 pól Must MVP ma przypisany przynajmniej jeden scenariusz. To tylko pokrycie planem, NIE pokrycie wykonaniem. T01–T22 mają instrukcję poniżej. R01–R03 to dodatkowe bramki D11; nie utożsamiać ich z nowymi identyfikatorami PTT.
+**Wynik macierzy:** 30/30 pól Must MVP ma przypisany przynajmniej jeden scenariusz. To tylko pokrycie planem, NIE pokrycie wykonaniem. T01–T26 mają instrukcję poniżej, w tym T23–T26 weryfikujące skonsolidowane D11/D12. R01–R03 to dodatkowe bramki D11; nie utożsamiać ich z nowymi identyfikatorami PTT.
 
-## 3. Procedury szczegółowe (wszystkie: NOT RUN)
+## 3. Procedury szczegółowe T01–T26 (wszystkie: NOT RUN)
 
 **T01 — start/stop i stan timera (PTT-01/02/08).** Dane: K-A / Wspólny / A1, zegar Windows bez modyfikacji. Kroki: uruchom aplikację offline; wybierz K-A, projekt i zadanie; naciśnij Start; odczekaj co najmniej 5 s, sprawdź stan w głównym oknie; Stop; zamknij i uruchom ponownie. Oczekiwane: dokładnie jeden zamknięty wpis K-A, czas nieujemny odpowiada rzeczywiście upływającemu czasowi, stan „zatrzymany”, ta sama historia po restarcie; brak drugiego bieżącego pomiaru.
 
@@ -97,6 +97,15 @@
 
 **T22 — CSV injection i polskie znaki (PTT-22/39).** Dane: nazwy i opisy rozpoczynające się `=`, `+`, `-`, `@`, tabulatorem/nową linią; `Zażółć gęślą jaźń`, `"test";` i wielowierszowy opis. Kroki: podgląd, eksport CSV, otwórz w arkuszu i zweryfikuj cytowanie; ponownie odczytaj oryginalny wpis w SQLite. Oczekiwane: żaden tekst użytkownika nie jest wykonany jako formuła, polskie znaki i nowe linie zachowane, eksport nie modyfikuje opisu źródłowego.
 
+
+**T23 — wiele okresów uśpienia i decyzje po restarcie (PTT-09/10/20).** Dane syntetyczne: A1, 10:00–11:00 praca, S1 sen 11:00–12:00, praca 12:00–12:30, S2 sen 12:30–13:00, praca 13:00–14:00. Osobny przypadek: brak czasu wybudzenia. Kroki: rzeczywisty suspend/resume Windows 11 x64, identyfikacja S1/S2, odłożenie decyzji „Później”, restart, odczyt listy i banera 10 sekund, wpisanie brakującej godziny (gdy potrzeba), doliczenie wyłącznie S1, odrzucenie S2, ponowne wykonanie tej samej operacji i kolejne restarty. Oczekiwane: 2h30m pracy + 1h30m pending przed decyzją; po doliczeniu S1 — 3h30m pracy; po odrzuceniu S2 — nadal 3h30m; brak automatycznego dopisywania, podwójnego naliczenia i nadpisania granic. UI nie blokuje timera przy odroczeniu, a okres z nieznanym końcem wymaga jawnej korekty; Summary/Detailed/CSV zgodne ze stanem decyzji.
+
+**T24 — strefa IANA, filtr dat, presety i DST (PTT-20/34/35).** Dane: źródło UTC 2026-01-31 23:30–2026-02-01 00:30 (3600 s), filtr styczniowy oraz instant referencyjny 2026-11-15 23:30Z. Kroki: wyświetl Europe/Warsaw, wybierz Europe/London i „Anuluj”, następnie „Zastosuj”; powtórz z błędem trwałego zapisu ustawienia i dla presetów „Dzisiaj”/„Ten tydzień”; sprawdź restart, powrót do Warszawy oraz daty DST. Oczekiwane: w Warszawie styczeń 0 s, luty 3600 s; w Londynie styczeń 1800 s, luty 1800 s, bez zmiany całkowitego czasu i entryId; anulowanie/błąd persist niczego nie zapisują; ręcznie wskazane daty filtra pozostają takie same, presety względne przeliczają lokalny dzień (Warszawa 16.11, Londyn 15.11); eksport i Detailed pokazują te same wkłady.
+
+**T25 — finalny kontrakt 12 kolumn CSV (PTT-20/22/23/35/38/39).** Dane: ukończony wpis 23:30–01:30 przez północ (7200 s), dwóch klientów A/B, rozliczalne i nierozliczalne wpisy, tekst z polskimi znakami, średnikiem, cudzysłowem, nową linią oraz potencjalną formułą; czas ponad 24 h. Kroki: wygeneruj podgląd Detailed i CSV dla pojedynczego dnia, całego okresu i każdego klienta; porównaj zapisane bajty oraz widok polskiego Excela, przetestuj Europe/Warsaw i DST. Oczekiwane: dokładnie 12 zatwierdzonych polskich kolumn w kolejności: ID, klient, projekt, zadanie, opis, start, koniec, rozliczalność, całkowite sekundy, całkowite HH:MM:SS, sekundy w okresie, HH:MM:SS w okresie; 1 wiersz na oryginalny ukończony wpis; UTF-8 z pojedynczym BOM, separator średnik, cytowanie i ochrona przed CSV injection, wartości Tak/Nie, lokalne ISO8601 z offsetem, bez zaokrągleń, brak zawijania czasu po 24h. Dla pełnego wpisu 7200 s, a dla odpowiednich dni wkład 1800 s i 5400 s; bez obcych klientów, aktywnych i nierozstrzygniętych sekund w sumach. Zawartość CSV zgodna z podglądem, bez zmian w bazie źródłowej.
+
+**T26 — szkice po awarii i preferencje sortowania (PTT-09/18/36).** Dane: formularz edycji E1, lokalny szkic, później zmodyfikowany bądź usunięty oryginał oraz dwa oczekujące szkice. Kroki: zmień formularz, odczekaj około 1 s bez wpisywania i wywołaj blur, wymuś zamknięcie procesu i restart; odłóż powiadomienie do końca sesji, sprawdź listę „Szkice (N)”, konflikt wersji E1, brak oryginału i ręczne odtworzenie nowego wpisu ze śladem pochodzenia; wybierz „Najnowsze/Najstarsze”, wykonaj restart, zasymuluj błąd persist, automatyczne ograniczone ponowienia i ręczne „Spróbuj ponownie”. Oczekiwane: szkice zachowane bez automatycznego usunięcia i bez cichego nadpisania oryginału, trwały audyt pochodzenia, poprawny porządek i zapamiętanie preferencji; przy błędzie zapisu preferencja działa w bieżącej sesji z ostrzeżeniem, a ręczne retry nie resetuje limitu automatycznych prób. Scenariusz początkowo NOT RUN.
+
 ## 4. Dodatkowe bramki D11 wydania Store (NOT RUN)
 
 **R01 — prawdziwe MSIX i Private audience.** Dane: konto MSA właściciela (bez wpisywania adresu do dowodów), drugie niezaproszone MSA, czysty Windows 11 x64. Kroki: zweryfikuj zatwierdzony pakiet w Store, pozytywny pobór przez właściciela, negatywna próba obcego konta także z bezpośrednim linkiem. Oczekiwane: produkt Free, prywatna grupa tylko z MSA właściciela, brak nieautoryzowanego pobrania, nie rozszerzano grona testerów. Nie tworzyć konta/nie publikować bez osobnej operacyjnej autoryzacji.
@@ -119,11 +128,11 @@
 | Dowody | Link do logu/zdjęcia/raportu, bez sekretów |
 | Defekt / ponowienie | ID zgłoszenia, data poprawki i ponowny wynik |
 
-**Brama DEV-15:** wszystkie 30 pozycji Must muszą mieć wykonane testy, bez krytycznych FAIL/BLOCKED, a scenariusze T05/T06/T13/T14/T15/T16/T20 oraz R01–R03 muszą być poparte dowodami odpowiednio do bieżącej D11. Wymaganie „niezależna QA” w QA-01 jest osobne — autor kodu nie zatwierdza samodzielnie wydania. Brak podpisanego/instalowalnego MSIX, testu realnego sleep, migracji, braku mieszania klientów lub przywracania = **BLOCKED**, a nie PASS.
+**Brama DEV-15:** wszystkie 30 pozycji Must muszą mieć wykonane testy, łącznie z nowymi T23–T26, bez krytycznych FAIL/BLOCKED, a scenariusze T05/T06/T13/T14/T15/T16/T20 oraz R01–R03 muszą być poparte dowodami odpowiednio do bieżącej D11. Wymaganie „niezależna QA” w QA-01 jest osobne — autor kodu nie zatwierdza samodzielnie wydania. Brak podpisanego/instalowalnego MSIX, testu realnego sleep, migracji, braku mieszania klientów lub przywracania = **BLOCKED**, a nie PASS.
 
 ## 6. Otwarte uzgodnienia i kontrola aktualności
 
-- D11 i D12 mają nadal zbiorczy status „Do decyzji”; w ich treści znajdują się liczne zatwierdzone poddecyzje. Przed wykonaniem QA potwierdzić ostatnią wersję kontraktu (nowsze poddecyzje mogą nadpisywać wcześniejsze zapisy, np. NSIS→Store MSIX).
-- Właściwość `Akceptacja` wymaga osobnego zatwierdzenia; ten plan nie zmienia jej automatycznie.
+- **D11 i D12 zatwierdzono biznesowo 17.11.2026** (Status Zrobione, Akceptacja Zatwierdzone). D11: Windows 11 x64, Microsoft Store MSIX Private audience, konto Individual i jedyne osobiste MSA właściciela, trwałe niewirtualizowane per-user AppData po uninstall/reinstall. Poprzednie NSIS/OneDrive/płatne podpisywanie to historie propozycji, nie obowiązujący kanał wydania. D12: UTC/IANA/DST, indywidualne pending, nieblokujące przypomnienia, Detailed/CSV i odzyskiwane szkice. Obie decyzje nie wymagają ponownego głosowania PO.
+- Akceptacja D11/D12 nie oznacza odbioru żadnego DEV ani wykonania testów. Wiele kart PTT ma nadal Akceptacja=Propozycja. TECH-06 ocenia kompletność *planu*; QA-01/DEV-15 oceniają rzeczywiście uruchomione testy i pozostają osobne.
 - Przy nowym Must zmienić macierz, dodać scenariusz i ponownie zrewidować bramkę; nie zaliczać pokrycia testem, który nie spełnia nowego kontraktu.
 - Pokrycie scenariuszami = plan. Pokrycie wdrożeniem = osobny przegląd GitHub. Pokrycie wykonaniem = zarejestrowany wynik QA. Te trzy poziomy raportować oddzielnie.
