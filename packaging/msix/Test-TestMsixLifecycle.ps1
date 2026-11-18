@@ -70,9 +70,20 @@ public static class TestPackageActivation {
 }
 '@
 
-function Install-TestVersion([string] $Path, [version] $Version) {
+function Install-TestVersion([string] $Path, [version] $Version, [switch] $Updating) {
     Write-Host "Installing test package $Version"
-    Add-AppxPackage -Path $Path -AllowUnsigned
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        try {
+            # On the clean runner, only the verified test package can still
+            # hold resources after its main window and process exit.
+            Add-AppxPackage -Path $Path -AllowUnsigned -ForceTargetApplicationShutdown:($Updating -and $attempt -eq 2)
+            break
+        } catch {
+            if (!$Updating -or $attempt -ge 2 -or $_.Exception.Message -notmatch '0x80073D02') { throw }
+            Write-Host 'The test MSIX is still releasing resources. Retrying the update.'
+            Start-Sleep -Seconds 3
+        }
+    }
     $instance = Get-AppxPackage -Name $packageName
     if (!$instance -or [version] $instance.Version -ne $Version) {
         throw "Windows did not register test version $Version."
@@ -97,7 +108,10 @@ function Start-TestVersion($Instance) {
         $process.Refresh()
         if (!$process.HasExited) {
             [void] $process.CloseMainWindow()
-            if (!$process.WaitForExit(3000)) { Stop-Process -Id $process.Id -Force }
+            if (!$process.WaitForExit(3000)) {
+                Stop-Process -Id $process.Id -Force
+                if (!$process.WaitForExit(5000)) { throw 'The test application did not exit.' }
+            }
         }
     }
 }
@@ -131,7 +145,7 @@ Start-TestVersion $initial
 Test-LocalData 'seed'
 Write-Host 'Clean installation opened with an isolated database.'
 
-$updated = Install-TestVersion $updatedPath ([version] $updatedIdentity.Version)
+$updated = Install-TestVersion $updatedPath ([version] $updatedIdentity.Version) -Updating
 Start-TestVersion $updated
 Test-LocalData 'check'
 Write-Host 'Update preserved the test client and preferences.'
