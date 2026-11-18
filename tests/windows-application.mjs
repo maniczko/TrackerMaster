@@ -427,9 +427,17 @@ async function verifyDraft(cdp, sessionId, phase) {
   };
   const text = 'Szkic po przerwaniu aplikacji';
   if (phase === 'verify-recovery') {
-    await waitFor('history row for the first client', () => evaluate(`Boolean([...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)})))`));
-    await evaluate(`[...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)})).querySelector('button[aria-label^="Popraw wpis:"]').click()`);
-    await waitFor('entry editor opens', () => evaluate(`Boolean(document.querySelector('#entry-draft-description'))`));
+    await waitFor('editor action for the first client is ready', () => evaluate(`(() => {
+      const row = [...document.querySelectorAll('section.history tbody tr')].find(item => item.textContent.includes(${JSON.stringify(primaryDescription)}));
+      const action = row?.querySelector('button[aria-label^="Popraw wpis:"]');
+      return Boolean(action && !action.disabled);
+    })()`));
+    await waitFor('entry editor opens', () => evaluate(`(() => {
+      if (document.querySelector('#entry-draft-description')) return true;
+      const action = [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)}))?.querySelector('button[aria-label^="Popraw wpis:"]');
+      if (action && !action.disabled) action.click();
+      return false;
+    })()`));
     await evaluate(`(() => {
       const field = document.querySelector('#entry-draft-description');
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, ${JSON.stringify(text)});
