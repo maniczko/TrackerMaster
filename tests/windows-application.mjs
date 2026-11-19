@@ -500,6 +500,23 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     assert.equal(rows[3].ended_at, null);
     entryId = rows[3].id;
   } finally { activeDb.close(); }
+  await waitFor('main window shows the active timer', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button:not(:disabled)'))`));
+  const failureDb = new DatabaseSync(testDb);
+  try {
+    failureDb.exec("CREATE TRIGGER test_reject_timer_stop BEFORE UPDATE OF ended_at ON time_entries BEGIN SELECT RAISE(FAIL, 'test timer write failure'); END");
+    await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button').click()`);
+    await waitFor('write failure is shown to the user', () => evaluate(mainSession, `[...document.querySelectorAll('[role="alert"]')].some(item => item.textContent.includes('Nie udało się potwierdzić operacji') && item.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych'))`));
+    await waitFor('timer still shown as running after the failed stop', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .status.running'))`));
+    assert.equal(await evaluate(mainSession, `document.body.textContent.includes('Pomiar zatrzymany.')`), false);
+    const unchanged = failureDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
+    assert.equal(unchanged.length, 4);
+    assert.equal(unchanged[3].id, entryId);
+    assert.equal(unchanged[3].ended_at, null);
+    assert.equal(unchanged[3].duration_seconds, null);
+  } finally {
+    failureDb.exec('DROP TRIGGER IF EXISTS test_reject_timer_stop');
+    failureDb.close();
+  }
   pressShortcut();
   await waitFor('second press stops measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'idle'`));
   const stoppedDb = new DatabaseSync(testDb, { readOnly: true });
@@ -509,7 +526,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     assert.equal(rows[3].id, entryId);
     assert.ok(rows[3].ended_at && rows[3].duration_seconds >= 5);
   } finally { stoppedDb.close(); }
-  console.log('PASS: the saved global shortcut started and stopped exactly one entry after application restart');
+  console.log('PASS: failed Stop showed an error and kept the entry open; the global shortcut retry stopped it exactly once after restart');
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
