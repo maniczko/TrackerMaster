@@ -348,7 +348,9 @@ async function verifyMiniTimer(cdp, mainSession) {
   await delay(250);
   assert.equal(await evaluate(widget, 'document.querySelector(".qp-mini").dataset.mode'), 'idle',
     'The old shortcut must not activate a focused Start button');
-  await evaluate(widget, 'document.querySelector(".qp-toggle").click()');
+  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', 'tests/windows-hotkey.ps1'], {
+    timeout: 10_000, windowsHide: true, stdio: 'pipe',
+  });
   await waitFor('mini timer starts native measurement', () => evaluate(widget, `(() => {
     const clock = document.querySelector('.qp-clock');
     const elapsed = clock?.textContent.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
