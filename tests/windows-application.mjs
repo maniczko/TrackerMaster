@@ -557,8 +557,22 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, ${JSON.stringify(originalEnd)});
     field.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
+  const injectedFailure = new DatabaseSync(testDb);
+  try {
+    injectedFailure.exec("CREATE TRIGGER test_reject_revision BEFORE INSERT ON description_revisions BEGIN SELECT RAISE(FAIL, 'test write failure'); END");
+  } finally { injectedFailure.close(); }
   assert.equal(inspectWindow('Close', primary.pid, window), 'posted');
   await waitFor('corrected draft save confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
+  await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
+  await waitFor('SQLite error keeps the editor open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych')`));
+  assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
+  assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
+  const blocked = new DatabaseSync(testDb);
+  try {
+    assert.equal(blocked.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
+    assert.equal(blocked.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
+    blocked.exec('DROP TRIGGER test_reject_revision');
+  } finally { blocked.close(); }
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
   await waitFor('save hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
   const saved = new DatabaseSync(testDb, { readOnly: true });
@@ -578,7 +592,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   }
   await waitFor('second launch restores the window after save', () => inspectWindow('Visibility', primary.pid, window) === 'visible');
   await waitFor('saved correction appears in history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(savedText)}))`));
-  console.log('PASS: invalid edit stayed open with unchanged data; corrected save recorded one revision');
+  console.log('PASS: validation and SQLite failures preserved the edit; retry saved exactly one revision');
 }
 
 async function runWindow(port, phase, recovery) {
