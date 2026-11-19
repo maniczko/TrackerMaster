@@ -567,6 +567,11 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     failureDb.exec('DROP TRIGGER IF EXISTS test_reject_timer_stop');
     failureDb.close();
   }
+  await waitFor('switched timer runs for at least six seconds', () => evaluate(widget, `(() => {
+    const clock = document.querySelector('.qp-clock');
+    const elapsed = clock?.textContent.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
+    return document.querySelector('.qp-mini')?.dataset.mode === 'running' && elapsed >= 6;
+  })()`));
   pressShortcut();
   await waitFor('second press stops measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'idle'`));
   const stoppedDb = new DatabaseSync(testDb, { readOnly: true });
