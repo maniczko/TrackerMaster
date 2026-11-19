@@ -533,8 +533,32 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, ${JSON.stringify(savedText)});
     field.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
+  const originalEnd = await evaluate(`document.querySelectorAll('[aria-label="Edycja wpisu"] input[type="datetime-local"]')[1].value`);
+  await evaluate(`(() => {
+    const field = document.querySelectorAll('[aria-label="Edycja wpisu"] input[type="datetime-local"]')[1];
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, '');
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
   assert.equal(inspectWindow('Close', primary.pid, window), 'posted');
   await waitFor('draft save confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
+  await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
+  await waitFor('invalid edit stays open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Sprawdź daty i godziny')`));
+  assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
+  assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
+  const rejected = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    assert.equal(rejected.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
+    assert.equal(rejected.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
+  } finally { rejected.close(); }
+  await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Pozostań').click()`);
+  await waitFor('invalid edit dialog dismissed', () => evaluate(`!document.querySelector('dialog.entry-draft-dialog[open]')`));
+  await evaluate(`(() => {
+    const field = document.querySelectorAll('[aria-label="Edycja wpisu"] input[type="datetime-local"]')[1];
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, ${JSON.stringify(originalEnd)});
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  assert.equal(inspectWindow('Close', primary.pid, window), 'posted');
+  await waitFor('corrected draft save confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
   await waitFor('save hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
   const saved = new DatabaseSync(testDb, { readOnly: true });
@@ -554,7 +578,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   }
   await waitFor('second launch restores the window after save', () => inspectWindow('Visibility', primary.pid, window) === 'visible');
   await waitFor('saved correction appears in history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(savedText)}))`));
-  console.log('PASS: save on close recorded exactly one correction and restored the same window');
+  console.log('PASS: invalid edit stayed open with unchanged data; corrected save recorded one revision');
 }
 
 async function runWindow(port, phase, recovery) {
