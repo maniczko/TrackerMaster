@@ -68,6 +68,17 @@ public static class TestPackageActivation {
         }
     }
 }
+
+public static class TestPackageWindow {
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr window, out uint owner);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostMessageW(IntPtr window, uint message, UIntPtr wParam, IntPtr lParam);
+}
 '@
 
 function Install-TestVersion([string] $Path, [version] $Version, [switch] $Updating) {
@@ -97,13 +108,50 @@ function Start-TestVersion($Instance) {
     $expectedExe = Join-Path $Instance.InstallLocation 'tracker-master.exe'
     if ($process.Path -ine $expectedExe) { throw "Unexpected process from test package activation." }
     try {
+        $window = [IntPtr]::Zero
         for ($attempt = 0; $attempt -lt 30; $attempt++) {
             $process.Refresh()
             if ($process.HasExited) { throw "Packaged application exited with code $($process.ExitCode)." }
-            if ($process.MainWindowHandle -ne 0 -and (Test-Path -LiteralPath $database)) { return }
+            if ($process.MainWindowHandle -ne 0 -and $process.MainWindowTitle -eq 'Personal Time Tracker' -and
+                (Test-Path -LiteralPath $database)) {
+                $window = $process.MainWindowHandle
+                break
+            }
             Start-Sleep -Seconds 1
         }
-        throw 'Packaged application did not open a window and database in the test profile.'
+        if ($window -eq [IntPtr]::Zero) { throw 'Packaged application did not open a window and database in the test profile.' }
+        [uint32] $windowOwner = 0
+        if ([TestPackageWindow]::GetWindowThreadProcessId($window, [ref] $windowOwner) -eq 0 -or $windowOwner -ne $processId) {
+            throw 'The window does not belong to the launched test package.'
+        }
+        Start-Sleep -Seconds 2
+        if (![TestPackageWindow]::PostMessageW($window, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)) {
+            throw "Could not request window close: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
+        }
+        $hidden = $false
+        for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            $process.Refresh()
+            if ($process.HasExited -or ![TestPackageWindow]::IsWindow($window)) {
+                throw 'Closing the packaged window terminated the process or destroyed its window.'
+            }
+            if (![TestPackageWindow]::IsWindowVisible($window)) { $hidden = $true; break }
+            Start-Sleep -Milliseconds 250
+        }
+        if (!$hidden) { throw 'The packaged window stayed visible after the close request.' }
+        $reactivatedId = [TestPackageActivation]::Launch("$($Instance.PackageFamilyName)!TrackerMaster")
+        if ($reactivatedId -ne $processId) {
+            $second = Get-Process -Id $reactivatedId -ErrorAction SilentlyContinue
+            if ($second -and !$second.WaitForExit(10000)) { throw 'A second packaged process remained running.' }
+        }
+        $visible = $false
+        for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            $process.Refresh()
+            if ($process.HasExited -or ![TestPackageWindow]::IsWindow($window)) { throw 'The original packaged window disappeared after reactivation.' }
+            if ([TestPackageWindow]::IsWindowVisible($window)) { $visible = $true; break }
+            Start-Sleep -Milliseconds 250
+        }
+        if (!$visible) { throw 'Reactivating the package did not show the original window.' }
+        Write-Host 'PASS: close hid the packaged window and reactivation restored the original process and window.'
     } finally {
         $process.Refresh()
         if (!$process.HasExited) {
