@@ -1800,6 +1800,99 @@ mod tests {
         assert_eq!(state.entries[0].id, active_id);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn project_timer_write_failures_roll_back_on_disk_and_allow_retry() {
+        use optional_task_migration::{transition, TimerAction};
+        use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+        }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = PathBuf::from("target").join(format!("tracker-timer-write-{}-{stamp}.sqlite3", std::process::id()));
+        fs::File::create_new(&path).unwrap();
+        let file = Cleanup(path);
+        let mut db = Connection::open(&file.0).unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Original'),(2,1,'Next');
+            INSERT INTO billable_projects VALUES(2);").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+
+        let persisted = || {
+            let reader = Connection::open_with_flags(&file.0, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let mut stmt = reader.prepare("SELECT e.id,e.project_id,e.started_at,e.ended_at,e.duration_seconds,
+                (SELECT description FROM entry_descriptions WHERE entry_id=e.id),
+                EXISTS(SELECT 1 FROM billable_entries WHERE entry_id=e.id)
+                FROM time_entries e ORDER BY e.id").unwrap();
+            let entries = stmt.query_map([], |r| Ok((
+                r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?, r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<String>>(5)?, r.get::<_, bool>(6)?,
+            ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let metadata = reader.query_row("SELECT (SELECT COUNT(*) FROM entry_descriptions),
+                (SELECT COUNT(*) FROM billable_entries)", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap();
+            (entries, metadata)
+        };
+        let clock = |tracker: &Tracker| tracker.running_since.as_ref().unwrap().since;
+        let write_error = "Nie udało się zapisać lub odczytać danych lokalnych.";
+        let started = now();
+        transition(&mut tracker, None, &started, TimerAction::Start { project_id: 1, task_id: None, description: "Original" }).unwrap();
+        let first = snapshot(&tracker).unwrap().active.unwrap().id;
+        let original_clock = clock(&tracker);
+        let before_switch = persisted();
+        assert_eq!(before_switch, (vec![(first, 1, started, None, None, Some("Original".into()), false)], (1, 0)));
+        let switch = || TimerAction::Start { project_id: 2, task_id: None, description: "Replacement" };
+
+        // FAIL leaves earlier changes intact inside the transaction; dropping it must undo them.
+        tracker.db.execute_batch("CREATE TEMP TRIGGER fail_switch_description
+            AFTER INSERT ON main.entry_descriptions BEGIN SELECT RAISE(FAIL, 'simulated switch write failure'); END;").unwrap();
+        assert_eq!(transition(&mut tracker, Some(first), &now(), switch()).unwrap_err(), write_error);
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(clock(&tracker), original_clock);
+        assert_eq!(persisted(), before_switch);
+
+        tracker.db.execute_batch("DROP TRIGGER temp.fail_switch_description;").unwrap();
+        let switched_at = now();
+        transition(&mut tracker, Some(first), &switched_at, switch()).unwrap();
+        let before_stop = persisted();
+        let (entries, metadata) = &before_stop;
+        assert_eq!(*metadata, (2, 1));
+        assert_eq!(entries.len(), 2);
+        let mut closed_first = before_switch.0[0].clone();
+        closed_first.3 = Some(switched_at.clone());
+        closed_first.4 = entries[0].4;
+        assert!(closed_first.4.is_some());
+        assert_eq!(entries[0], closed_first);
+        let second = entries[1].0;
+        assert_ne!(second, first);
+        assert_eq!(entries[1], (second, 2, switched_at, None, None, Some("Replacement".into()), true));
+
+        let active_clock = clock(&tracker);
+        tracker.db.execute_batch("CREATE TEMP TRIGGER fail_stop_close
+            AFTER UPDATE OF ended_at ON main.time_entries BEGIN SELECT RAISE(FAIL, 'simulated stop write failure'); END;").unwrap();
+        assert_eq!(transition(&mut tracker, Some(second), &now(), TimerAction::Stop).unwrap_err(), write_error);
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(clock(&tracker), active_clock);
+        assert_eq!(persisted(), before_stop);
+
+        tracker.db.execute_batch("DROP TRIGGER temp.fail_stop_close;").unwrap();
+        let stopped_at = now();
+        transition(&mut tracker, Some(second), &stopped_at, TimerAction::Stop).unwrap();
+        assert!(tracker.running_since.is_none());
+        drop(tracker);
+        let after_stop = persisted();
+        let mut expected = before_stop;
+        expected.0[1].3 = Some(stopped_at);
+        expected.0[1].4 = after_stop.0.get(1).and_then(|entry| entry.4);
+        assert!(expected.0[1].4.is_some());
+        assert_eq!(after_stop, expected);
+    }
+
     #[test]
     fn repeated_start_does_not_split_active_entry() {
         let mut tracker = seeded();
