@@ -484,6 +484,42 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=1').get().count, 1);
   } finally { db.close(); }
   console.log('PASS: draft survived process interruption and applied once to the original entry');
+
+  await waitFor('second entry editor opens', () => evaluate(`(() => {
+    if (document.querySelector('#entry-draft-description')) return true;
+    const action = [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(secondDescription)}))?.querySelector('button[aria-label^="Popraw wpis:"]');
+    if (action && !action.disabled) action.click();
+    return false;
+  })()`));
+  const discardedText = 'Niezapisana edycja do odrzucenia';
+  await evaluate(`(() => {
+    const field = document.querySelector('#entry-draft-description');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, ${JSON.stringify(discardedText)});
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const window = await waitFor('main window before discarding draft', () => inspectWindow('Find', primary.pid) || null);
+  assert.equal(inspectWindow('Close', primary.pid, window), 'posted');
+  await waitFor('draft discard confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
+  await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Odrzuć zmiany').click()`);
+  await waitFor('discard hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
+  const unchanged = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    assert.equal(unchanged.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
+    assert.equal(unchanged.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
+  } finally { unchanged.close(); }
+  const relaunch = spawn(exe, [], { env: process.env, stdio: 'ignore', windowsHide: true });
+  try {
+    assert.deepEqual(await once(relaunch, 'exit', { signal: AbortSignal.timeout(12_000) }), [0, null]);
+  } finally {
+    if (relaunch.pid && relaunch.exitCode === null && relaunch.signalCode === null) {
+      const exited = once(relaunch, 'exit');
+      relaunch.kill();
+      await exited;
+    }
+  }
+  await waitFor('second launch restores the window after discard', () => inspectWindow('Visibility', primary.pid, window) === 'visible');
+  assert.equal(await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`), false);
+  console.log('PASS: discard left the original entry unchanged and reopened the same window');
 }
 
 async function runWindow(port, phase, recovery) {
