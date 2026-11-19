@@ -102,6 +102,17 @@ function Install-TestVersion([string] $Path, [version] $Version, [switch] $Updat
     $instance
 }
 
+function Write-TestWindowState([string] $Phase, $Process, [IntPtr] $Window, [version] $Version) {
+    $Process.Refresh()
+    $exited = $Process.HasExited
+    $exitCode = if ($exited) { try { $Process.ExitCode } catch { 'unavailable' } } else { 'running' }
+    $valid = [TestPackageWindow]::IsWindow($Window)
+    [uint32] $owner = 0
+    $thread = [TestPackageWindow]::GetWindowThreadProcessId($Window, [ref] $owner)
+    $visible = $valid -and [TestPackageWindow]::IsWindowVisible($Window)
+    Write-Host "WINDOW_DIAGNOSTIC phase=$Phase version=$Version pid=$($Process.Id) exited=$exited exitCode=$exitCode hwnd=$($Window.ToInt64()) valid=$valid owner=$owner thread=$thread visible=$visible"
+}
+
 function Start-TestVersion($Instance) {
     $processId = [TestPackageActivation]::Launch("$($Instance.PackageFamilyName)!TrackerMaster")
     $process = Get-Process -Id $processId
@@ -125,20 +136,31 @@ function Start-TestVersion($Instance) {
             throw 'The window does not belong to the launched test package.'
         }
         Start-Sleep -Seconds 2
+        Write-TestWindowState 'before-close' $process $window ([version] $Instance.Version)
         if (![TestPackageWindow]::PostMessageW($window, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)) {
             throw "Could not request window close: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
         }
         $hidden = $false
         for ($attempt = 0; $attempt -lt 40; $attempt++) {
             $process.Refresh()
-            if ($process.HasExited -or ![TestPackageWindow]::IsWindow($window)) {
-                throw 'Closing the packaged window terminated the process or destroyed its window.'
+            if ($process.HasExited) {
+                Write-TestWindowState 'after-close-process-exited' $process $window ([version] $Instance.Version)
+                throw "The packaged process exited after the close request with code $($process.ExitCode)."
+            }
+            if (![TestPackageWindow]::IsWindow($window)) {
+                Write-TestWindowState 'after-close-window-invalid' $process $window ([version] $Instance.Version)
+                throw 'The packaged process remained running but its original window became invalid after the close request.'
             }
             if (![TestPackageWindow]::IsWindowVisible($window)) { $hidden = $true; break }
             Start-Sleep -Milliseconds 250
         }
-        if (!$hidden) { throw 'The packaged window stayed visible after the close request.' }
+        if (!$hidden) {
+            Write-TestWindowState 'after-close-still-visible' $process $window ([version] $Instance.Version)
+            throw 'The packaged window stayed visible after the close request.'
+        }
+        Write-TestWindowState 'after-close-hidden' $process $window ([version] $Instance.Version)
         $reactivatedId = [TestPackageActivation]::Launch("$($Instance.PackageFamilyName)!TrackerMaster")
+        Write-Host "WINDOW_DIAGNOSTIC phase=reactivation version=$($Instance.Version) originalPid=$processId activatedPid=$reactivatedId"
         if ($reactivatedId -ne $processId) {
             $second = Get-Process -Id $reactivatedId -ErrorAction SilentlyContinue
             if ($second -and !$second.WaitForExit(10000)) { throw 'A second packaged process remained running.' }
@@ -146,11 +168,22 @@ function Start-TestVersion($Instance) {
         $visible = $false
         for ($attempt = 0; $attempt -lt 40; $attempt++) {
             $process.Refresh()
-            if ($process.HasExited -or ![TestPackageWindow]::IsWindow($window)) { throw 'The original packaged window disappeared after reactivation.' }
+            if ($process.HasExited) {
+                Write-TestWindowState 'after-reactivation-process-exited' $process $window ([version] $Instance.Version)
+                throw "The original packaged process exited after reactivation with code $($process.ExitCode)."
+            }
+            if (![TestPackageWindow]::IsWindow($window)) {
+                Write-TestWindowState 'after-reactivation-window-invalid' $process $window ([version] $Instance.Version)
+                throw 'The original packaged window became invalid after reactivation.'
+            }
             if ([TestPackageWindow]::IsWindowVisible($window)) { $visible = $true; break }
             Start-Sleep -Milliseconds 250
         }
-        if (!$visible) { throw 'Reactivating the package did not show the original window.' }
+        if (!$visible) {
+            Write-TestWindowState 'after-reactivation-still-hidden' $process $window ([version] $Instance.Version)
+            throw 'Reactivating the package did not show the original window.'
+        }
+        Write-TestWindowState 'after-reactivation-visible' $process $window ([version] $Instance.Version)
         Write-Host 'PASS: close hid the packaged window and reactivation restored the original process and window.'
     } finally {
         $process.Refresh()
