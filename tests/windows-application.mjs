@@ -421,7 +421,7 @@ async function verifyRestoreRetry(cdp, sessionId) {
   }
 }
 
-async function verifyDraft(cdp, sessionId, phase) {
+async function verifyDraft(cdp, sessionId, phase, primary) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
@@ -456,7 +456,18 @@ async function verifyDraft(cdp, sessionId, phase) {
     const db = new DatabaseSync(testDb, { readOnly: true });
     try { assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, primaryDescription); }
     finally { db.close(); }
+    const window = await waitFor('main window while editing', () => inspectWindow('Find', primary.pid) || null);
+    assert.equal(inspectWindow('Close', primary.pid, window), 'posted');
+    await waitFor('unsaved edit close confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
+    assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
+    const labels = await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].map(button => button.textContent.trim())`);
+    assert.deepEqual(labels, ['Zapisz', 'Odrzuć zmiany', 'Pozostań']);
+    await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Pozostań').click()`);
+    await waitFor('close confirmation dismissed', () => evaluate(`!document.querySelector('dialog.entry-draft-dialog[open]')`));
+    assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), text);
+    assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
     console.log('draft: uncommitted snapshot saved while original entry remained unchanged');
+    console.log('PASS: closing the window asked about the draft and Stay preserved it');
     return;
   }
   const button = `[...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Przejdź do szkiców')`;
@@ -552,7 +563,7 @@ async function runWindow(port, phase, recovery) {
       await verifyMiniTimer(cdp, sessionId);
       await verifySecondLaunch(child, env);
     }
-    if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase);
+    if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase, child);
     if (phase === 'draft-reopen') await verifyRestoreRetry(cdp, sessionId);
     return seconds;
   } finally {
