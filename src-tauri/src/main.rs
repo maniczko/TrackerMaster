@@ -1353,16 +1353,17 @@ fn start_project_from_shortcut(tracker: &mut Tracker, project_id: i64, task_id: 
 }
 
 fn request_quit(app: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    // Check before reading the timer: it can change while a confirmation is open.
+    if app.state::<QuitDialog>().0.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
     let shared = app.state::<Shared>();
     let guard = shared.lock();
     let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
         .and_then(|tracker| snapshot(tracker).map(|s| s.active));
     if matches!(active, Ok(None)) { app.exit(0); }
     else {
-        use std::sync::atomic::Ordering;
-        if app.state::<QuitDialog>().0.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return;
-        }
         // Do not hold the tracker lock or block the UI thread during a dialog.
         drop(guard);
         let main_app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(main_app).await; });
