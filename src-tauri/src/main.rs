@@ -2369,6 +2369,71 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn read_only_database_keeps_timer_open_and_allows_stop_after_reopen() {
+        use optional_task_migration::{transition, TimerAction};
+        use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        struct ResetCapture;
+        impl Drop for ResetCapture { fn drop(&mut self) { DB_ERROR_CAPTURE.with(|capture| drop(capture.take())); } }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = PathBuf::from("target").join(format!("tracker-read-only-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let cleanup = Cleanup(dir);
+        let path = cleanup.0.join("tracker.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Synthetic project');").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let started = now();
+        transition(&mut tracker, None, &started, TimerAction::Start {
+            project_id: 1, task_id: None, description: "Read-only test",
+        }).unwrap();
+        let id = snapshot(&tracker).unwrap().active.unwrap().id;
+        let clock = tracker.running_since.take();
+        drop(tracker);
+
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(db.is_readonly(rusqlite::DatabaseName::Main).unwrap());
+        let mut tracker = Tracker { db, running_since: clock, restored: false };
+        DB_ERROR_CAPTURE.with(|capture| {
+            assert!(capture.borrow().is_none());
+            *capture.borrow_mut() = Some(Vec::new());
+        });
+        let _reset = ResetCapture;
+        let result = transition(&mut tracker, Some(id), &now(), TimerAction::Stop);
+        let errors = DB_ERROR_CAPTURE.with(|capture| capture.take().unwrap());
+        assert_eq!(result.unwrap_err(), "Nie udało się zapisać lub odczytać danych lokalnych.");
+        assert!(errors.iter().any(|error| error.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)),
+            "expected SQLite read-only error, got {errors:?}");
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, id);
+        let persisted: (String, Option<String>, Option<i64>) = tracker.db.query_row(
+            "SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1", [id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(persisted, (started, None, None));
+        let clock = tracker.running_since.take();
+        drop(tracker);
+
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        assert!(!db.is_readonly(rusqlite::DatabaseName::Main).unwrap());
+        let mut tracker = Tracker { db, running_since: clock, restored: false };
+        transition(&mut tracker, Some(id), &now(), TimerAction::Stop).unwrap();
+        assert!(snapshot(&tracker).unwrap().active.is_none());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let saved: (Option<String>, Option<i64>) = tracker.db.query_row(
+            "SELECT ended_at,duration_seconds FROM time_entries WHERE id=?1", [id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert!(saved.0.is_some() && saved.1.is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn project_timer_write_failures_roll_back_on_disk_and_allow_retry() {
         use optional_task_migration::{transition, TimerAction};
         use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
