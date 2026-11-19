@@ -752,14 +752,45 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   }
   await evaluate(`[...document.querySelectorAll('[aria-label="Szkice wpisów"] button')].find(button => button.textContent.trim() === 'Przywróć szkic').click()`);
   await waitFor('draft content restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
+  await evaluate(`[...document.querySelectorAll('[aria-label="Edycja wpisu"] button')].find(button => button.textContent.trim() === 'Zachowaj szkic').click()`);
+  await waitFor('restored draft put aside', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]')`));
+  const beforeConflict = new DatabaseSync(testDb, { readOnly: true });
+  let originalTimes;
+  try {
+    originalTimes = beforeConflict.prepare('SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=1').get();
+    assert.equal(beforeConflict.prepare('SELECT COUNT(*) AS count FROM billable_entries WHERE entry_id=1').get().count, 0);
+  } finally { beforeConflict.close(); }
+  const concurrentChange = await cdp.send('Runtime.evaluate', {
+    expression: `window.__TAURI_INTERNALS__.invoke('set_entry_billable', { entryId: 1, expected: false, billable: true })`,
+    awaitPromise: true,
+    returnByValue: true,
+  }, sessionId);
+  if (concurrentChange.exceptionDetails) throw new Error(concurrentChange.exceptionDetails.exception?.description ?? concurrentChange.exceptionDetails.text);
+  await waitFor('draft can be reviewed after concurrent change', () => evaluate(`Boolean([...document.querySelectorAll('[aria-label="Szkice wpisów"] button')].find(button => button.textContent.trim() === 'Przywróć szkic' && !button.disabled))`));
+  await evaluate(`[...document.querySelectorAll('[aria-label="Szkice wpisów"] button')].find(button => button.textContent.trim() === 'Przywróć szkic').click()`);
+  await waitFor('conflicting draft comparison', () => evaluate(`document.querySelector('.entry-draft-review')?.textContent.includes('Wpis zmienił się od utworzenia szkicu')`));
+  const review = await evaluate(`(() => {
+    const panel = document.querySelector('.entry-draft-review');
+    return { text: panel.textContent, checked: [...panel.querySelectorAll('input[type="checkbox"]')].filter(item => item.checked).length,
+      transferDisabled: [...panel.querySelectorAll('button')].find(item => item.textContent.trim() === 'Przenieś wybrane pola').disabled };
+  })()`);
+  assert.ok(review.text.includes(primaryDescription) && review.text.includes(text));
+  assert.equal(review.checked, 0);
+  assert.equal(review.transferDisabled, true);
+  await evaluate(`document.querySelector('.entry-draft-review input[aria-label="Przenieś pole Opis"]').click()`);
+  await evaluate(`[...document.querySelectorAll('.entry-draft-review button')].find(item => item.textContent.trim() === 'Przenieś wybrane pola').click()`);
+  await waitFor('selected draft field restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
   await waitFor('draft applied once to history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(text)}))`));
   const db = new DatabaseSync(testDb, { readOnly: true });
   try {
     assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, text);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=1').get().count, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM billable_entries WHERE entry_id=1').get().count, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM billing_revisions WHERE entry_id=1').get().count, 1);
+    assert.deepEqual(db.prepare('SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=1').get(), originalTimes);
   } finally { db.close(); }
-  console.log('PASS: draft survived process interruption and applied once to the original entry');
+  console.log('PASS: draft survived interruption, identified a concurrent change, and applied only the selected field');
 
   await waitFor('second entry editor opens', () => evaluate(`(() => {
     if (document.querySelector('#entry-draft-description')) return true;
