@@ -57,15 +57,14 @@ interface ITrackerApplicationActivationManager {
 }
 
 public static class TestPackageActivation {
+    // Keep the activation manager alive while this long-lived test process
+    // observes the packaged application's launch and reactivation.
+    private static readonly ITrackerApplicationActivationManager manager =
+        (ITrackerApplicationActivationManager)new TrackerApplicationActivationManager();
     public static int Launch(string appId) {
-        var manager = (ITrackerApplicationActivationManager)new TrackerApplicationActivationManager();
-        try {
-            uint processId;
-            manager.ActivateApplication(appId, null, 2, out processId);
-            return checked((int)processId);
-        } finally {
-            Marshal.ReleaseComObject(manager);
-        }
+        uint processId;
+        manager.ActivateApplication(appId, null, 2, out processId);
+        return checked((int)processId);
     }
 }
 
