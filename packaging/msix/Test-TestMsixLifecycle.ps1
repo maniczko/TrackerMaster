@@ -156,7 +156,7 @@ function Write-TestWindowState([string] $Phase, $Process, [IntPtr] $Window, [ver
     }
 }
 
-function Start-TestVersion($Instance) {
+function Start-TestVersion($Instance, [switch] $EarlyClose) {
     $traceFile = Join-Path $testData 'window-diagnostic.txt'
     if (Test-Path -LiteralPath $traceFile -PathType Leaf) { Remove-Item -LiteralPath $traceFile }
     $processId = [TestPackageActivation]::Launch("$($Instance.PackageFamilyName)!TrackerMaster")
@@ -167,36 +167,40 @@ function Start-TestVersion($Instance) {
     if ($processHandle -eq [IntPtr]::Zero) { throw "Could not open the test process for observation: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())." }
     try {
         $window = [IntPtr]::Zero
-        for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        for ($attempt = 0; $attempt -lt 300; $attempt++) {
             $process.Refresh()
             if ($process.HasExited) { throw "Packaged application exited with code $($process.ExitCode)." }
-            if ($process.MainWindowHandle -ne 0 -and $process.MainWindowTitle -eq 'Personal Time Tracker' -and
+            if ($process.MainWindowHandle -ne 0 -and [TestPackageWindow]::IsWindowVisible($process.MainWindowHandle) -and $process.MainWindowTitle -eq 'Personal Time Tracker' -and
                 (Test-Path -LiteralPath $database)) {
                 $window = $process.MainWindowHandle
                 break
             }
-            Start-Sleep -Seconds 1
+            Start-Sleep -Milliseconds 100
         }
         if ($window -eq [IntPtr]::Zero) { throw 'Packaged application did not open a window and database in the test profile.' }
         [uint32] $windowOwner = 0
         if ([TestPackageWindow]::GetWindowThreadProcessId($window, [ref] $windowOwner) -eq 0 -or $windowOwner -ne $processId) {
             throw 'The window does not belong to the launched test package.'
         }
-        $traceFile = Join-Path $testData 'window-diagnostic.txt'
-        $ready = $false
-        for ($attempt = 0; $attempt -lt 120; $attempt++) {
-            $process.Refresh()
-            if ($process.HasExited) { throw 'The packaged process exited before setup completed.' }
-            if ((Test-Path -LiteralPath $traceFile -PathType Leaf) -and
-                (Select-String -LiteralPath $traceFile -SimpleMatch 'setup-complete' -Quiet)) {
-                $ready = $true
-                break
+        if (!$EarlyClose) {
+            $traceFile = Join-Path $testData 'window-diagnostic.txt'
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 120; $attempt++) {
+                $process.Refresh()
+                if ($process.HasExited) { throw 'The packaged process exited before setup completed.' }
+                if ((Test-Path -LiteralPath $traceFile -PathType Leaf) -and
+                    (Select-String -LiteralPath $traceFile -SimpleMatch 'setup-complete' -Quiet)) {
+                    $ready = $true
+                    break
+                }
+                Start-Sleep -Milliseconds 250
             }
-            Start-Sleep -Milliseconds 250
+            if (!$ready) { throw 'The packaged application did not complete setup in time.' }
+            Start-Sleep -Seconds 2
+            Write-TestWindowState 'before-close' $process $window ([version] $Instance.Version) $processHandle
+        } else {
+            Write-Host 'Requesting close at the first observed visible window.'
         }
-        if (!$ready) { throw 'The packaged application did not complete setup in time.' }
-        Start-Sleep -Seconds 2
-        Write-TestWindowState 'before-close' $process $window ([version] $Instance.Version) $processHandle
         if (![TestPackageWindow]::PostMessageW($window, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)) {
             throw "Could not request window close: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
         }
@@ -286,6 +290,7 @@ try {
 }
 
 $initial = Install-TestVersion $initialPath ([version] $initialIdentity.Version)
+Start-TestVersion $initial -EarlyClose
 Start-TestVersion $initial
 Test-LocalData 'seed'
 Write-Host 'Clean installation opened with an isolated database.'

@@ -1522,11 +1522,14 @@ fn main() {
                     }
                 }).build(app)?;
             let window_config = app.config().app.windows.first().ok_or("Brak konfiguracji okna aplikacji")?;
-            tauri::WebviewWindowBuilder::from_config(app, window_config)?.build()?;
+            let main_window = tauri::WebviewWindowBuilder::from_config(app, window_config)?
+                .visible(false)
+                .build()?;
             #[cfg(windows)]
             trace_test_window(app.handle(), "setup-window-created");
             #[cfg(windows)]
             activation.listen(app.handle().clone())?;
+            main_window.show()?;
             #[cfg(windows)]
             trace_test_window(app.handle(), "setup-complete");
             Ok(())
