@@ -316,6 +316,8 @@ async function verifyOccupiedShortcut(cdp, session) {
     assert.equal(await evaluate(`document.querySelector('[aria-label="Skrót klawiaturowy"] strong')?.textContent`), 'Ctrl + Alt + F11');
     assert.equal(await readFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'shortcut.txt'), 'utf8'), 'Ctrl+Alt+F11');
     assert.equal(helper.exitCode, null, 'The other process must still own the shortcut during rejection');
+    await verifyMiniTimer(cdp, session);
+    assert.equal(helper.exitCode, null, 'The conflicting shortcut must still be reserved while testing the previous one');
     helper.stdin.end('\n');
     assert.deepEqual(await exited, [0, null], errors);
     await selectAndSave('F10');
@@ -323,7 +325,7 @@ async function verifyOccupiedShortcut(cdp, session) {
     await selectAndSave('F11');
     await waitFor('original shortcut restored', () => evaluate(`document.querySelector('[aria-label="Skrót klawiaturowy"] strong')?.textContent === 'Ctrl + Alt + F11'`));
     assert.equal(await readFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'shortcut.txt'), 'utf8'), 'Ctrl+Alt+F11');
-    console.log('PASS: actual shortcut conflict preserved the old preference; releasing and retrying succeeded');
+    console.log('PASS: an actual shortcut conflict preserved the working old shortcut; releasing and retrying succeeded');
   } finally {
     if (helper.exitCode === null && helper.signalCode === null) {
       helper.stdin.end('\n');
@@ -438,7 +440,7 @@ async function verifyMiniTimer(cdp, mainSession) {
   assert.deepEqual(readInterruptedTimer(), started);
   await close(reopened);
   await waitFor('reopened mini timer closes', async () => !(await findOtherWindow()));
-  console.log('PASS: native mini timer started by global shortcut while an independent window was focused; keyboard project search and restored pin also passed');
+  console.log('PASS: repeated key-downs in another focused window started exactly one timer; keyboard project search and restored pin also passed');
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
@@ -739,7 +741,6 @@ async function runWindow(port, phase, recovery) {
     }
     if (phase === 'interrupt') {
       await verifyOccupiedShortcut(cdp, sessionId);
-      await verifyMiniTimer(cdp, sessionId);
       await verifySecondLaunch(child, env);
     }
     if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase, child);

@@ -31,6 +31,11 @@ try {
         [TrackerHotkeyTest]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
         [TrackerHotkeyTest]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
         [TrackerHotkeyTest]::keybd_event(0x7A, 0, 0, [UIntPtr]::Zero)
+        # Simulate repeated key-down messages while the same key remains held.
+        for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Milliseconds 100
+            [TrackerHotkeyTest]::keybd_event(0x7A, 0, 0, [UIntPtr]::Zero)
+        }
     } finally {
         [TrackerHotkeyTest]::keybd_event(0x7A, 0, 2, [UIntPtr]::Zero)
         [TrackerHotkeyTest]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
