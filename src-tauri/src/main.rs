@@ -72,22 +72,25 @@ fn show_start_error(message: &str) {
 
 #[cfg(windows)]
 fn confirm_stop_and_exit() -> bool {
-    use windows_sys::Win32::UI::Controls::{TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_CANCEL_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION};
+    use windows_sys::Win32::UI::Controls::{TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION};
     use windows_sys::Win32::UI::WindowsAndMessaging::IDCANCEL;
     const STOP_AND_EXIT: i32 = 100;
     let message: Vec<u16> = "Pomiar nadal trwa. Czy chcesz go zatrzymać i zakończyć aplikację?"
         .encode_utf16().chain(Some(0)).collect();
     let title: Vec<u16> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
     let stop: Vec<u16> = "Stop i zamknij".encode_utf16().chain(Some(0)).collect();
-    let button = TASKDIALOG_BUTTON { nButtonID: STOP_AND_EXIT, pszButtonText: stop.as_ptr() };
+    let cancel: Vec<u16> = "Anuluj".encode_utf16().chain(Some(0)).collect();
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: STOP_AND_EXIT, pszButtonText: stop.as_ptr() },
+        TASKDIALOG_BUTTON { nButtonID: IDCANCEL, pszButtonText: cancel.as_ptr() },
+    ];
     let config = TASKDIALOGCONFIG {
         cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
         dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
-        dwCommonButtons: TDCBF_CANCEL_BUTTON,
         pszWindowTitle: title.as_ptr(),
         pszMainInstruction: message.as_ptr(),
-        cButtons: 1,
-        pButtons: &button,
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
         nDefaultButton: IDCANCEL,
         ..Default::default()
     };
@@ -1522,6 +1525,47 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn exit_dialog_offers_explicit_choices_and_defaults_to_cancel() {
+        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+            || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted") {
+            return;
+        }
+        use std::time::{Duration, Instant};
+        #[link(name = "user32")]
+        extern "system" {
+            fn FindWindowW(class: *const u16, title: *const u16) -> *mut std::ffi::c_void;
+            fn GetDlgItem(window: *mut std::ffi::c_void, id: i32) -> *mut std::ffi::c_void;
+            fn GetWindowTextW(window: *mut std::ffi::c_void, text: *mut u16, len: i32) -> i32;
+            fn SendMessageW(window: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize) -> isize;
+        }
+        let class: Vec<_> = "#32770".encode_utf16().chain(Some(0)).collect();
+        let title: Vec<_> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
+        for (selected, expected) in [(2, false), (100, true)] {
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || { let _ = send.send(confirm_stop_and_exit()); });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let dialog = loop {
+                let window = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+                if !window.is_null() { break window; }
+                assert!(Instant::now() < deadline, "The exit dialog did not appear");
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            for (id, expected_label) in [(100, "Stop i zamknij"), (2, "Anuluj")] {
+                let button = unsafe { GetDlgItem(dialog, id) };
+                assert!(!button.is_null(), "Missing exit dialog button {id}");
+                let mut text = [0u16; 80];
+                let len = unsafe { GetWindowTextW(button, text.as_mut_ptr(), text.len() as i32) };
+                assert_eq!(String::from_utf16_lossy(&text[..len as usize]), expected_label);
+            }
+            assert_eq!(unsafe { SendMessageW(dialog, 0x0400, 0, 0) } & 0xffff, 2);
+            let button = unsafe { GetDlgItem(dialog, selected) };
+            unsafe { SendMessageW(button, 0x00f5, 0, 0); }
+            assert_eq!(receive.recv_timeout(Duration::from_secs(10)).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn failed_backup_restore_can_be_retried_with_the_same_preview() {
