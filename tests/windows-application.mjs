@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { access, mkdtemp, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -678,6 +678,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     await waitFor('close confirmation dismissed', () => evaluate(`!document.querySelector('dialog.entry-draft-dialog[open]')`));
     assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), text);
     assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
+    await writeFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'draft-sort.txt'), 'newest', { flag: 'wx' });
     console.log('draft: uncommitted snapshot saved while original entry remained unchanged');
     console.log('PASS: closing the window asked about the draft and Stay preserved it');
     return;
@@ -686,6 +687,48 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('draft reminder after process restart', () => evaluate(`Boolean(${button})`));
   await evaluate(`${button}.click()`);
   await waitFor('restore draft button', () => evaluate(`Boolean([...document.querySelectorAll('[aria-label="Szkice wpisów"] button')].find(button => button.textContent.trim() === 'Przywróć szkic' && !button.disabled))`));
+  const profileDir = join(process.env.APPDATA, 'pl.tracker.personal.testonly');
+  const preference = join(profileDir, 'draft-sort.txt');
+  const preservedPreference = join(profileDir, 'draft-sort-before-fault-test.txt');
+  const draftPath = join(profileDir, 'entry-drafts', 'entry-1.json');
+  const draftBefore = await readFile(draftPath);
+  assert.equal(await readFile(preference, 'utf8'), 'newest');
+  await rename(preference, preservedPreference);
+  let restoredPreference = false;
+  try {
+    await mkdir(preference);
+    await evaluate(`(() => {
+      const select = document.querySelector('[aria-label="Szkice wpisów"] select');
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, 'oldest');
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    const sortAlert = `[aria-label="Szkice wpisów"] [role="alert"]`;
+    await waitFor('sort preference failure is visible', () => evaluate(`document.querySelector(${JSON.stringify(sortAlert)})?.textContent.includes('Nie udało się zapamiętać sortowania')`));
+    assert.equal(await evaluate(`document.querySelector('[aria-label="Szkice wpisów"] select').value`), 'oldest');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await waitFor('manual sort retry enabled', () => evaluate(`Boolean([...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie' && !item.disabled))`));
+      await evaluate(`[...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie').click()`);
+      await waitFor('failed manual sort retry completes', () => evaluate(`Boolean([...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie' && !item.disabled))`));
+      assert.equal(await evaluate(`document.querySelectorAll(${JSON.stringify(sortAlert)}).length`), 1);
+      assert.equal(await readFile(preservedPreference, 'utf8'), 'newest');
+      assert.deepEqual(await readFile(draftPath), draftBefore);
+    }
+    await rmdir(preference);
+    await rename(preservedPreference, preference);
+    restoredPreference = true;
+    await evaluate(`[...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie').click()`);
+    await waitFor('successful retry clears sort warning', () => evaluate(`!document.querySelector(${JSON.stringify(sortAlert)})`));
+    assert.equal(await readFile(preference, 'utf8'), 'oldest');
+    assert.deepEqual(await readFile(draftPath), draftBefore);
+    assert.equal((await readdir(profileDir)).some(name => name.startsWith('.draft-sort.txt-') && name.endsWith('.tmp')), false);
+    console.log('PASS: sort write failures preserved the draft and previous preference; manual retry saved the latest order');
+  } finally {
+    if (!restoredPreference) {
+      const obstacle = await stat(preference).catch(() => null);
+      if (obstacle?.isDirectory()) await rmdir(preference);
+      await rename(preservedPreference, preference);
+    }
+  }
   await evaluate(`[...document.querySelectorAll('[aria-label="Szkice wpisów"] button')].find(button => button.textContent.trim() === 'Przywróć szkic').click()`);
   await waitFor('draft content restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
