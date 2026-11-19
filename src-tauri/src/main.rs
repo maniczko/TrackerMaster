@@ -161,7 +161,11 @@ fn valid_description(description: &str) -> Cmd<&str> {
     }
     Ok(description)
 }
-fn db_err(_: rusqlite::Error) -> String { "Nie udało się zapisać lub odczytać danych lokalnych.".into() }
+fn db_err(_error: rusqlite::Error) -> String {
+    #[cfg(all(test, windows))]
+    tests::capture_db_error(_error);
+    "Nie udało się zapisać lub odczytać danych lokalnych.".into()
+}
 fn ensure_available(tracker: &Tracker) -> Cmd<()> {
     if tracker.restored { return Err("Kopia została przywrócona. Zamknij aplikację i uruchom ją ponownie.".into()); }
     Ok(())
@@ -2322,6 +2326,143 @@ mod tests {
         assert_eq!(state.entries[0].id, active_id);
     }
 
+    #[cfg(windows)]
+    std::thread_local! {
+        static DB_ERROR_CAPTURE: std::cell::RefCell<Option<Vec<rusqlite::Error>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(windows)]
+    pub(super) fn capture_db_error(error: rusqlite::Error) {
+        DB_ERROR_CAPTURE.with(|capture| {
+            if let Some(errors) = capture.borrow_mut().as_mut() {
+                errors.push(error);
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    fn assert_injected_write_failure(marker: &str, run: impl FnOnce() -> Cmd<()>) {
+        struct ResetCapture;
+        impl Drop for ResetCapture {
+            fn drop(&mut self) {
+                DB_ERROR_CAPTURE.with(|capture| drop(capture.take()));
+            }
+        }
+
+        DB_ERROR_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            assert!(capture.is_none());
+            *capture = Some(Vec::new());
+        });
+        let _reset = ResetCapture;
+        let result = run();
+        let errors = DB_ERROR_CAPTURE.with(|capture| capture.take().unwrap());
+
+        assert_eq!(result.unwrap_err(), "Nie udało się zapisać lub odczytać danych lokalnych.");
+        let [rusqlite::Error::SqliteFailure(code, Some(message))] = errors.as_slice() else {
+            panic!("expected one SQLite failure from {marker}, got {errors:?}");
+        };
+        assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+        assert_eq!(message.as_str(), marker);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_timer_write_failures_roll_back_on_disk_and_allow_retry() {
+        use optional_task_migration::{transition, TimerAction};
+        use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+        }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = PathBuf::from("target").join(format!("tracker-timer-write-{}-{stamp}.sqlite3", std::process::id()));
+        fs::File::create_new(&path).unwrap();
+        let file = Cleanup(path);
+        let mut db = Connection::open(&file.0).unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Original'),(2,1,'Next');
+            INSERT INTO billable_projects VALUES(2);").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+
+        let persisted = || {
+            let reader = Connection::open_with_flags(&file.0, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let mut stmt = reader.prepare("SELECT e.id,e.project_id,e.started_at,e.ended_at,e.duration_seconds,
+                (SELECT description FROM entry_descriptions WHERE entry_id=e.id),
+                EXISTS(SELECT 1 FROM billable_entries WHERE entry_id=e.id)
+                FROM time_entries e ORDER BY e.id").unwrap();
+            let entries = stmt.query_map([], |r| Ok((
+                r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?, r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<String>>(5)?, r.get::<_, bool>(6)?,
+            ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let metadata = reader.query_row("SELECT (SELECT COUNT(*) FROM entry_descriptions),
+                (SELECT COUNT(*) FROM billable_entries)", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap();
+            (entries, metadata)
+        };
+        let clock = |tracker: &Tracker| tracker.running_since.as_ref().unwrap().since;
+        let started = now();
+        transition(&mut tracker, None, &started, TimerAction::Start { project_id: 1, task_id: None, description: "Original" }).unwrap();
+        let first = snapshot(&tracker).unwrap().active.unwrap().id;
+        let original_clock = clock(&tracker);
+        let before_switch = persisted();
+        assert_eq!(before_switch, (vec![(first, 1, started, None, None, Some("Original".into()), false)], (1, 0)));
+        let switch = || TimerAction::Start { project_id: 2, task_id: None, description: "Replacement" };
+
+        // FAIL leaves earlier changes intact inside the transaction; dropping it must undo them.
+        tracker.db.execute_batch("CREATE TEMP TRIGGER fail_switch_description
+            AFTER INSERT ON main.entry_descriptions BEGIN SELECT RAISE(FAIL, 'simulated switch write failure'); END;").unwrap();
+        assert_injected_write_failure("simulated switch write failure", || {
+            transition(&mut tracker, Some(first), &now(), switch())
+        });
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(clock(&tracker), original_clock);
+        assert_eq!(persisted(), before_switch);
+
+        tracker.db.execute_batch("DROP TRIGGER temp.fail_switch_description;").unwrap();
+        let switched_at = now();
+        transition(&mut tracker, Some(first), &switched_at, switch()).unwrap();
+        let before_stop = persisted();
+        let (entries, metadata) = &before_stop;
+        assert_eq!(*metadata, (2, 1));
+        assert_eq!(entries.len(), 2);
+        let mut closed_first = before_switch.0[0].clone();
+        closed_first.3 = Some(switched_at.clone());
+        closed_first.4 = entries[0].4;
+        assert!(closed_first.4.is_some());
+        assert_eq!(entries[0], closed_first);
+        let second = entries[1].0;
+        assert_ne!(second, first);
+        assert_eq!(entries[1], (second, 2, switched_at, None, None, Some("Replacement".into()), true));
+
+        let active_clock = clock(&tracker);
+        tracker.db.execute_batch("CREATE TEMP TRIGGER fail_stop_close
+            AFTER UPDATE OF ended_at ON main.time_entries BEGIN SELECT RAISE(FAIL, 'simulated stop write failure'); END;").unwrap();
+        assert_injected_write_failure("simulated stop write failure", || {
+            transition(&mut tracker, Some(second), &now(), TimerAction::Stop)
+        });
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(clock(&tracker), active_clock);
+        assert_eq!(persisted(), before_stop);
+
+        tracker.db.execute_batch("DROP TRIGGER temp.fail_stop_close;").unwrap();
+        let stopped_at = now();
+        transition(&mut tracker, Some(second), &stopped_at, TimerAction::Stop).unwrap();
+        assert!(tracker.running_since.is_none());
+        drop(tracker);
+        let after_stop = persisted();
+        let mut expected = before_stop;
+        expected.0[1].3 = Some(stopped_at);
+        expected.0[1].4 = after_stop.0.get(1).and_then(|entry| entry.4);
+        assert!(expected.0[1].4.is_some());
+        assert_eq!(after_stop, expected);
+    }
+
     #[test]
     fn repeated_start_does_not_split_active_entry() {
         let mut tracker = seeded();
@@ -2426,6 +2567,72 @@ mod tests {
         correct_entry(&mut tracker, first, &updated.started_at, &updated.ended_at, "2026-01-01T08:30:00Z", "2026-01-01T10:00:00Z", current).unwrap();
         let revisions: Vec<(i64,i64)> = tracker.db.prepare("SELECT before_seconds,after_seconds FROM entry_revisions WHERE entry_id=?1 ORDER BY id").unwrap().query_map([first], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
         assert_eq!(revisions, vec![(3600, 5400), (5400, 5400)]);
+    }
+
+    #[test]
+    fn correction_retries_after_competing_sqlite_writer_releases_lock() {
+        use std::{fs, path::PathBuf, time::{Duration, SystemTime, UNIX_EPOCH}};
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = PathBuf::from("target").join(format!("tracker-correction-busy-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let cleanup = Cleanup(dir);
+        let path = cleanup.0.join("tracker.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialise(&mut db).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        db.execute_batch("INSERT INTO clients VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Synthetic project');
+            INSERT INTO tasks VALUES(1,1,'Synthetic task');
+            INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds)
+              VALUES(41,1,1,'2026-01-01T09:00:00.000Z','2026-01-01T10:00:00.000Z',3600);").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let start = "2026-01-01T09:00:00.000Z";
+        let original_end = "2026-01-01T10:00:00.000Z";
+        let corrected_end = "2026-01-01T10:30:00.000Z";
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let correct = |tracker: &mut Tracker| {
+            correct_entry(tracker, 41, start, original_end, start, corrected_end, current)
+        };
+        let entry = |db: &Connection| -> (String, String, i64, bool) {
+            db.query_row("SELECT started_at,ended_at,duration_seconds,manually_resolved FROM time_entries WHERE id=41",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+        };
+        let revision_count = |db: &Connection| {
+            db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap()
+        };
+
+        let mut writer = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        let lock = writer.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let busy = tracker.db.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(busy.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+        assert_eq!(correct(&mut tracker).unwrap_err(), db_err(busy));
+        assert!(tracker.db.is_autocommit());
+        {
+            let persisted = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(entry(&persisted), (start.to_owned(), original_end.to_owned(), 3600, false));
+            assert_eq!(revision_count(&persisted), 0);
+        }
+        lock.rollback().unwrap();
+        drop(writer);
+
+        correct(&mut tracker).unwrap();
+        drop(tracker);
+        let persisted = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(entry(&persisted), (start.to_owned(), corrected_end.to_owned(), 5400, true));
+        assert_eq!(persisted.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(revision_count(&persisted), 1);
+        let revision: (String, String, i64, String, String, i64) = persisted.query_row(
+            "SELECT before_start,before_end,before_seconds,after_start,after_end,after_seconds FROM entry_revisions WHERE entry_id=41",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap();
+        assert_eq!(revision, (start.to_owned(), original_end.to_owned(), 3600, start.to_owned(), corrected_end.to_owned(), 5400));
     }
 
     #[test]
