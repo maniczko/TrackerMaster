@@ -520,6 +520,41 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('second launch restores the window after discard', () => inspectWindow('Visibility', primary.pid, window) === 'visible');
   assert.equal(await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`), false);
   console.log('PASS: discard left the original entry unchanged and reopened the same window');
+
+  await waitFor('second entry reopens after discard', () => evaluate(`(() => {
+    if (document.querySelector('#entry-draft-description')) return true;
+    const action = [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(secondDescription)}))?.querySelector('button[aria-label^="Popraw wpis:"]');
+    if (action && !action.disabled) action.click();
+    return false;
+  })()`));
+  const savedText = 'Korekta zapisana przy zamknięciu';
+  await evaluate(`(() => {
+    const field = document.querySelector('#entry-draft-description');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, ${JSON.stringify(savedText)});
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  assert.equal(inspectWindow('Close', primary.pid, window), 'posted');
+  await waitFor('draft save confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
+  await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
+  await waitFor('save hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
+  const saved = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    assert.equal(saved.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, savedText);
+    assert.equal(saved.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 1);
+  } finally { saved.close(); }
+  const reopen = spawn(exe, [], { env: process.env, stdio: 'ignore', windowsHide: true });
+  try {
+    assert.deepEqual(await once(reopen, 'exit', { signal: AbortSignal.timeout(12_000) }), [0, null]);
+  } finally {
+    if (reopen.pid && reopen.exitCode === null && reopen.signalCode === null) {
+      const exited = once(reopen, 'exit');
+      reopen.kill();
+      await exited;
+    }
+  }
+  await waitFor('second launch restores the window after save', () => inspectWindow('Visibility', primary.pid, window) === 'visible');
+  await waitFor('saved correction appears in history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(savedText)}))`));
+  console.log('PASS: save on close recorded exactly one correction and restored the same window');
 }
 
 async function runWindow(port, phase, recovery) {
