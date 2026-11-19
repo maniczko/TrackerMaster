@@ -1907,6 +1907,72 @@ mod tests {
     }
 
     #[test]
+    fn correction_retries_after_competing_sqlite_writer_releases_lock() {
+        use std::{fs, path::PathBuf, time::{Duration, SystemTime, UNIX_EPOCH}};
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = PathBuf::from("target").join(format!("tracker-correction-busy-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let cleanup = Cleanup(dir);
+        let path = cleanup.0.join("tracker.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialise(&mut db).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        db.execute_batch("INSERT INTO clients VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Synthetic project');
+            INSERT INTO tasks VALUES(1,1,'Synthetic task');
+            INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds)
+              VALUES(41,1,1,'2026-01-01T09:00:00.000Z','2026-01-01T10:00:00.000Z',3600);").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let start = "2026-01-01T09:00:00.000Z";
+        let original_end = "2026-01-01T10:00:00.000Z";
+        let corrected_end = "2026-01-01T10:30:00.000Z";
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let correct = |tracker: &mut Tracker| {
+            correct_entry(tracker, 41, start, original_end, start, corrected_end, current)
+        };
+        let entry = |db: &Connection| -> (String, String, i64, bool) {
+            db.query_row("SELECT started_at,ended_at,duration_seconds,manually_resolved FROM time_entries WHERE id=41",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+        };
+        let revision_count = |db: &Connection| {
+            db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap()
+        };
+
+        let mut writer = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        let lock = writer.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let busy = tracker.db.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(busy.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+        assert_eq!(correct(&mut tracker).unwrap_err(), db_err(busy));
+        assert!(tracker.db.is_autocommit());
+        {
+            let persisted = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(entry(&persisted), (start.to_owned(), original_end.to_owned(), 3600, false));
+            assert_eq!(revision_count(&persisted), 0);
+        }
+        lock.rollback().unwrap();
+        drop(writer);
+
+        correct(&mut tracker).unwrap();
+        drop(tracker);
+        let persisted = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(entry(&persisted), (start.to_owned(), corrected_end.to_owned(), 5400, true));
+        assert_eq!(persisted.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(revision_count(&persisted), 1);
+        let revision: (String, String, i64, String, String, i64) = persisted.query_row(
+            "SELECT before_start,before_end,before_seconds,after_start,after_end,after_seconds FROM entry_revisions WHERE entry_id=41",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap();
+        assert_eq!(revision, (start.to_owned(), original_end.to_owned(), 3600, start.to_owned(), corrected_end.to_owned(), 5400));
+    }
+
+    #[test]
     fn version_three_migrates_to_revision_history_without_losing_entries() {
         let mut tracker = seeded();
         let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
