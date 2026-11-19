@@ -501,6 +501,56 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     entryId = rows[3].id;
   } finally { activeDb.close(); }
   await waitFor('main window shows the active timer', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button:not(:disabled)'))`));
+  await evaluate(mainSession, `(() => {
+    const select = document.querySelectorAll('[aria-label="Pomiar czasu"] select')[0];
+    const option = [...select.options].find(item => item.textContent === ${JSON.stringify(primaryClient)});
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, option.value);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor('other client project available for switch', () => evaluate(mainSession, `[...document.querySelectorAll('[aria-label="Pomiar czasu"] select')[1].options].some(item => item.textContent === ${JSON.stringify(project)})`));
+  await evaluate(mainSession, `(() => {
+    const select = document.querySelectorAll('[aria-label="Pomiar czasu"] select')[1];
+    const option = [...select.options].find(item => item.textContent === ${JSON.stringify(project)});
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, option.value);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor('switch enabled', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-start button:not(:disabled)'))`));
+  const replacementDescription = 'Przełączenie po błędzie zapisu';
+  await evaluate(mainSession, `(() => {
+    const input = document.querySelector('[aria-label="Pomiar czasu"] .timer-description input');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(replacementDescription)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const switchDb = new DatabaseSync(testDb);
+  try {
+    switchDb.exec("CREATE TRIGGER test_reject_timer_switch AFTER INSERT ON entry_descriptions BEGIN SELECT RAISE(FAIL, 'test switch write failure'); END");
+    await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
+    await waitFor('failed switch shows the write error', () => evaluate(mainSession, `[...document.querySelectorAll('[role="alert"]')].some(item => item.textContent.includes('Nie udało się potwierdzić operacji') && item.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych'))`));
+    assert.equal(await evaluate(mainSession, `document.body.textContent.includes('Przełączono zadanie.')`), false);
+    const unchanged = switchDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
+    assert.equal(unchanged.length, 4);
+    assert.equal(unchanged[3].id, entryId);
+    assert.equal(unchanged[3].ended_at, null);
+    assert.equal(unchanged[3].duration_seconds, null);
+    assert.equal(await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-description input').value`), replacementDescription);
+  } finally {
+    switchDb.exec('DROP TRIGGER IF EXISTS test_reject_timer_switch');
+    switchDb.close();
+  }
+  await waitFor('switch retry enabled', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-start button:not(:disabled)'))`));
+  await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
+  await waitFor('switch retry succeeds', () => evaluate(mainSession, `document.body.textContent.includes('Przełączono zadanie.')`));
+  const switchedDb = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    const rows = switchedDb.prepare(`SELECT e.id, e.started_at, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
+    assert.equal(rows.length, 5);
+    assert.equal(rows[3].id, entryId);
+    assert.equal(rows[3].ended_at, rows[4].started_at);
+    assert.equal(rows[4].description, replacementDescription);
+    assert.equal(rows[4].ended_at, null);
+    entryId = rows[4].id;
+  } finally { switchedDb.close(); }
+  await waitFor('widget reflects the switched timer', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running' && document.querySelector('.qp-context')?.textContent.includes(${JSON.stringify(primaryClient)})`));
   const failureDb = new DatabaseSync(testDb);
   try {
     failureDb.exec("CREATE TRIGGER test_reject_timer_stop BEFORE UPDATE OF ended_at ON time_entries BEGIN SELECT RAISE(FAIL, 'test timer write failure'); END");
@@ -509,10 +559,10 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     await waitFor('timer still shown as running after the failed stop', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .status.running'))`));
     assert.equal(await evaluate(mainSession, `document.body.textContent.includes('Pomiar zatrzymany.')`), false);
     const unchanged = failureDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
-    assert.equal(unchanged.length, 4);
-    assert.equal(unchanged[3].id, entryId);
-    assert.equal(unchanged[3].ended_at, null);
-    assert.equal(unchanged[3].duration_seconds, null);
+    assert.equal(unchanged.length, 5);
+    assert.equal(unchanged[4].id, entryId);
+    assert.equal(unchanged[4].ended_at, null);
+    assert.equal(unchanged[4].duration_seconds, null);
   } finally {
     failureDb.exec('DROP TRIGGER IF EXISTS test_reject_timer_stop');
     failureDb.close();
@@ -522,11 +572,11 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   const stoppedDb = new DatabaseSync(testDb, { readOnly: true });
   try {
     const rows = stoppedDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
-    assert.equal(rows.length, 4);
-    assert.equal(rows[3].id, entryId);
-    assert.ok(rows[3].ended_at && rows[3].duration_seconds >= 5);
+    assert.equal(rows.length, 5);
+    assert.equal(rows[4].id, entryId);
+    assert.ok(rows[4].ended_at && rows[4].duration_seconds >= 5);
   } finally { stoppedDb.close(); }
-  console.log('PASS: failed Stop showed an error and kept the entry open; the global shortcut retry stopped it exactly once after restart');
+  console.log('PASS: failed Switch and Stop showed errors, preserved the running entry, and succeeded once on retry');
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
@@ -920,8 +970,8 @@ try {
   const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
     t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id
     JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id`).all();
-  assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient, secondClient, secondClient]);
-  assert.deepEqual(rows.map(row => row.task), [task, null, null, null]);
+  assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient, secondClient, secondClient, primaryClient]);
+  assert.deepEqual(rows.map(row => row.task), [task, null, null, null, null]);
   assert.ok(rows.every(row => row.project === project));
   assert.ok(rows.slice(0, 2).every(row => row.duration >= 5 && row.manually_resolved === 0));
   assert.equal(rows[0].duration, seconds);
@@ -931,6 +981,7 @@ try {
   assert.equal(rows[2].duration, recovery.duration);
   assert.equal(rows[2].manually_resolved, 1);
   assert.ok(rows[3].ended_at && rows[3].duration >= 5 && rows[3].manually_resolved === 0);
+  assert.ok(rows[4].ended_at && rows[4].duration >= 5 && rows[4].manually_resolved === 0);
 } finally {
   db.close();
 }
