@@ -2369,6 +2369,76 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn sqlite_full_during_switch_rolls_back_and_retry_keeps_boundary() {
+        use optional_task_migration::{transition, TimerAction};
+        use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        struct ResetCapture;
+        impl Drop for ResetCapture { fn drop(&mut self) { DB_ERROR_CAPTURE.with(|capture| drop(capture.take())); } }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = PathBuf::from("target").join(format!("tracker-full-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let cleanup = Cleanup(dir);
+        let path = cleanup.0.join("tracker.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "page_size", 512).unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Original'),(2,1,'Next');").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let started = now();
+        transition(&mut tracker, None, &started, TimerAction::Start {
+            project_id: 1, task_id: None, description: "Original",
+        }).unwrap();
+        let id = snapshot(&tracker).unwrap().active.unwrap().id;
+        let pages: i64 = tracker.db.pragma_query_value(None, "page_count", |row| row.get(0)).unwrap();
+        let free: i64 = tracker.db.pragma_query_value(None, "freelist_count", |row| row.get(0)).unwrap();
+        assert_eq!(free, 0);
+        tracker.db.pragma_update(None, "max_page_count", pages).unwrap();
+        let limit: i64 = tracker.db.pragma_query_value(None, "max_page_count", |row| row.get(0)).unwrap();
+        assert_eq!(limit, pages);
+        let description = "X".repeat(2000);
+        DB_ERROR_CAPTURE.with(|capture| {
+            assert!(capture.borrow().is_none());
+            *capture.borrow_mut() = Some(Vec::new());
+        });
+        let _reset = ResetCapture;
+        let result = transition(&mut tracker, Some(id), &now(), TimerAction::Start {
+            project_id: 2, task_id: None, description: &description,
+        });
+        let errors = DB_ERROR_CAPTURE.with(|capture| capture.take().unwrap());
+        assert_eq!(result.unwrap_err(), "Nie udało się zapisać lub odczytać danych lokalnych.");
+        assert!(errors.iter().any(|error| error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)),
+            "expected SQLITE_FULL, got {errors:?}");
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, id);
+        let persisted: (String, Option<String>, Option<i64>) = tracker.db.query_row(
+            "SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1", [id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(persisted, (started, None, None));
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_descriptions", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+
+        tracker.db.pragma_update(None, "max_page_count", pages + 100).unwrap();
+        let switched = now();
+        transition(&mut tracker, Some(id), &switched, TimerAction::Start {
+            project_id: 2, task_id: None, description: &description,
+        }).unwrap();
+        let active = snapshot(&tracker).unwrap().active.unwrap();
+        assert_ne!(active.id, id);
+        assert_eq!(active.started_at, switched);
+        assert_eq!(active.description, description);
+        let old_end: String = tracker.db.query_row("SELECT ended_at FROM time_entries WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        assert_eq!(old_end, switched);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn read_only_database_keeps_timer_open_and_allows_stop_after_reopen() {
         use optional_task_migration::{transition, TimerAction};
         use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
