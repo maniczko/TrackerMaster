@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { watch } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
@@ -695,18 +696,13 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   assert.equal(await readFile(preference, 'utf8'), 'newest');
   await rename(preference, preservedPreference);
   let restoredPreference = false;
+  const sortWrites = new Set();
+  const sortWatcher = watch(profileDir, (_event, filename) => {
+    const name = filename?.toString();
+    if (name?.startsWith('.draft-sort.txt-') && name.endsWith('.tmp')) sortWrites.add(name);
+  });
   try {
     await mkdir(preference);
-    assert.equal(await evaluate(`(() => {
-      window.__sortTestOriginalFetch = window.fetch;
-      window.__sortTestWrites = 0;
-      window.fetch = function(resource, ...args) {
-        const url = new URL(typeof resource === 'string' ? resource : resource.url, location.href);
-        if (url.hostname === 'ipc.localhost' && url.pathname === '/set_draft_sort') window.__sortTestWrites++;
-        return window.__sortTestOriginalFetch.call(this, resource, ...args);
-      };
-      return window.fetch !== window.__sortTestOriginalFetch;
-    })()`), true);
     await evaluate(`(() => {
       const select = document.querySelector('[aria-label="Szkice wpisów"] select');
       Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, 'oldest');
@@ -714,12 +710,12 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     })()`);
     const sortAlert = `[aria-label="Szkice wpisów"] [role="alert"]`;
     await waitFor('sort preference failure is visible', () => evaluate(`document.querySelector(${JSON.stringify(sortAlert)})?.textContent.includes('Nie udało się zapamiętać sortowania')`));
-    assert.equal(await evaluate('window.__sortTestWrites'), 1);
+    await waitFor('initial sort write observed', () => sortWrites.size === 1);
     assert.equal(await evaluate(`document.querySelector('[aria-label="Szkice wpisów"] select').value`), 'oldest');
     for (let attempt = 0; attempt < 2; attempt++) {
       await waitFor('manual sort retry enabled', () => evaluate(`Boolean([...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie' && !item.disabled))`));
       await evaluate(`[...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie').click()`);
-      await waitFor('failed manual sort retry completes', () => evaluate(`window.__sortTestWrites === ${attempt + 2} && Boolean([...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie' && !item.disabled))`));
+      await waitFor('failed manual sort retry completes', async () => sortWrites.size === attempt + 2 && await evaluate(`Boolean([...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie' && !item.disabled))`));
       assert.equal(await evaluate(`document.querySelectorAll(${JSON.stringify(sortAlert)}).length`), 1);
       assert.equal(await readFile(preservedPreference, 'utf8'), 'newest');
       assert.deepEqual(await readFile(draftPath), draftBefore);
@@ -729,25 +725,25 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     await evaluate(`${closeDrafts}.click()`);
     await waitFor('draft list closed', () => evaluate(`!document.querySelector('[aria-label="Szkice wpisów"]')`));
     await evaluate(`${openDrafts}.click()`);
-    await waitFor('one automatic retry after entering list', () => evaluate(`window.__sortTestWrites === 4 && Boolean([...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie' && !item.disabled))`));
+    await waitFor('one automatic retry after entering list', async () => sortWrites.size === 4 && await evaluate(`Boolean([...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie' && !item.disabled))`));
     await evaluate(`${closeDrafts}.click()`);
     await waitFor('draft list closed again', () => evaluate(`!document.querySelector('[aria-label="Szkice wpisów"]')`));
     await evaluate(`${openDrafts}.click()`);
     await waitFor('draft list reopened within retry interval', () => evaluate(`Boolean(document.querySelector(${JSON.stringify(sortAlert)}))`));
     await delay(750);
-    assert.equal(await evaluate('window.__sortTestWrites'), 4, 'Reopening before the retry interval must not write again');
+    assert.equal(sortWrites.size, 4, 'Reopening before the retry interval must not write again');
     await rmdir(preference);
     await rename(preservedPreference, preference);
     restoredPreference = true;
     await evaluate(`[...document.querySelectorAll(${JSON.stringify(sortAlert)} + ' button')].find(item => item.textContent.trim() === 'Spróbuj ponownie').click()`);
     await waitFor('successful retry clears sort warning', () => evaluate(`!document.querySelector(${JSON.stringify(sortAlert)})`));
-    assert.equal(await evaluate('window.__sortTestWrites'), 5);
+    await waitFor('successful sort retry observed', () => sortWrites.size === 5);
     assert.equal(await readFile(preference, 'utf8'), 'oldest');
     assert.deepEqual(await readFile(draftPath), draftBefore);
     assert.equal((await readdir(profileDir)).some(name => name.startsWith('.draft-sort.txt-') && name.endsWith('.tmp')), false);
     console.log('PASS: manual and automatic sort retries were counted, rate-limited, and preserved the draft until successful save');
   } finally {
-    await evaluate(`if (window.__sortTestOriginalFetch) window.fetch = window.__sortTestOriginalFetch`);
+    sortWatcher.close();
     if (!restoredPreference) {
       const obstacle = await stat(preference).catch(() => null);
       if (obstacle?.isDirectory()) await rmdir(preference);
