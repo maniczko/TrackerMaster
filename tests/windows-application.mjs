@@ -147,6 +147,8 @@ async function exercisePage(data, phase) {
   const testProfileVisible = () => document.querySelector('[role="note"]')?.textContent.includes('Wersja testowa.');
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled && pick('#new-client'));
 
+  if (phase === 'hotkey-restart') return null;
+
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
       await until('interrupted timer requires verification', recoveryMessage);
@@ -443,6 +445,73 @@ async function verifyMiniTimer(cdp, mainSession) {
   console.log('PASS: repeated key-downs in another focused window started exactly one timer; keyboard project search and restored pin also passed');
 }
 
+async function verifyShortcutAfterRestart(cdp, mainSession) {
+  const evaluate = async (session, expression) => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, session);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  await waitFor('saved shortcut registered after restart', () => evaluate(mainSession, `(() => {
+    const section = document.querySelector('[aria-label="Skrót klawiaturowy"]');
+    return section?.querySelector('strong')?.textContent === 'Ctrl + Alt + F11' && section.textContent.includes('aktywny globalnie');
+  })()`));
+  await evaluate(mainSession, 'document.querySelector(".widget-open").click()');
+  const target = await waitFor('mini timer after restart', async () => {
+    const { targetInfos } = await cdp.send('Target.getTargets');
+    return targetInfos.find(item => item.type === 'page' && item.targetId !== cdp.pageId && /^https?:\/\/tauri\.localhost(?::\d+)?\//.test(item.url));
+  });
+  const { sessionId: widget } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
+  await waitFor('mini timer ready after restart', () => evaluate(widget, `document.querySelector('.qp-toggle')?.title.includes('Ctrl + Alt + F11') ?? false`));
+  await evaluate(widget, `document.querySelector('[aria-label="Rozwiń panel"]').click()`);
+  await waitFor('project search after restart', () => evaluate(widget, `document.activeElement === document.querySelector('[role="combobox"]')`));
+  await evaluate(widget, `(() => {
+    const input = document.activeElement;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(secondClient)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await waitFor('project available after restart', () => evaluate(widget, `(() => {
+    const options = [...document.querySelectorAll('[role="option"]')];
+    return options.length === 1 && options[0].getAttribute('aria-label') === ${JSON.stringify(`Bez zadania — ${secondClient} / ${project}`)};
+  })()`));
+  for (const key of ['ArrowDown', 'Enter']) {
+    await evaluate(widget, `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }))`);
+  }
+  await waitFor('description focused after restart', () => evaluate(widget, 'document.activeElement.id === "qp-description"'));
+  const description = 'Dwa naciśnięcia po restarcie';
+  await evaluate(widget, `(() => {
+    const input = document.activeElement;
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, ${JSON.stringify(description)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const pressShortcut = () => {
+    const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', 'tests/windows-hotkey.ps1'], {
+      timeout: 20_000, windowsHide: true, encoding: 'utf8',
+    });
+    assert.ok(output.includes('independent-window-focused'));
+  };
+  pressShortcut();
+  await waitFor('first press starts measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running'`));
+  const activeDb = new DatabaseSync(testDb, { readOnly: true });
+  let entryId;
+  try {
+    const rows = activeDb.prepare(`SELECT e.id, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
+    assert.equal(rows.length, 4);
+    assert.equal(rows[3].description, description);
+    assert.equal(rows[3].ended_at, null);
+    entryId = rows[3].id;
+  } finally { activeDb.close(); }
+  pressShortcut();
+  await waitFor('second press stops measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'idle'`));
+  const stoppedDb = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    const rows = stoppedDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
+    assert.equal(rows.length, 4);
+    assert.equal(rows[3].id, entryId);
+    assert.ok(rows[3].ended_at && rows[3].duration_seconds >= 5);
+  } finally { stoppedDb.close(); }
+  console.log('PASS: the saved global shortcut started and stopped exactly one entry after application restart');
+}
+
 async function verifyRestoreRetry(cdp, sessionId) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
@@ -708,7 +777,7 @@ async function runWindow(port, phase, recovery) {
       console.log(`${phase}: report matched the selected client (${seconds} s)`);
     } else {
       assert.equal(seconds, null);
-      console.log(`${phase}: history showed the manually recovered entry`);
+      if (phase !== 'hotkey-restart') console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -745,6 +814,7 @@ async function runWindow(port, phase, recovery) {
     }
     if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase, child);
     if (phase === 'draft-reopen') await verifyRestoreRetry(cdp, sessionId);
+    if (phase === 'hotkey-restart') await verifyShortcutAfterRestart(cdp, sessionId);
     return seconds;
   } finally {
     cdp?.close();
@@ -823,6 +893,8 @@ try {
   await runWindow(port, 'verify-recovery', recovery);
   await waitForWindowClosed(port);
   await runWindow(port, 'draft-reopen', recovery);
+  await waitForWindowClosed(port);
+  await runWindow(port, 'hotkey-restart', recovery);
 } finally {
   registry('delete', ['/f']);
 }
@@ -831,8 +903,8 @@ try {
   const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
     t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id
     JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id`).all();
-  assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient, secondClient]);
-  assert.deepEqual(rows.map(row => row.task), [task, null, null]);
+  assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient, secondClient, secondClient]);
+  assert.deepEqual(rows.map(row => row.task), [task, null, null, null]);
   assert.ok(rows.every(row => row.project === project));
   assert.ok(rows.slice(0, 2).every(row => row.duration >= 5 && row.manually_resolved === 0));
   assert.equal(rows[0].duration, seconds);
@@ -841,6 +913,7 @@ try {
   assert.equal(rows[2].ended_at, recovery.end);
   assert.equal(rows[2].duration, recovery.duration);
   assert.equal(rows[2].manually_resolved, 1);
+  assert.ok(rows[3].ended_at && rows[3].duration >= 5 && rows[3].manually_resolved === 0);
 } finally {
   db.close();
 }
