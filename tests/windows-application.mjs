@@ -364,6 +364,17 @@ async function verifyMiniTimer(cdp, mainSession) {
     return sessionId;
   };
   const widget = await openWidget();
+  const inspectTimerBar = () => evaluate(widget, `(() => {
+    const clock = document.querySelector('.qp-clock').getBoundingClientRect();
+    const action = document.querySelector('.qp-toggle').getBoundingClientRect();
+    const bar = document.querySelector('.qp-bar').getBoundingClientRect();
+    return { clockRight: clock.right, actionLeft: action.left, actionRight: action.right,
+      actionWidth: action.width, actionHeight: action.height, barRight: bar.right };
+  })()`);
+  const idleBar = await inspectTimerBar();
+  assert.ok(idleBar.actionWidth >= 44 && idleBar.actionHeight >= 44, 'Timer action should have a 44px target');
+  assert.ok(idleBar.clockRight <= idleBar.actionLeft && idleBar.actionRight <= idleBar.barRight,
+    'Timer action should follow the clock and fit inside the bar');
   await evaluate(widget, `document.querySelector('[aria-label="Rozwiń panel"]').click()`);
   await waitFor('mini timer opens the focused project search', () => evaluate(widget,
     `document.activeElement === document.querySelector('[role="combobox"]')`));
@@ -430,6 +441,10 @@ async function verifyMiniTimer(cdp, mainSession) {
     const elapsed = clock?.textContent.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);
     return document.querySelector('.qp-mini')?.dataset.mode === 'running' && elapsed >= 5;
   })()`));
+  const runningBar = await inspectTimerBar();
+  assert.equal(runningBar.actionWidth, idleBar.actionWidth, 'Timer action width changes when running');
+  assert.equal(runningBar.actionHeight, idleBar.actionHeight, 'Timer action height changes when running');
+  assert.equal(runningBar.actionLeft, idleBar.actionLeft, 'Timer action moves when running');
   const started = readInterruptedTimer();
   const close = session => evaluate(session, `document.querySelector('[aria-label="Zamknij mini timer"]').click()`)
     .catch(error => { if (!/Execution context was destroyed|Target closed|Session with given id not found/i.test(error.message)) throw error; });
@@ -930,6 +945,31 @@ async function runWindow(port, phase, recovery) {
       return ready?.result.value === true;
     });
     console.log(`${phase}: connected to the test app`);
+    if (phase === 'initial') {
+      const evalIn = async (id, expression) => {
+        const value = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, id);
+        if (value.exceptionDetails) throw new Error(value.exceptionDetails.text);
+        return value.result.value;
+      };
+      await evalIn(sessionId, 'document.querySelector(".widget-open").click()');
+      const target = await waitFor('empty mini timer window', async () => {
+        const { targetInfos } = await cdp.send('Target.getTargets');
+        return targetInfos.find(item => item.type === 'page' && item.targetId !== cdp.pageId && /^https?:\/\/tauri\.localhost(?::\d+)?\//.test(item.url));
+      });
+      const { sessionId: emptyWidget } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
+      await waitFor('empty mini timer is ready', () => evalIn(emptyWidget,
+        `document.querySelector('.qp-mini')?.dataset.mode === 'idle' && document.querySelector('.qp-toggle')?.getAttribute('aria-disabled') === 'false'`).catch(() => false));
+      await evalIn(emptyWidget, `document.querySelector('.qp-toggle').click()`);
+      await waitFor('start without project opens the picker', () => evalIn(emptyWidget,
+        `Boolean(document.querySelector('.qp-panel')) && document.activeElement === document.querySelector('[role="combobox"]')`));
+      assert.equal(await evalIn(emptyWidget, `document.querySelector('.qp-mini').dataset.mode`), 'idle');
+      await evalIn(emptyWidget, `document.querySelector('[aria-label="Zamknij mini timer"]').click()`);
+      await waitFor('empty mini timer closes', async () => {
+        const { targetInfos } = await cdp.send('Target.getTargets');
+        return !targetInfos.some(item => item.targetId === target.targetId);
+      });
+      console.log('PASS: Start without a project opens the picker and leaves the timer stopped');
+    }
     if (phase === 'initial') await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory });
     const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription, interruptedDescription, recovery };
     const result = await cdp.send('Runtime.evaluate', {

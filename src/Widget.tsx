@@ -123,10 +123,6 @@ export default function Widget() {
       await refresh(true);
     } finally { gate.endWrite(); setBusy(false); }
   }
-  toggleRef.current = () => {
-    if (controlsLocked || !command || dirtyEdit) return;
-    void write(command.name, command.args, true, command.name === 'widget_project_start' ? () => setDraft('') : undefined);
-  };
   async function checkState() {
     if (await refresh()) setVerify(false);
   }
@@ -150,6 +146,15 @@ export default function Widget() {
     } catch { setWindowError('Nie zmieniono rozmiaru okna.'); }
     finally { panelLock.current = false; setPanelPending(false); }
   }, [open]);
+  toggleRef.current = () => {
+    if (controlsLocked || dirtyEdit) return;
+    if (!command) {
+      if (open) search.current?.focus();
+      else void setPanel(true);
+      return;
+    }
+    void write(command.name, command.args, true, command.name === 'widget_project_start' ? () => setDraft('') : undefined);
+  };
   useEffect(() => {
     if (open) {
       if (returnFocus.current === 'context') fullContext.current?.focus();
@@ -219,11 +224,11 @@ export default function Widget() {
   return <main className="qp-mini" data-mode={clock.mode} aria-label="TrackerMaster – mini timer">
     <header className="qp-bar">
       <span className="qp-grip" title="Przeciągnij okno" aria-hidden="true" onMouseDown={event => { if (event.button === 0) void invoke('widget_drag').catch(() => setWindowError('Nie przesunięto mini timera.')); }}><TimerIcon name="grip" /></span>
-      <button type="button" className={`qp-toggle${clock.mode === 'running' ? ' qp-running' : ''}`} aria-label={toggleLabel} title={`${toggleLabel} · ${shortcutLabel(shortcut?.shortcut || defaultShortcut)}${shortcut?.registered ? ' (globalnie)' : ' (w tym oknie)'}`} aria-disabled={controlsLocked || !command || dirtyEdit} onClick={() => toggleRef.current()}><TimerIcon name={active ? 'stop' : 'play'} /></button>
-      <span className="qp-clock" title={clock.mode === 'running' ? 'Orientacyjny czas pomiaru' : 'Czas pomiaru'} aria-live="off">{clock.text}</span>
       <button type="button" ref={contextButton} className="qp-context" title={`${context.title} — ${context.path}`} aria-label={`${context.title} — ${context.path}. Pokaż pełne informacje`} aria-expanded={open && details} aria-controls={open ? 'qp-panel' : undefined} onClick={() => void setPanel(true, 'context')}>
         <strong>{context.title}</strong><small>{context.path}</small>
       </button>
+      <span className="qp-clock" title={clock.mode === 'running' ? 'Orientacyjny czas pomiaru' : 'Czas pomiaru'} aria-live="off">{clock.text}</span>
+      <button type="button" className={`qp-toggle${clock.mode === 'running' ? ' qp-running' : ''}`} aria-label={toggleLabel} title={`${toggleLabel} · ${shortcutLabel(shortcut?.shortcut || defaultShortcut)}${shortcut?.registered ? ' (globalnie)' : ' (w tym oknie)'}`} aria-disabled={controlsLocked || dirtyEdit} onClick={() => toggleRef.current()}><TimerIcon name={active ? 'stop' : 'play'} /></button>
       <div className="qp-tools">
         <button type="button" className="qp-icon" aria-label="Przypięcie na wierzchu" aria-pressed={onTop} title={pinLabel} aria-disabled={pinPending} onClick={() => void changePin()}><TimerIcon name="pin" /></button>
         <button type="button" className="qp-icon" ref={disclosure} aria-label={expandLabel} title={expandLabel} aria-expanded={open} aria-controls={open ? 'qp-panel' : undefined} aria-disabled={panelPending} onClick={() => void setPanel(!open)}><TimerIcon name={open ? 'collapse' : 'expand'} /></button>
