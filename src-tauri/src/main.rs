@@ -1526,6 +1526,79 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn exit_dialog_has_explicit_choices_and_safe_default() {
+        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+            || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted") {
+            return;
+        }
+        use std::{os::windows::ffi::OsStrExt, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+        #[repr(C)]
+        struct ActivationContext {
+            size: u32, flags: u32, source: *const u16, architecture: u16, language: u16,
+            assembly_directory: *const u16, resource_name: *const u16, application_name: *const u16,
+            module: *mut std::ffi::c_void,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateActCtxW(context: *const ActivationContext) -> *mut std::ffi::c_void;
+            fn ActivateActCtx(context: *mut std::ffi::c_void, cookie: *mut usize) -> i32;
+            fn DeactivateActCtx(flags: u32, cookie: usize) -> i32;
+            fn ReleaseActCtx(context: *mut std::ffi::c_void);
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn FindWindowW(class: *const u16, title: *const u16) -> *mut std::ffi::c_void;
+            fn GetDlgItem(window: *mut std::ffi::c_void, id: i32) -> *mut std::ffi::c_void;
+            fn GetWindowTextW(window: *mut std::ffi::c_void, text: *mut u16, len: i32) -> i32;
+            fn SendMessageW(window: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize) -> isize;
+        }
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("tracker-dialog-{}-{stamp}.manifest", std::process::id()));
+        std::fs::write(&path, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../packaging/msix/dialog-test.manifest"))).unwrap();
+        let class: Vec<_> = "#32770".encode_utf16().chain(Some(0)).collect();
+        let title: Vec<_> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
+        for (selected, expected) in [(2, false), (100, true)] {
+            let manifest = path.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let source: Vec<_> = manifest.as_os_str().encode_wide().chain(Some(0)).collect();
+                let context = ActivationContext {
+                    size: std::mem::size_of::<ActivationContext>() as u32,
+                    flags: 0, source: source.as_ptr(), architecture: 0, language: 0,
+                    assembly_directory: std::ptr::null(), resource_name: std::ptr::null(),
+                    application_name: std::ptr::null(), module: std::ptr::null_mut(),
+                };
+                let handle = unsafe { CreateActCtxW(&context) };
+                assert_ne!(handle as isize, -1);
+                let mut cookie = 0;
+                assert_ne!(unsafe { ActivateActCtx(handle, &mut cookie) }, 0);
+                let result = confirm_stop_and_exit();
+                unsafe { DeactivateActCtx(0, cookie); ReleaseActCtx(handle); }
+                let _ = send.send(result);
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let dialog = loop {
+                let window = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+                if !window.is_null() && !unsafe { GetDlgItem(window, 100) }.is_null() { break window; }
+                assert!(Instant::now() < deadline, "The exit dialog did not appear");
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            for (id, expected_label) in [(100, "Stop i zamknij"), (2, "Anuluj")] {
+                let button = unsafe { GetDlgItem(dialog, id) };
+                assert!(!button.is_null(), "Missing exit button {id}");
+                let mut text = [0u16; 80];
+                let len = unsafe { GetWindowTextW(button, text.as_mut_ptr(), text.len() as i32) };
+                assert_eq!(String::from_utf16_lossy(&text[..len as usize]), expected_label);
+            }
+            assert_eq!(unsafe { SendMessageW(dialog, 0x0400, 0, 0) } & 0xffff, 2);
+            unsafe { SendMessageW(GetDlgItem(dialog, selected), 0x00f5, 0, 0); }
+            assert_eq!(receive.recv_timeout(Duration::from_secs(10)).unwrap(), expected);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn failed_backup_restore_can_be_retried_with_the_same_preview() {
         use std::time::{SystemTime, UNIX_EPOCH};
