@@ -72,13 +72,32 @@ fn show_start_error(message: &str) {
 
 #[cfg(windows)]
 fn confirm_stop_and_exit() -> bool {
-    #[link(name = "user32")]
-    extern "system" { fn MessageBoxW(hwnd: *mut std::ffi::c_void, text: *const u16, caption: *const u16, flags: u32) -> i32; }
-    let message: Vec<u16> = "Pomiar nadal trwa. Czy chcesz go zatrzymać i zakończyć aplikację?\n\nWybierz Nie, aby kontynuować pomiar."
+    use windows_sys::Win32::UI::Controls::{TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_CANCEL_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION};
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDCANCEL;
+    const STOP_AND_EXIT: i32 = 100;
+    let message: Vec<u16> = "Pomiar nadal trwa. Czy chcesz go zatrzymać i zakończyć aplikację?"
         .encode_utf16().chain(Some(0)).collect();
     let title: Vec<u16> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
-    // Yes/No, question icon, default to No.
-    unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), 0x4 | 0x20 | 0x100) == 6 }
+    let stop: Vec<u16> = "Stop i zamknij".encode_utf16().chain(Some(0)).collect();
+    let button = TASKDIALOG_BUTTON { nButtonID: STOP_AND_EXIT, pszButtonText: stop.as_ptr() };
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        pszWindowTitle: title.as_ptr(),
+        pszMainInstruction: message.as_ptr(),
+        cButtons: 1,
+        pButtons: &button,
+        nDefaultButton: IDCANCEL,
+        ..Default::default()
+    };
+    let mut chosen = IDCANCEL;
+    let result = unsafe { TaskDialogIndirect(&config, &mut chosen, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if result < 0 {
+        show_start_error("Nie można wyświetlić potwierdzenia. Aplikacja pozostaje otwarta.");
+        return false;
+    }
+    chosen == STOP_AND_EXIT
 }
 type Shared = Arc<Mutex<Tracker>>;
 const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
@@ -88,6 +107,7 @@ impl Default for HotkeyState {
 }
 type Hotkey = Mutex<HotkeyState>;
 struct HotkeyChange(Mutex<()>);
+struct QuitDialog(std::sync::atomic::AtomicBool);
 #[derive(Default)]
 struct RestoreState { sequence: u64, pending: Option<storage_safety::PreparedRestore> }
 type Restore = Mutex<RestoreState>;
@@ -1337,13 +1357,24 @@ fn request_quit(app: &tauri::AppHandle) {
         .and_then(|tracker| snapshot(tracker).map(|s| s.active));
     if matches!(active, Ok(None)) { app.exit(0); }
     else {
+        use std::sync::atomic::Ordering;
+        if app.state::<QuitDialog>().0.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
         // Do not hold the tracker lock or block the UI thread during a dialog.
         drop(guard);
         let main_app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(main_app).await; });
         #[cfg(windows)]
         {
             let app = app.clone();
-            std::thread::spawn(move || match active {
+            std::thread::spawn(move || {
+                struct ResetQuit<'a>(&'a std::sync::atomic::AtomicBool);
+                impl Drop for ResetQuit<'_> {
+                    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+                }
+                let pending = app.state::<QuitDialog>();
+                let _reset = ResetQuit(&pending.0);
+                match active {
                 Ok(Some(entry)) if !entry.recovered => {
                     if !confirm_stop_and_exit() { return; }
                     let shared = app.state::<Shared>();
@@ -1359,6 +1390,7 @@ fn request_quit(app: &tauri::AppHandle) {
                 Ok(Some(_)) => show_start_error("Pomiar wymaga ręcznej weryfikacji. Rozlicz go przed zakończeniem aplikacji."),
                 Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
                 Ok(None) => {}
+                }
             });
         }
     }
@@ -1433,6 +1465,7 @@ fn main() {
             }
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(HotkeyChange(Mutex::new(())));
+            app.manage(QuitDialog(std::sync::atomic::AtomicBool::new(false)));
             app.manage(Mutex::new(RestoreState::default()));
             app.manage(editor_close::EditorClose::default());
             let saved = std::fs::read_to_string(dir.join("shortcut.txt")).ok().filter(|value| valid_shortcut(value)).unwrap_or_else(|| DEFAULT_SHORTCUT.into());
