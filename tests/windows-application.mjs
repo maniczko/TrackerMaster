@@ -698,14 +698,14 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   try {
     await mkdir(preference);
     assert.equal(await evaluate(`(() => {
-      const api = window.__TAURI_INTERNALS__;
-      window.__sortTestOriginalInvoke = api.invoke;
+      window.__sortTestOriginalFetch = window.fetch;
       window.__sortTestWrites = 0;
-      api.invoke = function(command, ...args) {
-        if (command === 'set_draft_sort') window.__sortTestWrites++;
-        return window.__sortTestOriginalInvoke.call(this, command, ...args);
+      window.fetch = function(resource, ...args) {
+        const url = new URL(typeof resource === 'string' ? resource : resource.url, location.href);
+        if (url.hostname === 'ipc.localhost' && url.pathname === '/set_draft_sort') window.__sortTestWrites++;
+        return window.__sortTestOriginalFetch.call(this, resource, ...args);
       };
-      return api.invoke !== window.__sortTestOriginalInvoke;
+      return window.fetch !== window.__sortTestOriginalFetch;
     })()`), true);
     await evaluate(`(() => {
       const select = document.querySelector('[aria-label="Szkice wpisów"] select');
@@ -747,7 +747,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     assert.equal((await readdir(profileDir)).some(name => name.startsWith('.draft-sort.txt-') && name.endsWith('.tmp')), false);
     console.log('PASS: manual and automatic sort retries were counted, rate-limited, and preserved the draft until successful save');
   } finally {
-    await evaluate(`if (window.__sortTestOriginalInvoke) window.__TAURI_INTERNALS__.invoke = window.__sortTestOriginalInvoke`);
+    await evaluate(`if (window.__sortTestOriginalFetch) window.fetch = window.__sortTestOriginalFetch`);
     if (!restoredPreference) {
       const obstacle = await stat(preference).catch(() => null);
       if (obstacle?.isDirectory()) await rmdir(preference);
