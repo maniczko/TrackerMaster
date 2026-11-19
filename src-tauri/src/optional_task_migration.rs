@@ -153,6 +153,9 @@ fn migrate_transaction(db: &mut Connection) -> Result<()> {
 }
 
 #[cfg(test)]
+mod csv_isolation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
