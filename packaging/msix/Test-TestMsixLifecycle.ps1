@@ -46,6 +46,7 @@ if ([version] $initialIdentity.Version -ge [version] $updatedIdentity.Version) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 [ComImport, Guid("45ba127d-10a8-46ea-8ab7-56ea9078943c")]
 class TrackerApplicationActivationManager {}
@@ -69,6 +70,13 @@ public static class TestPackageActivation {
 }
 
 public static class TestPackageWindow {
+    private delegate bool EnumWindowCallback(IntPtr window, IntPtr state);
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr state);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassNameW(IntPtr window, StringBuilder name, int maximum);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextW(IntPtr window, StringBuilder text, int maximum);
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint owner);
     [DllImport("user32.dll")]
@@ -85,6 +93,23 @@ public static class TestPackageWindow {
     public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
+
+    public static string DescribeWindows(uint processId) {
+        var result = new StringBuilder();
+        EnumWindows((window, state) => {
+            uint owner;
+            var thread = GetWindowThreadProcessId(window, out owner);
+            if (owner != processId) return true;
+            var className = new StringBuilder(256);
+            var title = new StringBuilder(256);
+            GetClassNameW(window, className, className.Capacity);
+            GetWindowTextW(window, title, title.Capacity);
+            result.AppendFormat("[hwnd={0},thread={1},visible={2},class={3},title={4}]",
+                window.ToInt64(), thread, IsWindowVisible(window), className, title);
+            return true;
+        }, IntPtr.Zero);
+        return result.ToString();
+    }
 }
 '@
 
@@ -122,6 +147,7 @@ function Write-TestWindowState([string] $Phase, $Process, [IntPtr] $Window, [ver
     $nativeWait = [TestPackageWindow]::WaitForSingleObject($ProcessHandle, 0)
     $present = $null -ne (Get-Process -Id $Process.Id -ErrorAction SilentlyContinue)
     Write-Host "WINDOW_DIAGNOSTIC phase=$Phase version=$Version pid=$($Process.Id) exited=$exited exitCode=$exitCode nativeQuery=$queryOk nativeCode=$nativeCode nativeWait=$nativeWait pidPresent=$present hwnd=$($Window.ToInt64()) valid=$valid owner=$owner thread=$thread visible=$visible"
+    Write-Host "WINDOW_LIST phase=$Phase pid=$($Process.Id) $([TestPackageWindow]::DescribeWindows([uint32] $Process.Id))"
 }
 
 function Start-TestVersion($Instance) {
