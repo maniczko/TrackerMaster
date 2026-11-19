@@ -167,8 +167,24 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
 
 #[tauri::command]
 fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
-    let tracker = locked(&state)?;
-    snapshot(&tracker)
+    let mut tracker = locked(&state)?;
+    let mut current = snapshot(&tracker)?;
+    if let (Some(active), Some(clock)) = (&mut current.active, &tracker.running_since) {
+        if snapshot_clock_uncertain(&active.started_at, Utc::now(), clock.since.elapsed().as_secs(), clock.power, power_sample()) {
+            // Same safety outcome as a rejected Stop: keep the row open for explicit recovery.
+            tracker.running_since = None;
+            active.recovered = true;
+        }
+    }
+    Ok(current)
+}
+
+fn snapshot_clock_uncertain(start: &str, now: DateTime<Utc>, elapsed: u64, started_power: PowerSample, power: Cmd<PowerSample>) -> bool {
+    let Ok(power) = power else { return true; };
+    let Ok(start) = DateTime::parse_from_rfc3339(start) else { return true; };
+    let start = start.with_timezone(&Utc);
+    let wall = now.signed_duration_since(start).num_seconds();
+    sleep_or_invalid(started_power, power) || now < start || wall.unsigned_abs().abs_diff(elapsed) > 2
 }
 
 // Unlike the history preview, a report must include every non-deleted entry.
@@ -309,6 +325,10 @@ fn exit_after_restore(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<()
     Ok(())
 }
 
+const WIDGET_WIDTH: f64 = 440.0;
+const WIDGET_COMPACT_HEIGHT: f64 = 76.0;
+const WIDGET_EXPANDED_HEIGHT: f64 = 390.0;
+
 #[tauri::command]
 async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
     if let Some(window) = app.get_webview_window("widget") {
@@ -318,7 +338,7 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
     } else {
         if let Ok(mut hotkey) = app.state::<Hotkey>().lock() { hotkey.widget_ready = false; }
         let window = tauri::WebviewWindowBuilder::new(&app, "widget", tauri::WebviewUrl::default())
-            .title("TrackerMaster — mini timer").inner_size(520.0, 76.0)
+            .title("TrackerMaster — mini timer").inner_size(WIDGET_WIDTH, WIDGET_COMPACT_HEIGHT)
             .decorations(false).resizable(false).build().map_err(|e| e.to_string())?;
         let position_path = app.path().app_data_dir().map_err(|e| e.to_string())?.join("widget-position.txt");
         if let Ok(saved) = std::fs::read_to_string(&position_path) {
@@ -348,7 +368,7 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
 #[tauri::command]
 async fn widget_panel(app: tauri::AppHandle, expanded: bool) -> Cmd<()> {
     let window = app.get_webview_window("widget").ok_or("Widget nie jest otwarty.")?;
-    let height = if expanded { 390.0 } else { 76.0 };
+    let height = if expanded { WIDGET_EXPANDED_HEIGHT } else { WIDGET_COMPACT_HEIGHT };
     if expanded {
         if let (Ok(Some(monitor)), Ok(position), Ok(scale)) = (window.current_monitor(), window.outer_position(), window.scale_factor()) {
             let bottom = i64::from(monitor.position().y) + i64::from(monitor.size().height);
@@ -359,7 +379,7 @@ async fn widget_panel(app: tauri::AppHandle, expanded: bool) -> Cmd<()> {
             }
         }
     }
-    window.set_size(tauri::LogicalSize::new(520.0, height)).map_err(|e| e.to_string())
+    window.set_size(tauri::LogicalSize::new(WIDGET_WIDTH, height)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1220,6 +1240,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_clock_withholds_sleep_and_unreliable_elapsed_time() {
+        let start = "2026-01-01T10:00:00Z";
+        let current = DateTime::parse_from_rfc3339("2026-01-01T10:01:00Z").unwrap().with_timezone(&Utc);
+        let baseline = PowerSample { total_ms: 10_000, awake_ms: 8_000 };
+        let awake = PowerSample { total_ms: 70_000, awake_ms: 68_000 };
+        let slept = PowerSample { total_ms: 70_000, awake_ms: 28_000 };
+        assert!(!snapshot_clock_uncertain(start, current, 60, baseline, Ok(awake)));
+        assert!(snapshot_clock_uncertain(start, current, 60, baseline, Ok(slept)));
+        assert!(snapshot_clock_uncertain(start, current, 5, baseline, Ok(awake)));
+        assert!(snapshot_clock_uncertain(start, current, 60, baseline, Err("clock unavailable".into())));
+    }
 
     #[cfg(windows)]
     #[test]
