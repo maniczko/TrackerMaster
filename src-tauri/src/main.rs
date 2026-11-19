@@ -1527,6 +1527,8 @@ fn main() {
             trace_test_window(app.handle(), "setup-window-created");
             #[cfg(windows)]
             activation.listen(app.handle().clone())?;
+            #[cfg(windows)]
+            trace_test_window(app.handle(), "setup-complete");
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -157,6 +157,8 @@ function Write-TestWindowState([string] $Phase, $Process, [IntPtr] $Window, [ver
 }
 
 function Start-TestVersion($Instance) {
+    $traceFile = Join-Path $testData 'window-diagnostic.txt'
+    if (Test-Path -LiteralPath $traceFile -PathType Leaf) { Remove-Item -LiteralPath $traceFile }
     $processId = [TestPackageActivation]::Launch("$($Instance.PackageFamilyName)!TrackerMaster")
     $process = Get-Process -Id $processId
     $expectedExe = Join-Path $Instance.InstallLocation 'tracker-master.exe'
@@ -180,6 +182,19 @@ function Start-TestVersion($Instance) {
         if ([TestPackageWindow]::GetWindowThreadProcessId($window, [ref] $windowOwner) -eq 0 -or $windowOwner -ne $processId) {
             throw 'The window does not belong to the launched test package.'
         }
+        $traceFile = Join-Path $testData 'window-diagnostic.txt'
+        $ready = $false
+        for ($attempt = 0; $attempt -lt 120; $attempt++) {
+            $process.Refresh()
+            if ($process.HasExited) { throw 'The packaged process exited before setup completed.' }
+            if ((Test-Path -LiteralPath $traceFile -PathType Leaf) -and
+                (Select-String -LiteralPath $traceFile -SimpleMatch 'setup-complete' -Quiet)) {
+                $ready = $true
+                break
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (!$ready) { throw 'The packaged application did not complete setup in time.' }
         Start-Sleep -Seconds 2
         Write-TestWindowState 'before-close' $process $window ([version] $Instance.Version) $processHandle
         if (![TestPackageWindow]::PostMessageW($window, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)) {
