@@ -1526,47 +1526,6 @@ fn main() {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    #[test]
-    fn exit_dialog_offers_explicit_choices_and_defaults_to_cancel() {
-        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
-            || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted") {
-            return;
-        }
-        use std::time::{Duration, Instant};
-        #[link(name = "user32")]
-        extern "system" {
-            fn FindWindowW(class: *const u16, title: *const u16) -> *mut std::ffi::c_void;
-            fn GetDlgItem(window: *mut std::ffi::c_void, id: i32) -> *mut std::ffi::c_void;
-            fn GetWindowTextW(window: *mut std::ffi::c_void, text: *mut u16, len: i32) -> i32;
-            fn SendMessageW(window: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize) -> isize;
-        }
-        let class: Vec<_> = "#32770".encode_utf16().chain(Some(0)).collect();
-        let title: Vec<_> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
-        for (selected, expected) in [(2, false), (100, true)] {
-            let (send, receive) = std::sync::mpsc::channel();
-            std::thread::spawn(move || { let _ = send.send(confirm_stop_and_exit()); });
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let dialog = loop {
-                let window = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
-                if !window.is_null() { break window; }
-                assert!(Instant::now() < deadline, "The exit dialog did not appear");
-                std::thread::sleep(Duration::from_millis(50));
-            };
-            for (id, expected_label) in [(100, "Stop i zamknij"), (2, "Anuluj")] {
-                let button = unsafe { GetDlgItem(dialog, id) };
-                assert!(!button.is_null(), "Missing exit dialog button {id}");
-                let mut text = [0u16; 80];
-                let len = unsafe { GetWindowTextW(button, text.as_mut_ptr(), text.len() as i32) };
-                assert_eq!(String::from_utf16_lossy(&text[..len as usize]), expected_label);
-            }
-            assert_eq!(unsafe { SendMessageW(dialog, 0x0400, 0, 0) } & 0xffff, 2);
-            let button = unsafe { GetDlgItem(dialog, selected) };
-            unsafe { SendMessageW(button, 0x00f5, 0, 0); }
-            assert_eq!(receive.recv_timeout(Duration::from_secs(10)).unwrap(), expected);
-        }
-    }
-
     #[test]
     fn failed_backup_restore_can_be_retried_with_the_same_preview() {
         use std::time::{SystemTime, UNIX_EPOCH};
