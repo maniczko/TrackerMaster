@@ -284,6 +284,54 @@ async function verifySecondLaunch(primary, env) {
   console.log(`PASS: X hid the original window, second launch restored it, and active entry #${original.id} was unchanged`);
 }
 
+async function verifyOccupiedShortcut(cdp, session) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, session);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const helper = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', 'tests/windows-occupy-hotkey.ps1'], {
+    windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '', errors = '';
+  helper.stdout.on('data', chunk => { output += chunk.toString(); });
+  helper.stderr.on('data', chunk => { errors += chunk.toString(); });
+  const exited = once(helper, 'exit');
+  const selectAndSave = async key => {
+    await evaluate(`(() => {
+    const section = document.querySelector('[aria-label="Skrót klawiaturowy"]');
+    const select = section.querySelectorAll('select')[1];
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, ${JSON.stringify(key)});
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await evaluate(`document.querySelector('[aria-label="Skrót klawiaturowy"] button').click()`);
+  };
+  try {
+    await waitFor('another process reserves Ctrl+Alt+F10', () => {
+      assert.equal(helper.exitCode, null, `Shortcut reservation failed: ${errors}`);
+      return output.includes('reserved');
+    });
+    await selectAndSave('F10');
+    await waitFor('occupied shortcut is rejected', () => evaluate(`document.querySelector('[aria-label="Skrót klawiaturowy"] [role="alert"]')?.textContent.includes('niedostępny lub zajęty')`));
+    assert.equal(await evaluate(`document.querySelector('[aria-label="Skrót klawiaturowy"] strong')?.textContent`), 'Ctrl + Alt + F11');
+    assert.equal(await readFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'shortcut.txt'), 'utf8'), 'Ctrl+Alt+F11');
+    assert.equal(helper.exitCode, null, 'The other process must still own the shortcut during rejection');
+    helper.stdin.end('\n');
+    assert.deepEqual(await exited, [0, null], errors);
+    await selectAndSave('F10');
+    await waitFor('released shortcut can be saved', () => evaluate(`document.querySelector('[aria-label="Skrót klawiaturowy"] strong')?.textContent === 'Ctrl + Alt + F10'`));
+    await selectAndSave('F11');
+    await waitFor('original shortcut restored', () => evaluate(`document.querySelector('[aria-label="Skrót klawiaturowy"] strong')?.textContent === 'Ctrl + Alt + F11'`));
+    assert.equal(await readFile(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'shortcut.txt'), 'utf8'), 'Ctrl+Alt+F11');
+    console.log('PASS: actual shortcut conflict preserved the old preference; releasing and retrying succeeded');
+  } finally {
+    if (helper.exitCode === null && helper.signalCode === null) {
+      helper.stdin.end('\n');
+      await exited;
+    }
+  }
+}
+
 async function verifyMiniTimer(cdp, mainSession) {
   const evaluate = async (session, expression) => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, session);
@@ -690,6 +738,7 @@ async function runWindow(port, phase, recovery) {
       assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.csv')).length, 1);
     }
     if (phase === 'interrupt') {
+      await verifyOccupiedShortcut(cdp, sessionId);
       await verifyMiniTimer(cdp, sessionId);
       await verifySecondLaunch(child, env);
     }
