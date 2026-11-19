@@ -122,7 +122,11 @@ fn valid_description(description: &str) -> Cmd<&str> {
     }
     Ok(description)
 }
-fn db_err(_: rusqlite::Error) -> String { "Nie udało się zapisać lub odczytać danych lokalnych.".into() }
+fn db_err(_error: rusqlite::Error) -> String {
+    #[cfg(all(test, windows))]
+    tests::capture_db_error(_error);
+    "Nie udało się zapisać lub odczytać danych lokalnych.".into()
+}
 fn ensure_available(tracker: &Tracker) -> Cmd<()> {
     if tracker.restored { return Err("Kopia została przywrócona. Zamknij aplikację i uruchom ją ponownie.".into()); }
     Ok(())
@@ -1801,6 +1805,47 @@ mod tests {
     }
 
     #[cfg(windows)]
+    std::thread_local! {
+        static DB_ERROR_CAPTURE: std::cell::RefCell<Option<Vec<rusqlite::Error>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(windows)]
+    pub(super) fn capture_db_error(error: rusqlite::Error) {
+        DB_ERROR_CAPTURE.with(|capture| {
+            if let Some(errors) = capture.borrow_mut().as_mut() {
+                errors.push(error);
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    fn assert_injected_write_failure(marker: &str, run: impl FnOnce() -> Cmd<()>) {
+        struct ResetCapture;
+        impl Drop for ResetCapture {
+            fn drop(&mut self) {
+                DB_ERROR_CAPTURE.with(|capture| drop(capture.take()));
+            }
+        }
+
+        DB_ERROR_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            assert!(capture.is_none());
+            *capture = Some(Vec::new());
+        });
+        let _reset = ResetCapture;
+        let result = run();
+        let errors = DB_ERROR_CAPTURE.with(|capture| capture.take().unwrap());
+
+        assert_eq!(result.unwrap_err(), "Nie udało się zapisać lub odczytać danych lokalnych.");
+        let [rusqlite::Error::SqliteFailure(code, Some(message))] = errors.as_slice() else {
+            panic!("expected one SQLite failure from {marker}, got {errors:?}");
+        };
+        assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+        assert_eq!(message.as_str(), marker);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn project_timer_write_failures_roll_back_on_disk_and_allow_retry() {
         use optional_task_migration::{transition, TimerAction};
@@ -1839,7 +1884,6 @@ mod tests {
             (entries, metadata)
         };
         let clock = |tracker: &Tracker| tracker.running_since.as_ref().unwrap().since;
-        let write_error = "Nie udało się zapisać lub odczytać danych lokalnych.";
         let started = now();
         transition(&mut tracker, None, &started, TimerAction::Start { project_id: 1, task_id: None, description: "Original" }).unwrap();
         let first = snapshot(&tracker).unwrap().active.unwrap().id;
@@ -1851,7 +1895,9 @@ mod tests {
         // FAIL leaves earlier changes intact inside the transaction; dropping it must undo them.
         tracker.db.execute_batch("CREATE TEMP TRIGGER fail_switch_description
             AFTER INSERT ON main.entry_descriptions BEGIN SELECT RAISE(FAIL, 'simulated switch write failure'); END;").unwrap();
-        assert_eq!(transition(&mut tracker, Some(first), &now(), switch()).unwrap_err(), write_error);
+        assert_injected_write_failure("simulated switch write failure", || {
+            transition(&mut tracker, Some(first), &now(), switch())
+        });
         assert!(tracker.db.is_autocommit());
         assert_eq!(clock(&tracker), original_clock);
         assert_eq!(persisted(), before_switch);
@@ -1875,7 +1921,9 @@ mod tests {
         let active_clock = clock(&tracker);
         tracker.db.execute_batch("CREATE TEMP TRIGGER fail_stop_close
             AFTER UPDATE OF ended_at ON main.time_entries BEGIN SELECT RAISE(FAIL, 'simulated stop write failure'); END;").unwrap();
-        assert_eq!(transition(&mut tracker, Some(second), &now(), TimerAction::Stop).unwrap_err(), write_error);
+        assert_injected_write_failure("simulated stop write failure", || {
+            transition(&mut tracker, Some(second), &now(), TimerAction::Stop)
+        });
         assert!(tracker.db.is_autocommit());
         assert_eq!(clock(&tracker), active_clock);
         assert_eq!(persisted(), before_stop);
