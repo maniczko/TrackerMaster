@@ -72,35 +72,34 @@ fn show_start_error(message: &str) {
 
 #[cfg(windows)]
 fn confirm_stop_and_exit() -> bool {
-    use windows_sys::Win32::UI::Controls::{TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION};
-    use windows_sys::Win32::UI::WindowsAndMessaging::IDCANCEL;
-    const STOP_AND_EXIT: i32 = 100;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, MessageBoxW, SetDlgItemTextW, SetWindowsHookExW, UnhookWindowsHookEx,
+        HCBT_ACTIVATE, IDCANCEL, IDOK, MB_DEFBUTTON2, MB_ICONQUESTION, MB_OKCANCEL, WH_CBT,
+    };
+    thread_local! { static LABELED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    unsafe extern "system" fn label_buttons(code: i32, window: usize, data: isize) -> isize {
+        if code == HCBT_ACTIVATE as i32 {
+            let stop: Vec<u16> = "Stop i zamknij".encode_utf16().chain(Some(0)).collect();
+            let cancel: Vec<u16> = "Anuluj".encode_utf16().chain(Some(0)).collect();
+            let stop_set = SetDlgItemTextW(window as *mut std::ffi::c_void, IDOK, stop.as_ptr());
+            let cancel_set = SetDlgItemTextW(window as *mut std::ffi::c_void, IDCANCEL, cancel.as_ptr());
+            LABELED.with(|labeled| labeled.set(stop_set != 0 && cancel_set != 0));
+        }
+        CallNextHookEx(std::ptr::null_mut(), code, window, data)
+    }
     let message: Vec<u16> = "Pomiar nadal trwa. Czy chcesz go zatrzymać i zakończyć aplikację?"
         .encode_utf16().chain(Some(0)).collect();
     let title: Vec<u16> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
-    let stop: Vec<u16> = "Stop i zamknij".encode_utf16().chain(Some(0)).collect();
-    let cancel: Vec<u16> = "Anuluj".encode_utf16().chain(Some(0)).collect();
-    let buttons = [
-        TASKDIALOG_BUTTON { nButtonID: STOP_AND_EXIT, pszButtonText: stop.as_ptr() },
-        TASKDIALOG_BUTTON { nButtonID: IDCANCEL, pszButtonText: cancel.as_ptr() },
-    ];
-    let config = TASKDIALOGCONFIG {
-        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
-        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
-        pszWindowTitle: title.as_ptr(),
-        pszMainInstruction: message.as_ptr(),
-        cButtons: buttons.len() as u32,
-        pButtons: buttons.as_ptr(),
-        nDefaultButton: IDCANCEL,
-        ..Default::default()
-    };
-    let mut chosen = IDCANCEL;
-    let result = unsafe { TaskDialogIndirect(&config, &mut chosen, std::ptr::null_mut(), std::ptr::null_mut()) };
-    if result < 0 {
+    let hook = unsafe { SetWindowsHookExW(WH_CBT, Some(label_buttons), std::ptr::null_mut(), GetCurrentThreadId()) };
+    if hook.is_null() {
         show_start_error("Nie można wyświetlić potwierdzenia. Aplikacja pozostaje otwarta.");
         return false;
     }
-    chosen == STOP_AND_EXIT
+    LABELED.with(|labeled| labeled.set(false));
+    let chosen = unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2) };
+    unsafe { UnhookWindowsHookEx(hook); }
+    chosen == IDOK && LABELED.with(|labeled| labeled.get())
 }
 type Shared = Arc<Mutex<Tracker>>;
 const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
@@ -1533,20 +1532,7 @@ mod tests {
             || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted") {
             return;
         }
-        use std::{os::windows::ffi::OsStrExt, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
-        #[repr(C)]
-        struct ActivationContext {
-            size: u32, flags: u32, source: *const u16, architecture: u16, language: u16,
-            assembly_directory: *const u16, resource_name: *const u16, application_name: *const u16,
-            module: *mut std::ffi::c_void,
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn CreateActCtxW(context: *const ActivationContext) -> *mut std::ffi::c_void;
-            fn ActivateActCtx(context: *mut std::ffi::c_void, cookie: *mut usize) -> i32;
-            fn DeactivateActCtx(flags: u32, cookie: usize) -> i32;
-            fn ReleaseActCtx(context: *mut std::ffi::c_void);
-        }
+        use std::time::{Duration, Instant};
         #[link(name = "user32")]
         extern "system" {
             fn FindWindowW(class: *const u16, title: *const u16) -> *mut std::ffi::c_void;
@@ -1554,38 +1540,29 @@ mod tests {
             fn GetWindowTextW(window: *mut std::ffi::c_void, text: *mut u16, len: i32) -> i32;
             fn SendMessageW(window: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize) -> isize;
         }
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("tracker-dialog-{}-{stamp}.manifest", std::process::id()));
-        std::fs::write(&path, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../packaging/msix/dialog-test.manifest"))).unwrap();
         let class: Vec<_> = "#32770".encode_utf16().chain(Some(0)).collect();
         let title: Vec<_> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
-        for (selected, expected) in [(2, false), (100, true)] {
-            let manifest = path.clone();
+        for (selected, expected) in [(2, false), (1, true)] {
             let (send, receive) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let source: Vec<_> = manifest.as_os_str().encode_wide().chain(Some(0)).collect();
-                let context = ActivationContext {
-                    size: std::mem::size_of::<ActivationContext>() as u32,
-                    flags: 0, source: source.as_ptr(), architecture: 0, language: 0,
-                    assembly_directory: std::ptr::null(), resource_name: std::ptr::null(),
-                    application_name: std::ptr::null(), module: std::ptr::null_mut(),
-                };
-                let handle = unsafe { CreateActCtxW(&context) };
-                assert_ne!(handle as isize, -1);
-                let mut cookie = 0;
-                assert_ne!(unsafe { ActivateActCtx(handle, &mut cookie) }, 0);
                 let result = confirm_stop_and_exit();
-                unsafe { DeactivateActCtx(0, cookie); ReleaseActCtx(handle); }
                 let _ = send.send(result);
             });
             let deadline = Instant::now() + Duration::from_secs(10);
             let dialog = loop {
                 let window = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
-                if !window.is_null() && !unsafe { GetDlgItem(window, 100) }.is_null() { break window; }
+                if !window.is_null() {
+                    let button = unsafe { GetDlgItem(window, 1) };
+                    let mut text = [0u16; 80];
+                    if !button.is_null() {
+                        let len = unsafe { GetWindowTextW(button, text.as_mut_ptr(), text.len() as i32) };
+                        if String::from_utf16_lossy(&text[..len as usize]) == "Stop i zamknij" { break window; }
+                    }
+                }
                 assert!(Instant::now() < deadline, "The exit dialog did not appear");
                 std::thread::sleep(Duration::from_millis(50));
             };
-            for (id, expected_label) in [(100, "Stop i zamknij"), (2, "Anuluj")] {
+            for (id, expected_label) in [(1, "Stop i zamknij"), (2, "Anuluj")] {
                 let button = unsafe { GetDlgItem(dialog, id) };
                 assert!(!button.is_null(), "Missing exit button {id}");
                 let mut text = [0u16; 80];
@@ -1596,7 +1573,6 @@ mod tests {
             unsafe { SendMessageW(GetDlgItem(dialog, selected), 0x00f5, 0, 0); }
             assert_eq!(receive.recv_timeout(Duration::from_secs(10)).unwrap(), expected);
         }
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
