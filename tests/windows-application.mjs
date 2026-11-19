@@ -348,10 +348,30 @@ async function verifyMiniTimer(cdp, mainSession) {
   await delay(250);
   assert.equal(await evaluate(widget, 'document.querySelector(".qp-mini").dataset.mode'), 'idle',
     'The old shortcut must not activate a focused Start button');
-  const focusCheck = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', 'tests/windows-hotkey.ps1'], {
-    timeout: 20_000, windowsHide: true, encoding: 'utf8',
+  const focusTest = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', 'tests/windows-hotkey.ps1'], {
+    windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   });
-  assert.equal(focusCheck.trim(), 'independent-window-focused');
+  let focusOutput = '', focusErrors = '';
+  focusTest.stdout.on('data', chunk => { focusOutput += chunk.toString(); });
+  focusTest.stderr.on('data', chunk => { focusErrors += chunk.toString(); });
+  const focusExit = once(focusTest, 'exit');
+  try {
+    await waitFor('hotkey sent with independent window focused', () => {
+      assert.equal(focusTest.exitCode, null, `Focus helper stopped early: ${focusErrors}`);
+      return focusOutput.includes('hotkey-sent');
+    });
+    await waitFor('timer starts while independent window remains open', async () => {
+      assert.equal(focusTest.exitCode, null, `Focus helper stopped before timer started: ${focusErrors}`);
+      return evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running'`);
+    });
+    assert.deepEqual(await focusExit, [0, null], focusErrors);
+    assert.ok(focusOutput.includes('independent-window-focused'));
+  } finally {
+    if (focusTest.exitCode === null && focusTest.signalCode === null) {
+      focusTest.kill();
+      await focusExit;
+    }
+  }
   await waitFor('mini timer starts native measurement', () => evaluate(widget, `(() => {
     const clock = document.querySelector('.qp-clock');
     const elapsed = clock?.textContent.split(':').reduce((seconds, field) => seconds * 60 + Number(field), 0);

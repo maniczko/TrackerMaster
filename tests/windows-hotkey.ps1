@@ -36,7 +36,9 @@ try {
         [TrackerHotkeyTest]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
         [TrackerHotkeyTest]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
     }
-    Start-Sleep -Seconds 6
+    [Console]::Out.WriteLine('hotkey-sent')
+    [Console]::Out.Flush()
+    Start-Sleep -Seconds 8
     if ([TrackerHotkeyTest]::GetForegroundWindow() -ne $otherApp.Handle) {
         throw 'The independent test window lost focus during the hotkey test.'
     }
