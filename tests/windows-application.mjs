@@ -22,6 +22,14 @@ await assert.rejects(stat(normalDb), { code: 'ENOENT' });
 
 const temp = await mkdtemp(join(process.env.RUNNER_TEMP, 'TrackerMaster-WebView-'));
 const csvDirectory = await mkdtemp(join(temp, 'download-'));
+const csvEvents = [];
+const csvWatcher = watch(csvDirectory, (event, filename) => {
+  csvEvents.push({ at: new Date().toISOString(), event, filename: filename?.toString() ?? null });
+});
+const csvSnapshot = async () => {
+  try { return await readdir(csvDirectory); }
+  catch (error) { return { error: error.code ?? error.message }; }
+};
 const primaryClient = 'Klient Żuraw QA';
 const secondClient = 'Klient Beta QA';
 const project = 'Projekt kontrolny';
@@ -72,9 +80,14 @@ async function connect(port, child) {
   endpoint.hostname = '127.0.0.1';
   const socket = new WebSocket(endpoint);
   const pending = new Map();
+  const downloadEvents = [];
   let lastId = 0;
   socket.addEventListener('message', event => {
     const message = JSON.parse(event.data);
+    if (message.method === 'Browser.downloadWillBegin' || message.method === 'Browser.downloadProgress') {
+      const { guid, state, receivedBytes, totalBytes, suggestedFilename } = message.params;
+      downloadEvents.push({ at: new Date().toISOString(), method: message.method, guid, state, receivedBytes, totalBytes, suggestedFilename });
+    }
     pending.get(message.id)?.(message);
   });
   const opened = await new Promise(resolve => {
@@ -89,6 +102,7 @@ async function connect(port, child) {
   }
   return {
     pageId: endpoints.id,
+    downloadEvents,
     close: () => socket.close(),
     async send(method, params = {}, sessionId) {
       const id = ++lastId;
@@ -970,7 +984,7 @@ async function runWindow(port, phase, recovery) {
       });
       console.log('PASS: Start without a project opens the picker and leaves the timer stopped');
     }
-    if (phase === 'initial') await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory });
+    if (phase === 'initial') await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory, eventsEnabled: true });
     const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription, interruptedDescription, recovery };
     const result = await cdp.send('Runtime.evaluate', {
       expression: `(${exercisePage.toString()})(${JSON.stringify(input)}, ${JSON.stringify(phase)})`,
@@ -1012,8 +1026,13 @@ async function runWindow(port, phase, recovery) {
       assert.ok(!rows[1].includes(secondClient) && !rows[1].includes(secondDescription));
       assert.equal(Number(rows[1].split(';')[10].replaceAll('"', '')), seconds);
       console.log('First window: downloaded CSV matched Report Details');
+      console.log(`CSV_DIAGNOSTIC phase=after-read protocol=${JSON.stringify(cdp.downloadEvents)} directory=${JSON.stringify(await csvSnapshot())}`);
     } else {
-      assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.csv')).length, 1);
+      const files = await readdir(csvDirectory);
+      if (files.filter(name => name.endsWith('.csv')).length !== 1) {
+        console.log(`CSV_DIAGNOSTIC phase=${phase}-unexpected directory=${JSON.stringify(files)} changes=${JSON.stringify(csvEvents)}`);
+      }
+      assert.equal(files.filter(name => name.endsWith('.csv')).length, 1);
     }
     if (phase === 'interrupt') {
       await verifyOccupiedShortcut(cdp, sessionId);
@@ -1024,11 +1043,17 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'hotkey-restart') await verifyShortcutAfterRestart(cdp, sessionId);
     return seconds;
   } finally {
+    if (phase === 'initial') {
+      console.log(`CSV_DIAGNOSTIC phase=before-exit protocol=${JSON.stringify(cdp?.downloadEvents ?? [])} directory=${JSON.stringify(await csvSnapshot())}`);
+    }
     cdp?.close();
     if (child.pid && child.exitCode === null && child.signalCode === null) {
       const closed = once(child, 'exit');
       child.kill();
       await closed;
+    }
+    if (phase === 'initial') {
+      console.log(`CSV_DIAGNOSTIC phase=after-exit directory=${JSON.stringify(await csvSnapshot())} changes=${JSON.stringify(csvEvents)}`);
     }
     await assert.rejects(stat(normalDb), { code: 'ENOENT' });
   }
@@ -1103,6 +1128,7 @@ try {
   await waitForWindowClosed(port);
   await runWindow(port, 'hotkey-restart', recovery);
 } finally {
+  csvWatcher.close();
   registry('delete', ['/f']);
 }
 const db = new DatabaseSync(testDb, { readOnly: true });
