@@ -148,6 +148,12 @@ function Write-TestWindowState([string] $Phase, $Process, [IntPtr] $Window, [ver
     $present = $null -ne (Get-Process -Id $Process.Id -ErrorAction SilentlyContinue)
     Write-Host "WINDOW_DIAGNOSTIC phase=$Phase version=$Version pid=$($Process.Id) exited=$exited exitCode=$exitCode nativeQuery=$queryOk nativeCode=$nativeCode nativeWait=$nativeWait pidPresent=$present hwnd=$($Window.ToInt64()) valid=$valid owner=$owner thread=$thread visible=$visible"
     Write-Host "WINDOW_LIST phase=$Phase pid=$($Process.Id) $([TestPackageWindow]::DescribeWindows([uint32] $Process.Id))"
+    $traceFile = Join-Path $testData 'window-diagnostic.txt'
+    if (Test-Path -LiteralPath $traceFile -PathType Leaf) {
+        Get-Content -LiteralPath $traceFile | ForEach-Object { Write-Host "APP_WINDOW_DIAGNOSTIC $_" }
+    } else {
+        Write-Host 'APP_WINDOW_DIAGNOSTIC unavailable'
+    }
 }
 
 function Start-TestVersion($Instance) {

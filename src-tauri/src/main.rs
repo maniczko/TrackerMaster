@@ -17,6 +17,22 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::{sync::{Arc, Mutex}, time::Instant};
 use tauri::{Emitter, Manager, State};
+
+#[cfg(windows)]
+fn trace_test_window(app: &tauri::AppHandle, message: &str) {
+    if option_env!("VITE_TRACKER_TEST_MODE") != Some("1")
+        || app.config().identifier != "pl.tracker.personal.testonly"
+    {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(dir) = app.path().app_data_dir() {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(dir.join("window-diagnostic.txt")) {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+}
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -1508,16 +1524,32 @@ fn main() {
             let window_config = app.config().app.windows.first().ok_or("Brak konfiguracji okna aplikacji")?;
             tauri::WebviewWindowBuilder::from_config(app, window_config)?.build()?;
             #[cfg(windows)]
+            trace_test_window(app.handle(), "setup-window-created");
+            #[cfg(windows)]
             activation.listen(app.handle().clone())?;
             Ok(())
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    #[cfg(windows)]
+                    trace_test_window(window.app_handle(), "main-close-requested");
                     api.prevent_close();
+                    #[cfg(windows)]
+                    trace_test_window(window.app_handle(), "main-close-prevented");
                     if !editor_close::intercept(window.app_handle(), editor_close::CloseAction::Hide) {
-                        let _ = window.hide();
+                        let result = window.hide();
+                        #[cfg(windows)]
+                        trace_test_window(window.app_handle(), if result.is_ok() { "main-hide-ok" } else { "main-hide-error" });
+                        let _ = result;
+                    } else {
+                        #[cfg(windows)]
+                        trace_test_window(window.app_handle(), "main-close-editor-intercepted");
                     }
+                }
+                #[cfg(windows)]
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    trace_test_window(window.app_handle(), "main-destroyed");
                 }
             }
         })
