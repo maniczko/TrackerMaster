@@ -22,3 +22,10 @@ test('report refresh depends on revision and invalidates stale CSV previews', ()
   assert.match(report, /\}, \[open, loaded, refresh, revision\]\)/);
   assert.match(report, /<ReportExport key=\{JSON\.stringify\(\[client, range\.from, range\.through, data\.time_zone, revision\]\)\}/);
 });
+
+test('a new revision does not render old report data or expose its CSV preview', () => {
+  assert.match(report, /const \[snapshot, setSnapshot\] = useState<\{ revision: number; data: Data \} \| null>\(null\)/);
+  assert.match(report, /const data = snapshot\?\.revision === revision \? snapshot\.data : null/);
+  assert.match(report, /setSnapshot\(\{ revision, data: next \}\)/);
+  assert.doesNotMatch(report, /setData\(/, 'unversioned data must not bypass revision validation');
+});
