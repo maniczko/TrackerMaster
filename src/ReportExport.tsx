@@ -15,13 +15,14 @@ type Props = {
   expectedRows: readonly ExportRow[];
   incomplete: boolean;
   clientLabel?: string;
+  clientName?: string;
 };
 
-export default function ReportExport({ scope, from, through, zone, expectedRows, incomplete, clientLabel }: Props) {
+export default function ReportExport({ scope, from, through, zone, expectedRows, incomplete, clientLabel, clientName }: Props) {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const key = JSON.stringify([scope, from, through, zone, clientLabel]);
+  const key = JSON.stringify([scope, from, through, zone, clientLabel, clientName]);
   const current = preview?.key === key && !incomplete && sameExportRows(preview.rows, expectedRows) ? preview : null;
 
   async function prepare() {
@@ -29,6 +30,7 @@ export default function ReportExport({ scope, from, through, zone, expectedRows,
     try {
       const data = await invoke<ExportData>('get_client_export_data', { scope });
       if (data.client_id !== scope.clientId || data.time_zone !== zone) throw new Error('Klient lub strefa raportu uległy zmianie. Odśwież raport i przygotuj podgląd ponownie.');
+      if (data.client !== clientName) throw new Error('Nazwa klienta uległa zmianie. Odśwież dane i przygotuj podgląd ponownie.');
       const rows = makeClientExportRows(data.entries, data.client, from, through, zone);
       if (!sameExportRows(rows, expectedRows)) throw new Error('Dane zmieniły się od wyświetlenia raportu. Przygotuj podgląd ponownie po odświeżeniu.');
       setPreview({ key, client: data.client, from, through, zone, rows, csv: exportCsv(rows, zone), total: rows.reduce((sum, row) => sum + row.contribution, 0) });
@@ -56,7 +58,7 @@ export default function ReportExport({ scope, from, through, zone, expectedRows,
     {incomplete && <p className="muted">Przygotowanie CSV będzie możliwe po poprawieniu danych raportu.</p>}
     {preview && !current && <p role="status">Dane w raporcie się zmieniły. Przygotuj nowy podgląd przed pobraniem.</p>}
     {current && <div className="export-preview">
-      <p>Klient: <strong>{spreadsheetText(clientLabel ?? current.client)}</strong> · {current.from} — {current.through} · {current.zone}</p>
+      <p>Klient: <strong>{clientLabel?.endsWith(current.client) ? clientLabel.slice(0, clientLabel.length - current.client.length) : ''}{spreadsheetText(current.client)}</strong> · {current.from} — {current.through} · {current.zone}</p>
       <p>Liczba wpisów: <strong>{current.rows.length}</strong> · Czas w okresie: <strong>{formatDuration(current.total)}</strong></p>
       <p className="muted">Podgląd i plik zawierają te same zakończone wpisy. Tekst podobny do formuły otrzyma apostrof ochronny.</p>
       {current.rows.length === 0 && <p className="muted">Brak zakończonych, rozstrzygniętych wpisów spełniających filtry.</p>}

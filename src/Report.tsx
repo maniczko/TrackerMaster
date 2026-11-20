@@ -324,7 +324,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
         </> : <ReportDetails key={`details:${viewKey}`} rows={view.rows} clientLabelByEntry={clientLabelByEntry}
           finalizedSeconds={view.finalizedSeconds} liveSeconds={view.liveSeconds} zone={data.time_zone} onEdit={onEditEntry} onHistory={onShowHistory} />}
         <ReportExport key={`export:${viewKey}`} scope={reportScope} from={range.from}
-          through={range.through} zone={data.time_zone} expectedRows={view.finalizedRows} incomplete={incomplete} clientLabel={selectedClientLabel} />
+          through={range.through} zone={data.time_zone} expectedRows={view.finalizedRows} incomplete={incomplete} clientLabel={selectedClientLabel} clientName={resolved.client?.name} />
       </>}
     </>}
   </section>;
