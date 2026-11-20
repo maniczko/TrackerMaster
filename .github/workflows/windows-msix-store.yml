@@ -73,10 +73,11 @@ jobs:
               throw 'Provide all three exact Product Identity values from Partner Center.'
             }
           } else {
-            # Test-only identity: never use the pull-request artifact for Partner Center.
-            $pkgName = 'TrackerMaster.TestOnly'
-            $publisher = 'CN=TrackerMaster-TestOnly, OID.2.25.311729368913984317654407730594956997722=1'
-            $publisherDisplayName = 'TrackerMaster Test'
+            # Partner Center identity supplied by the application owner on 2026-11-20.
+            # Only the app's local data profile remains isolated for safe testing.
+            $pkgName = 'vatlar.TrackerMaster'
+            $publisher = 'CN=EBE2824B-F077-49B4-A180-73C366094CBA'
+            $publisherDisplayName = 'vatlar'
             $version = '0.1.0.0'
           }
           & ./packaging/msix/store/New-PrivateStoreMsix.ps1 `
@@ -90,7 +91,7 @@ jobs:
       - name: Upload unsigned MSIX for owner review
         uses: actions/upload-artifact@v4
         with:
-          name: TrackerMaster-isolated-MSIX-${{ github.event_name }}
+          name: TrackerMaster-PartnerCenter-private-MSIX-${{ github.event_name }}
           path: dist/TrackerMaster-private-store-candidate-x64.msix
           if-no-files-found: error
           retention-days: 7
