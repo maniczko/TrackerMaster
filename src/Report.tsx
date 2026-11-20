@@ -36,7 +36,10 @@ export default function Report({ clients, projects, loaded, revision, onEditEntr
   const [filterStorageProblem, setFilterStorageProblem] = useState(initialFilter.problem);
   const [now, setNow] = useState(Date.now);
   const [client, setClient] = useState('');
-  const [data, setData] = useState<Data | null>(null);
+  // Keep the revision alongside the fetched data so an older report can never
+  // appear as current during the first render after a committed edit.
+  const [snapshot, setSnapshot] = useState<{ revision: number; data: Data } | null>(null);
+  const data = snapshot?.revision === revision ? snapshot.data : null;
   const [error, setError] = useState('');
   const [refresh, setRefresh] = useState(0);
   const [zoneDraft, setZoneDraft] = useState('');
@@ -53,15 +56,15 @@ export default function Report({ clients, projects, loaded, revision, onEditEntr
   }
 
   useEffect(() => {
-    if (!open || !loaded) { setData(null); return; }
+    if (!open || !loaded) { setSnapshot(null); return; }
     let cancelled = false;
     let timer: number | undefined;
     async function update() {
       try {
         const next = await invoke<Data>('get_report_data');
-        if (!cancelled) { setData(next); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
+        if (!cancelled) { setSnapshot({ revision, data: next }); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
       } catch (e) {
-        if (!cancelled) { setData(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
+        if (!cancelled) { setSnapshot(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
       } finally {
         if (!cancelled) timer = window.setTimeout(update, 5000);
       }
