@@ -4,12 +4,11 @@ mod storage_safety;
 mod sleep_periods;
 mod power_events;
 mod optional_task_migration;
+mod ui_preferences;
+mod entry_drafts;
+mod editor_close;
 
-// v12 adds D4 sleep-period storage. Windows suspend/resume notifications record
-// periods for the running entry; each period stays pending until the user
-// includes or rejects it, and edits that would desynchronise an entry from its
-// recorded sleep periods are refused.
-const LATEST_SCHEMA_VERSION: i64 = 12;
+const LATEST_SCHEMA_VERSION: i64 = 13;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -544,16 +543,21 @@ fn set_entry_billing(db: &mut Connection, entry_id: i64, expected: bool, billabl
 }
 
 fn set_description(db: &mut Connection, entry_id: i64, expected: &str, description: &str, changed_at: &str) -> Cmd<()> {
-    let description = valid_description(description)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
-    let current: Option<String> = tx.query_row("SELECT COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| r.get(0)).optional().map_err(db_err)?;
+    update_description(&tx, entry_id, expected, description, changed_at)?;
+    tx.commit().map_err(db_err)
+}
+
+fn update_description(db: &rusqlite::Transaction<'_>, entry_id: i64, expected: &str, description: &str, changed_at: &str) -> Cmd<()> {
+    let description = valid_description(description)?;
+    let current: Option<String> = db.query_row("SELECT COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),'') FROM time_entries WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| r.get(0)).optional().map_err(db_err)?;
     if current.as_deref() != Some(expected) { return Err("Wpis lub opis zmienił się w innym oknie. Odśwież dane.".into()); }
     if expected != description {
-        if description.is_empty() { tx.execute("DELETE FROM entry_descriptions WHERE entry_id=?1", [entry_id]).map_err(db_err)?; }
-        else { tx.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2) ON CONFLICT(entry_id) DO UPDATE SET description=excluded.description", params![entry_id,description]).map_err(db_err)?; }
-        tx.execute("INSERT INTO description_revisions(entry_id,changed_at,before_description,after_description) VALUES(?1,?2,?3,?4)", params![entry_id,changed_at,expected,description]).map_err(db_err)?;
+        if description.is_empty() { db.execute("DELETE FROM entry_descriptions WHERE entry_id=?1", [entry_id]).map_err(db_err)?; }
+        else { db.execute("INSERT INTO entry_descriptions(entry_id,description) VALUES(?1,?2) ON CONFLICT(entry_id) DO UPDATE SET description=excluded.description", params![entry_id,description]).map_err(db_err)?; }
+        db.execute("INSERT INTO description_revisions(entry_id,changed_at,before_description,after_description) VALUES(?1,?2,?3,?4)", params![entry_id,changed_at,expected,description]).map_err(db_err)?;
     }
-    tx.commit().map_err(db_err)
+    Ok(())
 }
 
 #[tauri::command]
@@ -963,20 +967,25 @@ fn add_manual_entry_with_description(tracker: &mut Tracker, task_id: i64, starte
 }
 
 fn correct_entry(tracker: &mut Tracker, entry_id: i64, expected_start: &str, expected_end: &str, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<()> {
-    let (start, end) = parse_manual_range(started_at, ended_at, current)?;
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
-    let previous: Option<(String, String, i64)> = tx.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
+    update_entry_time(&tx, entry_id, expected_start, expected_end, started_at, ended_at, current)?;
+    tx.commit().map_err(db_err)
+}
+
+fn update_entry_time(db: &rusqlite::Transaction<'_>, entry_id: i64, expected_start: &str, expected_end: &str, started_at: &str, ended_at: &str, current: DateTime<Utc>) -> Cmd<()> {
+    let (start, end) = parse_manual_range(started_at, ended_at, current)?;
+    let previous: Option<(String, String, i64)> = db.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
     let (old_start, old_end, old_seconds) = previous.ok_or("Nie znaleziono zakończonego wpisu.")?;
-    ensure_no_sleep_periods(&tx, entry_id)?;
+    ensure_no_sleep_periods(db, entry_id)?;
     if old_start != expected_start || old_end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed korektą.".into()); }
-    ensure_no_overlap(&tx, start, end, Some(entry_id))?;
+    ensure_no_overlap(db, start, end, Some(entry_id))?;
     let new_start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
     let new_end = end.to_rfc3339_opts(SecondsFormat::Millis, true);
     let seconds = (end - start).num_seconds();
     if old_start == new_start && old_end == new_end { return Ok(()); }
-    tx.execute("INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![entry_id,current.to_rfc3339_opts(SecondsFormat::Millis, true),old_start,old_end,old_seconds,new_start,new_end,seconds]).map_err(db_err)?;
-    tx.execute("UPDATE time_entries SET started_at=?1,ended_at=?2,duration_seconds=?3,manually_resolved=1 WHERE id=?4", params![new_start,new_end,seconds,entry_id]).map_err(db_err)?;
-    tx.commit().map_err(db_err)
+    db.execute("INSERT INTO entry_revisions(entry_id,changed_at,before_start,before_end,before_seconds,after_start,after_end,after_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![entry_id,current.to_rfc3339_opts(SecondsFormat::Millis, true),old_start,old_end,old_seconds,new_start,new_end,seconds]).map_err(db_err)?;
+    db.execute("UPDATE time_entries SET started_at=?1,ended_at=?2,duration_seconds=?3,manually_resolved=1 WHERE id=?4", params![new_start,new_end,seconds,entry_id]).map_err(db_err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1224,7 +1233,9 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     validate_task_archives_schema(db)?;
     validate_description_schema(db)?;
     optional_task_migration::validate(db)?;
-    validate_project_timer_activity(db)
+    validate_project_timer_activity(db)?;
+    if version <= 12 { entry_drafts::migrate_resolutions(db)?; }
+    entry_drafts::validate_resolution_schema(db)
 }
 
 // Existing databases are backed up and verified before any schema migration.
@@ -1235,6 +1246,51 @@ fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: 
         storage_safety::create_backup(db, dir)?;
     }
     initialise(db)
+}
+
+fn request_quit(app: &tauri::AppHandle) {
+    let shared = app.state::<Shared>();
+    let guard = shared.lock();
+    let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
+        .and_then(|tracker| snapshot(tracker).map(|s| s.active));
+    if matches!(active, Ok(None)) { app.exit(0); }
+    else {
+        // Do not hold the tracker lock or block the UI thread during a dialog.
+        drop(guard);
+        let main_app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(main_app).await; });
+        #[cfg(windows)]
+        {
+            let app = app.clone();
+            std::thread::spawn(move || match active {
+                Ok(Some(entry)) if entry.uncertain && !entry.recovered => {
+                    let shared = app.state::<Shared>();
+                    let released = match shared.lock() {
+                        Ok(mut tracker) => release_unverifiable_timer(&mut tracker, entry.id, Utc::now(), power_sample()),
+                        Err(_) => Err("Nie można odczytać pomiaru.".into()),
+                    };
+                    match released {
+                        Ok(()) => show_start_error("Nie można wiarygodnie ustalić czasu pomiaru (uśpienie komputera lub zmiana zegara). Rozlicz go w oknie aplikacji przed zakończeniem.\n\nAplikacja pozostaje otwarta."),
+                        Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
+                    }
+                }
+                Ok(Some(entry)) if !entry.recovered => {
+                    if !confirm_stop_and_exit() { return; }
+                    let shared = app.state::<Shared>();
+                    let mut tracker = match shared.lock() {
+                        Ok(tracker) => tracker,
+                        Err(_) => { show_start_error("Nie można odczytać pomiaru. Aplikacja pozostaje otwarta."); return; }
+                    };
+                    if let Err(err) = stop_expected_for_exit(&mut tracker, entry.id) {
+                        drop(tracker);
+                        show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta."));
+                    } else { app.exit(0); }
+                }
+                Ok(Some(_)) => show_start_error("Pomiar wymaga ręcznej weryfikacji. Rozlicz go przed zakończeniem aplikacji."),
+                Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
+                Ok(None) => {}
+            });
+        }
+    }
 }
 
 fn main() {
@@ -1305,6 +1361,7 @@ fn main() {
             }
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(Mutex::new(RestoreState::default()));
+            app.manage(editor_close::EditorClose::default());
             let registered = app.global_shortcut().register("Ctrl+Shift+Space");
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
                 state.registered = registered.is_ok();
@@ -1321,47 +1378,8 @@ fn main() {
                     "show" => { let app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(app).await; }); }
                     "widget" => { let app = app.clone(); tauri::async_runtime::spawn(async move { let _ = open_widget(app).await; }); }
                     "quit" => {
-                        let shared = app.state::<Shared>();
-                        let guard = shared.lock();
-                        let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
-                            .and_then(|tracker| snapshot(tracker).map(|s| s.active));
-                        if matches!(active, Ok(None)) { app.exit(0); }
-                        else {
-                            // Do not hold the tracker lock or block the UI thread during a dialog.
-                            drop(guard);
-                            let main_app = app.clone(); tauri::async_runtime::spawn(async move { let _ = show_main(main_app).await; });
-                            #[cfg(windows)]
-                            {
-                                let app = app.clone();
-                                std::thread::spawn(move || match active {
-                                    Ok(Some(entry)) if entry.uncertain && !entry.recovered => {
-                                        let shared = app.state::<Shared>();
-                                        let released = match shared.lock() {
-                                            Ok(mut tracker) => release_unverifiable_timer(&mut tracker, entry.id, Utc::now(), power_sample()),
-                                            Err(_) => Err("Nie można odczytać pomiaru.".into()),
-                                        };
-                                        match released {
-                                            Ok(()) => show_start_error("Nie można wiarygodnie ustalić czasu pomiaru (uśpienie komputera lub zmiana zegara). Rozlicz go w oknie aplikacji przed zakończeniem.\n\nAplikacja pozostaje otwarta."),
-                                            Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
-                                        }
-                                    }
-                                    Ok(Some(entry)) if !entry.recovered => {
-                                        if !confirm_stop_and_exit() { return; }
-                                        let shared = app.state::<Shared>();
-                                        let mut tracker = match shared.lock() {
-                                            Ok(tracker) => tracker,
-                                            Err(_) => { show_start_error("Nie można odczytać pomiaru. Aplikacja pozostaje otwarta."); return; }
-                                        };
-                                        if let Err(err) = stop_expected_for_exit(&mut tracker, entry.id) {
-                                            drop(tracker);
-                                            show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta."));
-                                        } else { app.exit(0); }
-                                    }
-                                    Ok(Some(_)) => show_start_error("Pomiar wymaga ręcznej weryfikacji. Rozlicz go przed zakończeniem aplikacji."),
-                                    Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
-                                    Ok(None) => {}
-                                });
-                            }
+                        if !editor_close::intercept(app, editor_close::CloseAction::Quit) {
+                            request_quit(app);
                         }
                     }
                     _ => {}
@@ -1380,11 +1398,13 @@ fn main() {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    let _ = window.hide();
+                    if !editor_close::intercept(window.app_handle(), editor_close::CloseAction::Hide) {
+                        let _ = window.hide();
+                    }
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -2560,7 +2580,7 @@ mod tests {
         legacy.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(7,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600);").unwrap();
         assert_eq!(legacy.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 11);
         initialise(&mut legacy).unwrap();
-        assert_eq!(legacy.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 12);
+        assert_eq!(legacy.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
         assert_eq!(legacy.query_row("SELECT duration_seconds FROM time_entries WHERE id=7", [], |r| r.get::<_, i64>(0)).unwrap(), 3600);
         assert_eq!(legacy.query_row("SELECT COUNT(*) FROM sleep_periods", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
