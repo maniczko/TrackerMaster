@@ -869,6 +869,54 @@ mod tests {
     }
 
     #[test]
+    fn time_correction_from_draft_is_refused_for_an_entry_with_sleep_periods() {
+        let mut db = database();
+        // 2026-01-01T09:20:00Z – 09:30:00Z, inside entry 1 (09:00 – 10:00).
+        db.execute(
+            "INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(1,1767259200000,1767259800000)",
+            [],
+        )
+        .unwrap();
+        let source = read_source(&db, 1).unwrap().unwrap();
+        let dir = test_directory("sleep");
+        let draft = persist_draft(&dir, source.clone(), fields("Opis po śnie"), None).unwrap();
+        let correction = |range: Option<DraftRange>| DraftApplication::Correction {
+            base: source.clone(),
+            range,
+            description: "Opis po śnie".into(),
+        };
+        assert!(resolve_draft(
+            &mut db,
+            &draft,
+            correction(Some(range("2026-01-01T10:30:00.000Z"))),
+            test_now()
+        )
+        .is_err());
+        assert_eq!(read_source(&db, 1).unwrap(), Some(source.clone()));
+        assert_eq!(find_resolution(&db, 1, &draft.revision).unwrap(), None);
+        assert_eq!(list_drafts(&dir).unwrap().drafts, vec![draft.clone()]);
+
+        // A description-only correction does not move the entry boundaries, as
+        // with set_entry_description, so the recorded sleep period stays valid.
+        assert_eq!(
+            resolve_draft(&mut db, &draft, correction(None), test_now()).unwrap(),
+            1
+        );
+        let edited = read_source(&db, 1).unwrap().unwrap();
+        assert_eq!(edited.description, "Opis po śnie");
+        assert_eq!(
+            (edited.started_at.as_str(), edited.ended_at.as_str(), edited.duration_seconds),
+            (source.started_at.as_str(), source.ended_at.as_str(), source.duration_seconds)
+        );
+        let periods: i64 = db
+            .query_row("SELECT COUNT(*) FROM sleep_periods WHERE entry_id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(periods, 1);
+        discard_draft(&dir, 1, &draft.revision).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn creating_from_missing_source_uses_new_id_and_preserves_audit_in_backup() {
         let mut db = database();
         let source = read_source(&db, 1).unwrap().unwrap();
