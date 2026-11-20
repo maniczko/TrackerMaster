@@ -9,6 +9,8 @@ mod entry_drafts;
 mod editor_close;
 #[cfg(windows)]
 mod quit_dialog;
+#[cfg(windows)]
+mod instance_activation;
 
 const LATEST_SCHEMA_VERSION: i64 = 13;
 
@@ -17,6 +19,22 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::{sync::{Arc, Mutex}, time::Instant};
 use tauri::{Emitter, Manager, State};
+
+#[cfg(windows)]
+fn trace_test_window(app: &tauri::AppHandle, message: &str) {
+    if option_env!("VITE_TRACKER_TEST_MODE") != Some("1")
+        || app.config().identifier != "pl.tracker.personal.testonly"
+    {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(dir) = app.path().app_data_dir() {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(dir.join("window-diagnostic.txt")) {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+}
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -71,13 +89,34 @@ fn show_start_error(message: &str) {
 
 #[cfg(windows)]
 fn confirm_stop_and_exit() -> bool {
-    #[link(name = "user32")]
-    extern "system" { fn MessageBoxW(hwnd: *mut std::ffi::c_void, text: *const u16, caption: *const u16, flags: u32) -> i32; }
-    let message: Vec<u16> = "Pomiar nadal trwa. Czy chcesz go zatrzymać i zakończyć aplikację?\n\nWybierz Nie, aby kontynuować pomiar."
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, MessageBoxW, SetDlgItemTextW, SetWindowsHookExW, UnhookWindowsHookEx,
+        HCBT_ACTIVATE, IDCANCEL, IDOK, MB_DEFBUTTON2, MB_ICONQUESTION, MB_OKCANCEL, WH_CBT,
+    };
+    thread_local! { static LABELED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    unsafe extern "system" fn label_buttons(code: i32, window: usize, data: isize) -> isize {
+        if code == HCBT_ACTIVATE as i32 {
+            let stop: Vec<u16> = "Stop i zamknij".encode_utf16().chain(Some(0)).collect();
+            let cancel: Vec<u16> = "Anuluj".encode_utf16().chain(Some(0)).collect();
+            let stop_set = SetDlgItemTextW(window as *mut std::ffi::c_void, IDOK, stop.as_ptr());
+            let cancel_set = SetDlgItemTextW(window as *mut std::ffi::c_void, IDCANCEL, cancel.as_ptr());
+            LABELED.with(|labeled| labeled.set(stop_set != 0 && cancel_set != 0));
+        }
+        CallNextHookEx(std::ptr::null_mut(), code, window, data)
+    }
+    let message: Vec<u16> = "Pomiar nadal trwa. Czy chcesz go zatrzymać i zakończyć aplikację?"
         .encode_utf16().chain(Some(0)).collect();
     let title: Vec<u16> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
-    // Yes/No, question icon, default to No.
-    unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), 0x4 | 0x20 | 0x100) == 6 }
+    let hook = unsafe { SetWindowsHookExW(WH_CBT, Some(label_buttons), std::ptr::null_mut(), GetCurrentThreadId()) };
+    if hook.is_null() {
+        show_start_error("Nie można wyświetlić potwierdzenia. Aplikacja pozostaje otwarta.");
+        return false;
+    }
+    LABELED.with(|labeled| labeled.set(false));
+    let chosen = unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2) };
+    unsafe { UnhookWindowsHookEx(hook); }
+    chosen == IDOK && LABELED.with(|labeled| labeled.get())
 }
 type Shared = Arc<Mutex<Tracker>>;
 const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
@@ -1409,18 +1448,22 @@ fn main() {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             #[cfg(windows)]
-            {
-                let guard = lock_instance(&dir).map_err(|err| {
-                    let message = if err.raw_os_error() == Some(32) {
-                        "TrackerMaster jest już uruchomiony. Otwórz jego istniejące okno."
+            let activation = match instance_activation::start(&dir) {
+                Ok(instance_activation::Startup::Primary { guard, activation }) => {
+                    app.manage(guard);
+                    activation
+                }
+                Ok(instance_activation::Startup::Activated) => std::process::exit(0),
+                Err(err) => {
+                    let message = if err.raw_os_error() == Some(instance_activation::SHARING_VIOLATION) {
+                        "TrackerMaster jest już uruchomiony. Otwórz jego okno z ikony w zasobniku systemowym."
                     } else {
                         "Nie można zabezpieczyć dostępu do danych. Sprawdź uprawnienia katalogu aplikacji."
                     };
                     show_start_error(message);
-                    err
-                })?;
-                app.manage(guard);
-            }
+                    return Err(err.into());
+                }
+            };
             let database_path = dir.join("tracker.sqlite3");
             let existing_database = database_path.exists();
             storage_safety::preflight_existing(&database_path).map_err(|err| {
@@ -1477,16 +1520,39 @@ fn main() {
                     }
                 }).build(app)?;
             let window_config = app.config().app.windows.first().ok_or("Brak konfiguracji okna aplikacji")?;
-            tauri::WebviewWindowBuilder::from_config(app, window_config)?.build()?;
+            let main_window = tauri::WebviewWindowBuilder::from_config(app, window_config)?
+                .visible(false)
+                .build()?;
+            #[cfg(windows)]
+            trace_test_window(app.handle(), "setup-window-created");
+            #[cfg(windows)]
+            activation.listen(app.handle().clone())?;
+            main_window.show()?;
+            #[cfg(windows)]
+            trace_test_window(app.handle(), "setup-complete");
             Ok(())
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    #[cfg(windows)]
+                    trace_test_window(window.app_handle(), "main-close-requested");
                     api.prevent_close();
+                    #[cfg(windows)]
+                    trace_test_window(window.app_handle(), "main-close-prevented");
                     if !editor_close::intercept(window.app_handle(), editor_close::CloseAction::Hide) {
-                        let _ = window.hide();
+                        let result = window.hide();
+                        #[cfg(windows)]
+                        trace_test_window(window.app_handle(), if result.is_ok() { "main-hide-ok" } else { "main-hide-error" });
+                        let _ = result;
+                    } else {
+                        #[cfg(windows)]
+                        trace_test_window(window.app_handle(), "main-close-editor-intercepted");
                     }
+                }
+                #[cfg(windows)]
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    trace_test_window(window.app_handle(), "main-destroyed");
                 }
             }
         })
@@ -1498,6 +1564,56 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn exit_dialog_has_explicit_choices_and_safe_default() {
+        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+            || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted") {
+            return;
+        }
+        use std::time::{Duration, Instant};
+        #[link(name = "user32")]
+        extern "system" {
+            fn FindWindowW(class: *const u16, title: *const u16) -> *mut std::ffi::c_void;
+            fn GetDlgItem(window: *mut std::ffi::c_void, id: i32) -> *mut std::ffi::c_void;
+            fn GetWindowTextW(window: *mut std::ffi::c_void, text: *mut u16, len: i32) -> i32;
+            fn SendMessageW(window: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize) -> isize;
+        }
+        let class: Vec<_> = "#32770".encode_utf16().chain(Some(0)).collect();
+        let title: Vec<_> = "TrackerMaster".encode_utf16().chain(Some(0)).collect();
+        for (selected, expected) in [(2, false), (1, true)] {
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = confirm_stop_and_exit();
+                let _ = send.send(result);
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let dialog = loop {
+                let window = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+                if !window.is_null() {
+                    let button = unsafe { GetDlgItem(window, 1) };
+                    let mut text = [0u16; 80];
+                    if !button.is_null() {
+                        let len = unsafe { GetWindowTextW(button, text.as_mut_ptr(), text.len() as i32) };
+                        if String::from_utf16_lossy(&text[..len as usize]) == "Stop i zamknij" { break window; }
+                    }
+                }
+                assert!(Instant::now() < deadline, "The exit dialog did not appear");
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            for (id, expected_label) in [(1, "Stop i zamknij"), (2, "Anuluj")] {
+                let button = unsafe { GetDlgItem(dialog, id) };
+                assert!(!button.is_null(), "Missing exit button {id}");
+                let mut text = [0u16; 80];
+                let len = unsafe { GetWindowTextW(button, text.as_mut_ptr(), text.len() as i32) };
+                assert_eq!(String::from_utf16_lossy(&text[..len as usize]), expected_label);
+            }
+            assert_eq!(unsafe { SendMessageW(dialog, 0x0400, 0, 0) } & 0xffff, 2);
+            unsafe { SendMessageW(GetDlgItem(dialog, selected), 0x00f5, 0, 0); }
+            assert_eq!(receive.recv_timeout(Duration::from_secs(10)).unwrap(), expected);
+        }
+    }
 
     #[cfg(windows)]
     #[test]
