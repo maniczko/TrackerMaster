@@ -4,7 +4,7 @@ import { dateInZone, reportByDay, reportOverlaps, validTimeZone } from './report
 import type { ReportEntry } from './reportTime';
 import type { SleepPeriod } from './sleepTime';
 import { filterByClient } from './reportClientFilter';
-import { reportPresetRange } from './reportPresets';
+import { reportPresetRange, reportPresets } from './reportPresets';
 import type { ReportPreset } from './reportPresets';
 import { readReportFilter, saveReportFilter, validReportFilter } from './reportFilterStorage';
 import type { SavedReportFilter } from './reportFilterStorage';
@@ -27,7 +27,7 @@ function duration(value: number) {
   return [Math.floor(seconds / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map(n => String(n).padStart(2, '0')).join(':');
 }
 
-export default function Report({ clients, projects, loaded, onEditEntry }: { clients: Client[]; projects: Project[]; loaded: boolean; onEditEntry: (entry: Completed) => void }) {
+export default function Report({ clients, projects, loaded, revision, onEditEntry }: { clients: Client[]; projects: Project[]; loaded: boolean; revision: number; onEditEntry: (entry: Completed) => void }) {
   const [open, setOpen] = useState(false);
   const [initialFilter] = useState(() => { try { return readReportFilter(window.localStorage); } catch { return { filter: null, problem: true }; } });
   const [from, setFrom] = useState(() => initialFilter.filter?.kind === 'custom' ? initialFilter.filter.from : todayWarsaw().slice(0, 8) + '01');
@@ -36,7 +36,10 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   const [filterStorageProblem, setFilterStorageProblem] = useState(initialFilter.problem);
   const [now, setNow] = useState(Date.now);
   const [client, setClient] = useState('');
-  const [data, setData] = useState<Data | null>(null);
+  // Keep the revision alongside the fetched data so an older report can never
+  // appear as current during the first render after a committed edit.
+  const [snapshot, setSnapshot] = useState<{ revision: number; data: Data } | null>(null);
+  const data = snapshot?.revision === revision ? snapshot.data : null;
   const [error, setError] = useState('');
   const [refresh, setRefresh] = useState(0);
   const [zoneDraft, setZoneDraft] = useState('');
@@ -53,22 +56,22 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   }
 
   useEffect(() => {
-    if (!open || !loaded) { setData(null); return; }
+    if (!open || !loaded) { setSnapshot(null); return; }
     let cancelled = false;
     let timer: number | undefined;
     async function update() {
       try {
         const next = await invoke<Data>('get_report_data');
-        if (!cancelled) { setData(next); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
+        if (!cancelled) { setSnapshot({ revision, data: next }); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
       } catch (e) {
-        if (!cancelled) { setData(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
+        if (!cancelled) { setSnapshot(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
       } finally {
         if (!cancelled) timer = window.setTimeout(update, 5000);
       }
     }
     void update();
     return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [open, loaded, refresh]);
+  }, [open, loaded, refresh, revision]);
 
   useEffect(() => {
     const zone = data?.time_zone;
@@ -108,7 +111,7 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
     {open && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
       {data && <details className="report-zone"><summary>Zmień strefę raportowania</summary><p className="muted">Podaj nazwę strefy IANA, np. Europe/Warsaw, Europe/London lub America/New_York. Zmiana przeliczy przypisanie wcześniejszych pomiarów do dni, bez zmiany zapisanych pomiarów.</p><label>Strefa raportowania<input value={zoneDraft} disabled={zoneSaving} list="report-time-zones" onChange={e => { setZoneDraft(e.target.value); setZoneError(''); }} /></label><datalist id="report-time-zones"><option value="Europe/Warsaw" /><option value="Europe/London" /><option value="Europe/Berlin" /><option value="America/New_York" /><option value="UTC" /></datalist>{' '}<button className="secondary report-button" type="button" disabled={zoneSaving || !loaded} onClick={() => { if (!validTimeZone(zoneDraft)) { setZoneError('Podaj poprawną nazwę strefy IANA, np. Europe/Warsaw.'); return; } setZoneSaving(true); setZoneError(''); void invoke('set_report_timezone', { expectedTimeZone: data.time_zone, timeZone: zoneDraft }).then(() => { setNow(Date.now()); setRefresh(n => n + 1); }).catch(e => { setZoneError(`Nie udało się zapisać strefy: ${String(e)}`); setRefresh(n => n + 1); }).finally(() => setZoneSaving(false)); }}>Zapisz strefę</button>{zoneError && <div role="alert" className="alert error">{zoneError}</div>}</details>}
-      <div className="report-presets" aria-label="Szybki wybór zakresu"><button type="button" className="secondary report-button" aria-pressed={preset === 'today'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('today'); rememberFilter({ kind: 'today' }); }}>Dzisiaj</button><button type="button" className="secondary report-button" aria-pressed={preset === 'week'} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset('week'); rememberFilter({ kind: 'week' }); }}>Ten tydzień</button></div>
+      <div className="report-presets" aria-label="Szybki wybór zakresu">{reportPresets.map(([kind, label]) => <button key={kind} type="button" className="secondary report-button" aria-pressed={preset === kind} disabled={!data || !validTimeZone(data.time_zone)} onClick={() => { setNow(Date.now()); setPreset(kind); rememberFilter({ kind }); }}>{label}</button>)}</div>
       <div className="selectors report-filters"><label>Od<input type="date" value={range.from} onChange={e => { const value = e.target.value; setFrom(value); setThrough(range.through); setPreset('custom'); rememberFilter({ kind: 'custom', from: value, through: range.through }); }} /></label><label>Do<input type="date" value={range.through} onChange={e => { const value = e.target.value; setFrom(range.from); setThrough(value); setPreset('custom'); rememberFilter({ kind: 'custom', from: range.from, through: value }); }} /></label><label>Klient<select value={client} onChange={e => setClient(e.target.value)}><option value="">Wszyscy klienci</option>{clients.map(c => <option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></label></div>
       {filterStorageProblem && <div role="alert" className="alert error">Nie udało się odczytać lub zapisać zakresu raportu. Możesz nadal korzystać z raportu, ale wybór może nie zostać zapamiętany po zamknięciu aplikacji.</div>}
       {!loaded && <p role="status">Odśwież dane aplikacji, aby wyświetlić raport.</p>}
@@ -126,7 +129,7 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
         {result.active && !result.active.unresolved && <p className="muted">Aktywny pomiar jest tymczasowy i aktualizuje się co kilka sekund.</p>}
         {result.combined.days.length === 0 ? <p className="muted">Brak zakończonych lub aktywnych pomiarów w wybranym zakresie.</p> : <div className="table-wrap"><table><thead><tr><th>Dzień</th><th>Czas</th></tr></thead><tbody>{result.combined.days.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
       </>}
-      {data && result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <ReportExport key={JSON.stringify([client, range.from, range.through, data.time_zone])} client={client} from={range.from} through={range.through} zone={data.time_zone} />}
+      {data && result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <ReportExport key={JSON.stringify([client, range.from, range.through, data.time_zone, revision])} client={client} from={range.from} through={range.through} zone={data.time_zone} />}
     </>}
   </section>;
 }
