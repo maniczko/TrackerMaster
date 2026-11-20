@@ -36,3 +36,28 @@ test('missing, malformed and inaccessible storage cannot crash or write history'
   assert.deepEqual(readReportFilter(unavailable), { filter: null, problem: true });
   assert.equal(saveReportFilter(unavailable, { kind: 'week' }), false);
 });
+
+test('all quick presets survive a restart without freezing the date range', () => {
+  const kinds = ['today', 'yesterday', 'week', 'previousWeek', 'month', 'previousMonth'] as const;
+  for (const kind of kinds) {
+    const storage = memoryStorage();
+    assert.equal(saveReportFilter(storage, { kind }), true);
+    assert.deepEqual(readReportFilter(storage), { filter: { kind }, problem: false });
+    const restored = readReportFilter(storage).filter;
+    if (!restored || restored.kind === 'custom') throw new Error(`Relative preset ${kind} was not restored`);
+    // A stored selection persists, but dates must be computed at the current instant.
+    const before = reportPresetRange(restored.kind, Date.parse('2026-11-29T12:00:00Z'), 'Europe/Warsaw');
+    const after = reportPresetRange(restored.kind, Date.parse('2026-12-01T12:00:00Z'), 'Europe/Warsaw');
+    assert.notDeepEqual(before, after, `Preset ${kind} must follow the local calendar`);
+  }
+});
+
+test('unknown preset kinds are rejected and cannot replace the last valid filter', () => {
+  const storage = memoryStorage();
+  assert.equal(saveReportFilter(storage, { kind: 'previousMonth' }), true);
+  assert.equal(validReportFilter({ kind: 'last90Days' }), false);
+  assert.equal(saveReportFilter(storage, { kind: 'last90Days' } as never), false);
+  assert.deepEqual(readReportFilter(storage), { filter: { kind: 'previousMonth' }, problem: false });
+  storage.setItem('report-date-filter-v1', JSON.stringify({ kind: 'last90Days' }));
+  assert.deepEqual(readReportFilter(storage), { filter: null, problem: true });
+});
