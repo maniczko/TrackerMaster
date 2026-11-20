@@ -1,26 +1,25 @@
 import { Temporal } from '@js-temporal/polyfill';
-import { dateInZone, reportByDay } from './reportTime.ts';
+import type { SleepPeriod } from './sleepTime.ts';
+import { reportByDay } from './reportTime.ts';
 
-export type ExportEntry = { id: number; client: string; project: string; task: string; description: string; started_at: string; ended_at: string; duration_seconds: number; billable: boolean };
+export type ExportEntry = { id: number; client: string; project: string; task: string; description: string; started_at: string; ended_at: string; duration_seconds: number; billable: boolean; sleep_periods?: readonly SleepPeriod[] };
 export type ExportRow = { source: ExportEntry; contribution: number };
 
+// An entry with an undecided sleep period is withheld from the CSV until every
+// period is included or rejected; its known work still appears in the report.
 export function makeExportRows(entries: ExportEntry[], from: string, through: string, zone: string): ExportRow[] {
-  // reportByDay rejects duplicate IDs within one call. Since export computes
-  // each row independently, enforce the same invariant across the full export.
-  const ids = new Set<number>();
+  const byId = new Map<number, ExportEntry>();
   for (const entry of entries) {
-    if (!Number.isSafeInteger(entry.id) || entry.id <= 0 || ids.has(entry.id)) {
+    if (!Number.isSafeInteger(entry.id) || entry.id <= 0 || byId.has(entry.id)) {
       throw new Error('Dane eksportu zawierają nieprawidłowy lub powtórzony identyfikator wpisu.');
     }
-    ids.add(entry.id);
+    byId.set(entry.id, entry);
   }
-  return entries.flatMap(source => {
-    const result = reportByDay([source], from, through, zone);
-    if (result.excludedEntryIds.length) throw new Error(`Wpis #${source.id} wymaga poprawienia przed eksportem.`);
-    const zeroLengthDate = Date.parse(source.started_at) === Date.parse(source.ended_at) && source.duration_seconds === 0
-      ? dateInZone(Date.parse(source.started_at), zone) : null;
-    return result.totalSeconds > 0 || (zeroLengthDate !== null && zeroLengthDate >= from && zeroLengthDate <= through)
-      ? [{ source, contribution: result.totalSeconds }] : [];
+  const { excludedEntryIds, contributions } = reportByDay(entries, from, through, zone);
+  if (excludedEntryIds.length) throw new Error(`Wpis #${excludedEntryIds[0]} wymaga poprawienia przed eksportem.`);
+  return contributions.flatMap(row => {
+    const source = byId.get(row.id);
+    return source && !row.hasPendingSleep ? [{ source, contribution: row.seconds }] : [];
   });
 }
 
@@ -36,6 +35,7 @@ export function makeClientExportRows(entries: ExportEntry[], clientName: string,
 }
 
 export function formatDuration(seconds: number): string {
+  seconds = Math.floor(seconds);
   return [Math.floor(seconds / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map(n => String(n).padStart(2, '0')).join(':');
 }
 

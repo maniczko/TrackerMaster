@@ -194,3 +194,48 @@ test('TECH-10: over-24h duration formatting never wraps and DST-local offsets ar
   assert.equal(localTimestamp('2026-10-25T00:30:00Z', 'Europe/Warsaw'), '2026-10-25T02:30:00+02:00');
   assert.equal(localTimestamp('2026-10-25T01:30:00Z', 'Europe/Warsaw'), '2026-10-25T02:30:00+01:00');
 });
+
+test('TECH-10: report and CSV agree while each pending sleep period is decided separately', () => {
+  const span = (id: number, started: string, ended: string) => ({
+    id, entryId: 11, startedMs: Date.parse(started), endedMs: Date.parse(ended), decision: 'pending' as const,
+  });
+  const sleep = [
+    span(1, '2026-01-01T23:00:00Z', '2026-01-01T23:20:00Z'),
+    span(2, '2026-01-01T23:20:00Z', '2026-01-02T00:00:00Z'),
+    span(3, '2026-01-02T00:00:00Z', '2026-01-02T00:15:00Z'),
+  ];
+  const later: ExportEntry = {
+    id: 12, client: 'Alfa', project: 'Wspólny', task: '', description: '', billable: false,
+    started_at: '2026-01-02T13:00:00Z', ended_at: '2026-01-02T13:30:00Z', duration_seconds: 1800,
+  };
+  const decisions = [
+    { values: ['pending', 'pending', 'pending'], work: 3600, pending: 4500, count: 3, finalized: 1800 },
+    { values: ['included', 'pending', 'pending'], work: 4800, pending: 3300, count: 2, finalized: 1800 },
+    { values: ['included', 'excluded', 'pending'], work: 4800, pending: 900, count: 1, finalized: 1800 },
+    { values: ['included', 'excluded', 'included'], work: 5700, pending: 0, count: 0, finalized: 7500 },
+  ] as const;
+  for (const step of decisions) {
+    const entry: ExportEntry = {
+      id: 11, client: 'Alfa', project: 'Wspólny', task: '', description: '', billable: true,
+      started_at: '2026-01-01T22:00:00Z', ended_at: '2026-01-02T00:15:00Z', duration_seconds: step.work,
+      sleep_periods: sleep.map((period, index) => ({ ...period, decision: step.values[index] })),
+    };
+    const report = reportByDay([entry, later], '2026-01-01', '2026-01-02', 'UTC');
+    assert.deepEqual(report.excludedEntryIds, []);
+    // Known work stays in the report; undecided sleep is shown separately.
+    assert.equal(report.totalSeconds, step.work + 1800);
+    assert.equal(report.pendingSeconds, step.pending);
+    assert.equal(report.pendingPeriodCount, step.count);
+    const csv = makeClientExportRows([entry, later], 'Alfa', '2026-01-01', '2026-01-02', 'UTC');
+    // An entry reaches the CSV only after every one of its periods is decided.
+    assert.equal(csv.reduce((sum, row) => sum + row.contribution, 0), step.finalized);
+    assert.deepEqual(csv.map(row => row.source.id), step.count ? [12] : [11, 12]);
+    assert.equal(parseSemicolonCsv(exportCsv(csv, 'UTC')).length, csv.length + 1);
+    if (step.count === 3) {
+      const dayTwo = reportByDay([entry, later], '2026-01-02', '2026-01-02', 'UTC');
+      assert.equal(dayTwo.pendingPeriodCount, 1);
+      assert.equal(dayTwo.pendingSeconds, 900);
+      assert.equal(dayTwo.totalSeconds, 1800);
+    }
+  }
+});

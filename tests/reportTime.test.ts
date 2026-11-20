@@ -87,3 +87,27 @@ test('overlap alert follows report zone and half-open intervals', () => {
   assert.deepEqual(reportOverlaps(data, '2026-01-02', '2026-01-02', 'Europe/Warsaw').entryIds, [1, 2]);
   assert.deepEqual(reportOverlaps(data, '2026-01-01', '2026-01-01', 'Europe/London').entryIds, [1, 2]);
 });
+
+test('splits work and pending sleep by day without counting pending as work', () => {
+  const start = Date.parse('2026-01-01T22:00:00Z');
+  const sleep = { id:1, entryId:1, startedMs:start + 3600000, endedMs:start + 7200000, decision:'pending' as const };
+  const e = {...entry(1, '2026-01-01T22:00:00Z', '2026-01-02T01:00:00Z', 7200), sleep_periods:[sleep]};
+  const all = reportByDay([e], '2026-01-01', '2026-01-02', 'Europe/Warsaw');
+  assert.deepEqual(all.days, [{date:'2026-01-01',seconds:3600},{date:'2026-01-02',seconds:3600}]);
+  assert.equal(all.pendingSeconds, 3600);
+  assert.equal(reportByDay([e], '2026-01-01', '2026-01-01', 'Europe/Warsaw').pendingSeconds, 0);
+  assert.equal(reportByDay([e], '2026-01-02', '2026-01-02', 'Europe/Warsaw').pendingSeconds, 3600);
+  const included = {...e, duration_seconds:10800, sleep_periods:[{...sleep,decision:'included' as const}]};
+  assert.equal(reportByDay([included], '2026-01-01', '2026-01-02', 'Europe/Warsaw').totalSeconds, 10800);
+});
+
+test('carries fractional work across multiple segments, and rejects inconsistent durations', () => {
+  const start = Date.parse('2026-01-01T12:00:00Z');
+  const e = {...entry(1, new Date(start).toISOString(), new Date(start+1600).toISOString(), 1), sleep_periods:[{id:1,entryId:1,startedMs:start+600,endedMs:start+1000,decision:'excluded' as const}]};
+  const valid = reportByDay([e], '2026-01-01', '2026-01-01', 'UTC');
+  assert.equal(valid.totalSeconds, 1);
+  assert.deepEqual(valid.excludedEntryIds, []);
+  const invalid = reportByDay([{...e,duration_seconds:2}], '2026-01-01', '2026-01-01', 'UTC');
+  assert.equal(invalid.totalSeconds, 0);
+  assert.deepEqual(invalid.excludedEntryIds, [1]);
+});

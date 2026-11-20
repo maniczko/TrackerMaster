@@ -2,17 +2,19 @@
 
 mod storage_safety;
 mod sleep_periods;
+mod power_events;
 mod optional_task_migration;
 
-// v12 adds D4 sleep-period storage. This build does not yet record power
-// events; it migrates, validates, backs up and restores the table, and refuses
-// edits that would desynchronise an entry from its recorded sleep periods.
+// v12 adds D4 sleep-period storage. Windows suspend/resume notifications record
+// periods for the running entry; each period stays pending until the user
+// includes or rejects it, and edits that would desynchronise an entry from its
+// recorded sleep periods are refused.
 const LATEST_SCHEMA_VERSION: i64 = 12;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use std::{sync::Mutex, time::Instant};
+use std::{sync::{Arc, Mutex}, time::Instant};
 use tauri::{Emitter, Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
@@ -76,7 +78,7 @@ fn confirm_stop_and_exit() -> bool {
     // Yes/No, question icon, default to No.
     unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), 0x4 | 0x20 | 0x100) == 6 }
 }
-type Shared = Mutex<Tracker>;
+type Shared = Arc<Mutex<Tracker>>;
 #[derive(Default)]
 struct HotkeyState { project_id: Option<i64>, task_id: Option<i64>, registered: bool, widget_ready: bool, message: String }
 type Hotkey = Mutex<HotkeyState>;
@@ -92,9 +94,9 @@ struct Project { id: i64, client_id: i64, name: String, archived: bool, billable
 #[derive(Serialize)]
 struct Task { id: i64, project_id: i64, name: String, archived: bool }
 #[derive(Serialize)]
-struct Active { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, recovered: bool, billable: bool, description: String }
+struct Active { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, recovered: bool, uncertain: bool, has_sleep: bool, excluded_sleep_ms: i64, billable: bool, description: String }
 #[derive(Serialize)]
-struct Entry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String }
+struct Entry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, manually_resolved: bool, billable: bool, description: String, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 struct DeletedEntry { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: String, duration_seconds: i64, deleted_at: String }
 #[derive(Serialize)]
@@ -106,11 +108,14 @@ struct DescriptionRevision { id: i64, changed_at: String, before_description: St
 #[derive(Serialize)]
 struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>, active: Option<Active>, entries: Vec<Entry> }
 #[derive(Serialize)]
-struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String }
+struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingSleep { id: i64, entry_id: i64, started_ms: i64, ended_ms: Option<i64>, client: String, project: String, task: Option<String>, manual_resume: bool }
 #[derive(Serialize)]
 struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
 #[derive(Serialize)]
-struct ExportEntry { id: i64, client: String, project: String, task: String, description: String, started_at: String, ended_at: String, duration_seconds: i64, billable: bool }
+struct ExportEntry { id: i64, client: String, project: String, task: String, description: String, started_at: String, ended_at: String, duration_seconds: i64, billable: bool, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 struct ExportData { client_id: i64, client: String, time_zone: String, entries: Vec<ExportEntry> }
 
@@ -154,6 +159,39 @@ fn entry_project_sql(db: &Connection, alias: &str) -> Cmd<String> {
     }
 }
 
+// A projection is displayed or finalised only if wall and monotonic clocks
+// agree and every detected sleep interval is accounted for, without mutation.
+struct ActiveProjection { end: String, seconds: i64, excluded_sleep_ms: i64, periods: Option<Vec<sleep_periods::SleepPeriod>> }
+fn active_projection(db: &Connection, clock: Option<&RunningClock>, id: i64, started_at: &str, current: DateTime<Utc>, power: &Cmd<PowerSample>) -> Option<ActiveProjection> {
+    let clock = clock?;
+    let power = *power.as_ref().ok()?;
+    let start = DateTime::parse_from_rfc3339(started_at).ok()?;
+    let wall_ms = current.timestamp_millis().checked_sub(start.timestamp_millis())?;
+    if wall_ms < 0 { return None; }
+    let end = current.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).ok()?;
+    let sleep = if version >= 12 { sleep_periods::completed_periods(db,id,started_at,&end).ok()? } else { None };
+    if let Some((seconds, periods)) = sleep {
+        let total = power.total_ms.checked_sub(clock.power.total_ms)?;
+        let awake = power.awake_ms.checked_sub(clock.power.awake_ms)?;
+        if (wall_ms as u64).abs_diff(total) > 2_000 || awake > total.saturating_add(2_000) { return None; }
+        let mut known = 0u64;
+        let mut excluded = 0i64;
+        for period in &periods {
+            let duration = period.ended_ms?.checked_sub(period.started_ms)?;
+            known = known.checked_add(u64::try_from(duration).ok()?)?;
+            if period.decision != "included" { excluded = excluded.checked_add(duration)?; }
+        }
+        if known.abs_diff(total.saturating_sub(awake)) > 4_000 { return None; }
+        return Some(ActiveProjection { end, seconds, excluded_sleep_ms: excluded, periods: Some(periods) });
+    }
+    if sleep_or_invalid(clock.power, power) { return None; }
+    let wall = wall_ms / 1_000;
+    let elapsed = i64::try_from(clock.since.elapsed().as_secs()).ok()?;
+    if wall.abs_diff(elapsed) > 2 { return None; }
+    Some(ActiveProjection { end, seconds: wall, excluded_sleep_ms: 0, periods: None })
+}
+
 fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
     let db = &tracker.db;
     let project = entry_project_sql(db, "time_entries")?;
@@ -166,12 +204,21 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
     let tasks = db.prepare("SELECT id,project_id,name,EXISTS(SELECT 1 FROM task_archives a WHERE a.task_id=tasks.id) FROM tasks ORDER BY name COLLATE NOCASE,id").map_err(db_err)?
         .query_map([], |r| Ok(Task { id:r.get(0)?, project_id:r.get(1)?, name:r.get(2)?, archived:r.get(3)? })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    let active = db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| Ok(Active {
-        id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, recovered:tracker.running_since.is_none(), billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)?
-    })).optional().map_err(db_err)?;
+    let active = db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| {
+        let id: i64 = r.get(0)?;
+        let started_at: String = r.get(2)?;
+        let recovered = tracker.running_since.is_none();
+        let projection = active_projection(db, tracker.running_since.as_ref(), id, &started_at, Utc::now(), &power_sample());
+        let uncertain = !recovered && projection.is_none();
+        let has_sleep = has_sleep_periods(db,id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let excluded_sleep_ms = projection.map(|p| p.excluded_sleep_ms).unwrap_or(0);
+        Ok(Active { id, task_id:r.get(1)?, started_at, recovered, uncertain, has_sleep, excluded_sleep_ms, billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)? })
+    }).optional().map_err(db_err)?;
     let entries = db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id DESC LIMIT 500")).map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    enrich_entries_with_sleep(db, &mut entries)?;
     Ok(Snapshot { clients, projects, tasks, active, entries })
 }
 
@@ -181,34 +228,73 @@ fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
     snapshot(&tracker)
 }
 
+// Apply stored sleep decisions only to the entry that owns them. Any corrupt
+// or unfinished boundaries fail closed rather than silently adding work.
+fn completed_sleep(db: &Connection, id: i64, start: &str, end: &str) -> Cmd<Option<(i64, Vec<sleep_periods::SleepPeriod>)>> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(None); }
+    sleep_periods::completed_periods(db, id, start, end)
+        .map_err(|_| "Nie można bezpiecznie rozliczyć zapisanych okresów uśpienia. Sprawdź dane i kopię.".into())
+}
+fn enrich_entries_with_sleep(db: &Connection, entries: &mut [Entry]) -> Cmd<()> {
+    for entry in entries {
+        if let Some((duration, periods)) = completed_sleep(db, entry.id, &entry.started_at, &entry.ended_at)? {
+            entry.duration_seconds = duration;
+            entry.sleep_periods = Some(periods);
+        }
+    }
+    Ok(())
+}
+
 // Unlike the history preview, a report must include every non-deleted entry.
-// The active interval is only a provisional projection and is withheld whenever
-// sleep, a clock change, a restart, or an unavailable power sample is detected.
+// The active interval is a projection and is withheld when its clock or sleep
+// state is unresolved, after a restart, or without a power sample.
 fn report_data(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<PowerSample>) -> Cmd<ReportData> {
     ensure_available(tracker)?;
     let project = entry_project_sql(&tracker.db, "time_entries")?;
     let entries = tracker.db.prepare(&format!("SELECT id,task_id,started_at,ended_at,duration_seconds,manually_resolved,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id) ORDER BY id")).map_err(db_err)?
-        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)? })).map_err(db_err)?
+        .query_map([], |r| Ok(Entry { id:r.get(0)?, task_id:r.get(1)?, started_at:r.get(2)?, ended_at:r.get(3)?, duration_seconds:r.get(4)?, manually_resolved:r.get(5)?, billable:r.get(6)?, description:r.get(7)?, project_id:r.get(8)?, sleep_periods:None })).map_err(db_err)?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    enrich_entries_with_sleep(&tracker.db, &mut entries)?;
     let row: Option<(i64, Option<i64>, String, bool, String, i64)> = tracker.db.query_row(&format!("SELECT id,task_id,started_at,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id),COALESCE((SELECT description FROM entry_descriptions d WHERE d.entry_id=time_entries.id),''),{project} FROM time_entries WHERE ended_at IS NULL"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_err)?;
     let active = row.map(|(id, task_id, started_at, billable, description, project_id)| {
-        let projection = tracker.running_since.as_ref().and_then(|clock| {
-            let power = power.as_ref().ok()?;
-            if sleep_or_invalid(clock.power, *power) { return None; }
-            let start = DateTime::parse_from_rfc3339(&started_at).ok()?;
-            let wall_ms = current.timestamp_millis().checked_sub(start.timestamp_millis())?;
-            if wall_ms < 0 { return None; }
-            let wall = wall_ms / 1_000;
-            let elapsed = i64::try_from(clock.since.elapsed().as_secs()).ok()?;
-            if wall < 0 || (wall - elapsed).abs() > 2 { return None; }
-            Some((current.to_rfc3339_opts(SecondsFormat::Millis, true), wall))
-        });
+        let projection = active_projection(&tracker.db, tracker.running_since.as_ref(), id, &started_at, current, &power);
         let unresolved = projection.is_none();
-        let (ended_at, duration_seconds) = match projection { Some((end, duration)) => (Some(end), Some(duration)), None => (None, None) };
-        ReportActive { id, task_id, project_id, started_at, ended_at, duration_seconds, unresolved, billable, description }
+        let (ended_at, duration_seconds, sleep_periods) = match projection { Some(p) => (Some(p.end), Some(p.seconds), p.periods), None => (None, None, None) };
+        ReportActive { id, task_id, project_id, started_at, ended_at, duration_seconds, unresolved, billable, description, sleep_periods }
     });
     let time_zone = tracker.db.query_row("SELECT report_timezone FROM app_settings WHERE id=1", [], |r| r.get(0)).map_err(db_err)?;
     Ok(ReportData { entries, active, time_zone })
+}
+
+fn pending_sleep(db: &Connection) -> Cmd<Vec<PendingSleep>> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(Vec::new()); }
+    let mut stmt = db.prepare("SELECT s.id,s.entry_id,s.started_ms,s.ended_ms,c.name,p.name,t.name,s.manual_resume FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id WHERE s.decision='pending' AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id) ORDER BY s.started_ms,s.id").map_err(db_err)?;
+    let rows = stmt.query_map([], |r| Ok(PendingSleep { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, client:r.get(4)?, project:r.get(5)?, task:r.get(6)?, manual_resume:r.get(7)? })).map_err(db_err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+}
+
+#[tauri::command]
+fn get_pending_sleep(state: State<'_, Shared>) -> Cmd<Vec<PendingSleep>> {
+    let tracker = locked(&state)?;
+    pending_sleep(&tracker.db)
+}
+
+#[tauri::command]
+fn set_sleep_resume(state: State<'_, Shared>, entry_id: i64, period_id: i64, ended_at: String) -> Cmd<()> {
+    let end = DateTime::parse_from_rfc3339(&ended_at).map_err(|_| "Podaj poprawną datę wybudzenia.")?;
+    let mut tracker = locked(&state)?;
+    sleep_periods::record_resume_manual(&mut tracker.db,entry_id,period_id,end.timestamp_millis(),Utc::now().timestamp_millis())
+        .map_err(|_| "Nie można zapisać czasu wybudzenia. Sprawdź zakres i odśwież listę.".into())
+}
+
+#[tauri::command]
+fn resolve_sleep_period(state: State<'_, Shared>, entry_id: i64, period_id: i64, include: bool) -> Cmd<()> {
+    let mut tracker = locked(&state)?;
+    sleep_periods::resolve(&mut tracker.db, entry_id, period_id, include, Utc::now().timestamp_millis())
+        .map_err(|_| "Nie można zapisać decyzji. Odśwież listę i spróbuj ponownie.".into())
 }
 
 #[tauri::command]
@@ -228,7 +314,14 @@ fn client_export_data(db: &Connection, client_id: i64) -> Cmd<ExportData> {
     let mismatch: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM time_entries e JOIN projects p ON p.id={project} LEFT JOIN tasks t ON t.id=e.task_id WHERE p.client_id=?1 AND e.task_id IS NOT NULL AND (t.id IS NULL OR t.project_id<>p.id) AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id))"), [client_id], |r| r.get(0)).map_err(db_err)?;
     if mismatch { return Err("Nie można wyeksportować danych: zadanie nie pasuje do projektu. Sprawdź bazę danych.".into()); }
     let sql = format!("SELECT e.id,c.name,p.name,COALESCE(t.name,''),COALESCE(d.description,''),e.started_at,e.ended_at,e.duration_seconds,EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) FROM time_entries e JOIN projects p ON p.id={project} JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id LEFT JOIN entry_descriptions d ON d.entry_id=e.id WHERE p.client_id=?1 AND e.ended_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id");
-    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)? })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let entries = db.prepare(&sql).map_err(db_err)?.query_map([client_id], |r| Ok(ExportEntry { id:r.get(0)?, client:r.get(1)?, project:r.get(2)?, task:r.get(3)?, description:r.get(4)?, started_at:r.get(5)?, ended_at:r.get(6)?, duration_seconds:r.get(7)?, billable:r.get(8)?, sleep_periods:None })).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut entries = entries;
+    for entry in &mut entries {
+        if let Some((duration, periods)) = completed_sleep(db, entry.id, &entry.started_at, &entry.ended_at)? {
+            entry.duration_seconds = duration;
+            entry.sleep_periods = Some(periods);
+        }
+    }
     Ok(ExportData { client_id, client, time_zone, entries })
 }
 
@@ -666,6 +759,35 @@ fn resume_entry(state: State<'_, Shared>, source_id: i64, expected_active_id: Op
     let mut tracker = locked(&state)?;
     resume_saved_entry(&mut tracker, source_id, expected_active_id, &now())?;
     snapshot(&tracker)
+}
+
+// A running entry whose time cannot be verified (unmatched sleep, clock change
+// or a missed power event) keeps its clock only while one of its sleep periods
+// is still open, so SleepPending can supply the wake time. Otherwise the entry
+// goes to manual recovery, which already accounts for its recorded periods.
+fn keeps_clock_for_open_sleep(db: &Connection, entry_id: i64) -> Cmd<bool> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(false); }
+    Ok(sleep_periods::list_for_entry(db, entry_id).map_err(db_err)?.iter().any(|period| period.ended_ms.is_none()))
+}
+fn unverifiable_timer_message(keep: bool) -> &'static str {
+    if keep { "Nie można bezpiecznie ustalić czasu. Pomiar nie został zakończony; uzupełnij czas wybudzenia na liście okresów uśpienia." }
+    else { "Nie można bezpiecznie ustalić czasu. Pomiar nie został zakończony; podaj faktyczny czas zakończenia w oknie aplikacji." }
+}
+
+// Used when quitting from the tray: never stop an unverifiable entry, but
+// leave it in a state the main window can resolve instead of a dead end.
+fn release_unverifiable_timer(tracker: &mut Tracker, expected_id: i64, current: DateTime<Utc>, power: Cmd<PowerSample>) -> Cmd<()> {
+    ensure_available(tracker)?;
+    if tracker.running_since.is_none() { return Ok(()); }
+    let active: Option<(i64, String)> = tracker.db.query_row("SELECT id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(db_err)?;
+    let (id, started_at) = active.ok_or("Pomiar zmienił się podczas zamykania. Sprawdź aktualny stan.")?;
+    if id != expected_id { return Err("Pomiar zmienił się podczas zamykania. Sprawdź aktualny stan.".into()); }
+    if active_projection(&tracker.db, tracker.running_since.as_ref(), id, &started_at, current, &power).is_some() {
+        return Err("Pomiar zmienił się podczas zamykania. Sprawdź aktualny stan.".into());
+    }
+    if !keeps_clock_for_open_sleep(&tracker.db, id)? { tracker.running_since = None; }
+    Ok(())
 }
 
 fn stop_expected_for_exit(tracker: &mut Tracker, expected_id: i64) -> Cmd<()> {
@@ -1175,7 +1297,12 @@ fn main() {
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
                 err
             })?;
-            app.manage(Mutex::new(Tracker { db, running_since: None, restored: false }));
+            let tracker: Shared = Arc::new(Mutex::new(Tracker { db, running_since: None, restored: false }));
+            app.manage(tracker.clone());
+            #[cfg(windows)]
+            if power_events::register(tracker).is_err() {
+                show_start_error("Nie udało się uruchomić monitorowania uśpienia. Po przerwie pomiar może wymagać ręcznej weryfikacji.");
+            }
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(Mutex::new(RestoreState::default()));
             let registered = app.global_shortcut().register("Ctrl+Shift+Space");
@@ -1207,6 +1334,17 @@ fn main() {
                             {
                                 let app = app.clone();
                                 std::thread::spawn(move || match active {
+                                    Ok(Some(entry)) if entry.uncertain && !entry.recovered => {
+                                        let shared = app.state::<Shared>();
+                                        let released = match shared.lock() {
+                                            Ok(mut tracker) => release_unverifiable_timer(&mut tracker, entry.id, Utc::now(), power_sample()),
+                                            Err(_) => Err("Nie można odczytać pomiaru.".into()),
+                                        };
+                                        match released {
+                                            Ok(()) => show_start_error("Nie można wiarygodnie ustalić czasu pomiaru (uśpienie komputera lub zmiana zegara). Rozlicz go w oknie aplikacji przed zakończeniem.\n\nAplikacja pozostaje otwarta."),
+                                            Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
+                                        }
+                                    }
                                     Ok(Some(entry)) if !entry.recovered => {
                                         if !confirm_stop_and_exit() { return; }
                                         let shared = app.state::<Shared>();
@@ -1246,7 +1384,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -2327,6 +2465,83 @@ mod tests {
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, 0);
         assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'projects')", [], |r| r.get::<_, bool>(0)).unwrap());
+    }
+
+    #[test]
+    fn completed_sleep_is_separate_in_report_and_client_export() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'),(2,'B'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt A'),(2,2,'Projekt B'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',10800),(2,2,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',10800);").unwrap();
+        let start=DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(1,?1,?2)",params![start,start+7200000]).unwrap();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(2,?1,?2)",params![start,start+7200000]).unwrap();
+        let mut tracker=Tracker { db, running_since:None, restored:false };
+        let report=report_data(&tracker,Utc::now(),Err("unused".into())).unwrap();
+        let first=report.entries.iter().find(|entry|entry.id==1).unwrap();
+        assert_eq!(first.duration_seconds,3600);
+        assert_eq!(first.sleep_periods.as_ref().unwrap()[0].decision,"pending");
+        let client=client_export_data(&tracker.db,1).unwrap();
+        assert_eq!(client.entries.len(),1);
+        assert_eq!(client.entries[0].id,1);
+        assert_eq!(client.entries[0].duration_seconds,3600);
+        let pending=pending_sleep(&tracker.db).unwrap();
+        assert_eq!(pending.len(),2);
+        let period_id=client.entries[0].sleep_periods.as_ref().unwrap()[0].id;
+        let current=DateTime::parse_from_rfc3339("2026-01-02T10:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(correct_entry(&mut tracker,1,"2026-01-01T10:00:00Z","2026-01-01T13:00:00Z","2026-01-01T10:30:00Z","2026-01-01T13:00:00Z",current).is_err());
+        assert!(mark_entry_deleted(&mut tracker,1,"2026-01-01T10:00:00Z","2026-01-01T13:00:00Z","2026-01-02T10:00:00Z").is_err());
+        crate::sleep_periods::resolve(&mut tracker.db,1,period_id,true,start+7200001).unwrap();
+        let report=report_data(&tracker,Utc::now(),Err("unused".into())).unwrap();
+        assert_eq!(report.entries.iter().find(|entry|entry.id==1).unwrap().duration_seconds,10800);
+        assert_eq!(report.entries.iter().find(|entry|entry.id==2).unwrap().duration_seconds,3600);
+        let pending=pending_sleep(&tracker.db).unwrap();
+        assert_eq!(pending.len(),1);
+        assert_eq!(pending[0].entry_id,2);
+    }
+
+    #[test]
+    fn tray_exit_hands_unverifiable_timer_to_recovery_without_stopping_it() {
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        let current = DateTime::parse_from_rfc3339("2026-01-01T13:00:00Z").unwrap().with_timezone(&Utc);
+        let power = || Ok(PowerSample { total_ms: 11_800_000, awake_ms: 8_200_000 });
+        for closed in [true, false] {
+            let mut db = Connection::open_in_memory().unwrap();
+            initialise(&mut db).unwrap();
+            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at) VALUES(1,1,'2026-01-01T10:00:00Z');").unwrap();
+            let period = sleep_periods::record_suspend(&mut db, 1, start + 3_600_000).unwrap();
+            // A manual wake time 10 s away from the counters cannot be verified.
+            if closed { sleep_periods::record_resume_manual(&mut db, 1, period, start + 7_210_000, start + 10_800_000).unwrap(); }
+            let clock = RunningClock { since: Instant::now(), power: PowerSample { total_ms: 1_000_000, awake_ms: 1_000_000 } };
+            let mut tracker = Tracker { db, running_since: Some(clock), restored: false };
+            assert!(release_unverifiable_timer(&mut tracker, 2, current, power()).is_err());
+            assert!(tracker.running_since.is_some());
+            release_unverifiable_timer(&mut tracker, 1, current, power()).unwrap();
+            // Closed periods: manual recovery form. Open period: SleepPending supplies the wake time.
+            assert_eq!(tracker.running_since.is_none(), closed);
+            assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            assert_eq!(sleep_periods::list_for_entry(&tracker.db, 1).unwrap()[0].decision, "pending");
+        }
+    }
+
+    #[test]
+    fn recovered_timer_preserves_manually_supplied_sleep_and_pending_decision() {
+        let mut db=Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at) VALUES(1,1,'2026-01-01T10:00:00Z');").unwrap();
+        let suspend=DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        let id=sleep_periods::record_suspend(&mut db,1,suspend).unwrap();
+        let mut tracker=Tracker { db,running_since:None,restored:false };
+        let now=DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(resolve_recovered(&mut tracker,"2026-01-01T13:00:00Z",now).is_err());
+        sleep_periods::record_resume_manual(&mut tracker.db,1,id,suspend+7_200_000,now.timestamp_millis()).unwrap();
+        assert!(resolve_recovered(&mut tracker,"2026-01-01T12:00:00Z",now).is_err());
+        resolve_recovered(&mut tracker,"2026-01-01T13:00:00Z",now).unwrap();
+        let snapshot=snapshot(&tracker).unwrap();
+        assert!(snapshot.active.is_none());
+        assert_eq!(snapshot.entries[0].duration_seconds,3600);
+        let period=&snapshot.entries[0].sleep_periods.as_ref().unwrap()[0];
+        assert!(period.manual_resume);
+        assert_eq!(period.decision,"pending");
     }
 
     #[test]
