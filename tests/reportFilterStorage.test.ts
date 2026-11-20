@@ -35,3 +35,29 @@ test('missing, malformed and inaccessible legacy storage is handled', () => {
   const unavailable = { getItem: () => { throw Error('unavailable'); } };
   assert.deepEqual(readReportFilter(unavailable), { filter: null, problem: true });
 });
+
+// From main #36, adapted to PR #8: new filters are saved natively (ui_preferences::set_report_filter,
+// Rust test report_filter_migrates_once_and_keeps_the_last_valid_range); WebView storage is only read for migration.
+test('all quick presets survive a restart without freezing the date range', () => {
+  const kinds = ['today', 'yesterday', 'week', 'previousWeek', 'month', 'previousMonth'] as const;
+  for (const kind of kinds) {
+    const storage = memoryStorage();
+    storage.setItem('report-date-filter-v1', JSON.stringify({ kind }));
+    assert.deepEqual(readReportFilter(storage), { filter: { kind }, problem: false });
+    const restored = readReportFilter(storage).filter;
+    if (!restored || restored.kind === 'custom') throw new Error(`Relative preset ${kind} was not restored`);
+    // A stored selection persists, but dates must be computed at the current instant.
+    const before = reportPresetRange(restored.kind, Date.parse('2026-11-29T12:00:00Z'), 'Europe/Warsaw');
+    const after = reportPresetRange(restored.kind, Date.parse('2026-12-01T12:00:00Z'), 'Europe/Warsaw');
+    assert.notDeepEqual(before, after, `Preset ${kind} must follow the local calendar`);
+  }
+});
+
+test('unknown preset kinds are rejected when reading the saved filter', () => {
+  const storage = memoryStorage();
+  storage.setItem('report-date-filter-v1', JSON.stringify({ kind: 'previousMonth' }));
+  assert.equal(validReportFilter({ kind: 'last90Days' }), false);
+  assert.deepEqual(readReportFilter(storage), { filter: { kind: 'previousMonth' }, problem: false });
+  storage.setItem('report-date-filter-v1', JSON.stringify({ kind: 'last90Days' }));
+  assert.deepEqual(readReportFilter(storage), { filter: null, problem: true });
+});

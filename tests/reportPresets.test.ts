@@ -15,13 +15,17 @@ test('week boundaries cross years and daylight saving changes', () => {
   assert.deepEqual(reportPresetRange('week', Date.parse('2026-03-29T12:00:00Z'), 'Europe/Warsaw'), { from: '2026-03-23', through: '2026-03-29' });
 });
 
-test('yesterday, previous week and whole months follow the local calendar', () => {
-  const midnight = Date.parse('2026-11-30T23:30:00Z');
+test('yesterday, previous week and calendar months obey the reporting zone', () => {
+  const midnight = Date.parse('2026-11-30T23:30:00Z'); // 1 December in Warsaw, 30 November in London
   assert.deepEqual(reportPresetRange('yesterday', midnight, 'Europe/Warsaw'), { from: '2026-11-30', through: '2026-11-30' });
   assert.deepEqual(reportPresetRange('previousWeek', midnight, 'Europe/Warsaw'), { from: '2026-11-23', through: '2026-11-29' });
-  assert.deepEqual(reportPresetRange('previousMonth', midnight, 'Europe/Warsaw'), { from: '2026-11-01', through: '2026-11-30' });
   assert.deepEqual(reportPresetRange('month', midnight, 'Europe/Warsaw'), { from: '2026-12-01', through: '2026-12-31' });
+  assert.deepEqual(reportPresetRange('previousMonth', midnight, 'Europe/Warsaw'), { from: '2026-11-01', through: '2026-11-30' });
   assert.deepEqual(reportPresetRange('month', midnight, 'Europe/London'), { from: '2026-11-01', through: '2026-11-30' });
+});
+
+test('previous month is calendar based across leap years and New Year', () => {
   assert.deepEqual(reportPresetRange('previousMonth', Date.parse('2024-03-01T12:00:00Z'), 'UTC'), { from: '2024-02-01', through: '2024-02-29' });
   assert.deepEqual(reportPresetRange('previousMonth', Date.parse('2027-01-01T12:00:00Z'), 'UTC'), { from: '2026-12-01', through: '2026-12-31' });
+  assert.deepEqual(reportPresetRange('previousWeek', Date.parse('2027-01-01T12:00:00Z'), 'UTC'), { from: '2026-12-21', through: '2026-12-27' });
 });
