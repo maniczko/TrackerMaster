@@ -5,6 +5,8 @@ import { reportByDay } from './reportTime.ts';
 export type ExportEntry = { id: number; client: string; project: string; task: string; description: string; started_at: string; ended_at: string; duration_seconds: number; billable: boolean; sleep_periods?: readonly SleepPeriod[] };
 export type ExportRow = { source: ExportEntry; contribution: number };
 
+// An entry with an undecided sleep period is withheld from the CSV until every
+// period is included or rejected; its known work still appears in the report.
 export function makeExportRows(entries: ExportEntry[], from: string, through: string, zone: string): ExportRow[] {
   const byId = new Map<number, ExportEntry>();
   for (const entry of entries) {
