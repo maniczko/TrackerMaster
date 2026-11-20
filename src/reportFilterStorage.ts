@@ -1,6 +1,8 @@
 import { Temporal } from '@js-temporal/polyfill';
+import { reportPresets } from './reportPresets';
+import type { ReportPreset } from './reportPresets';
 
-export type SavedReportFilter = { kind: 'today' | 'week' } | { kind: 'custom'; from: string; through: string };
+export type SavedReportFilter = { kind: ReportPreset } | { kind: 'custom'; from: string; through: string };
 type StorageAccess = Pick<Storage, 'getItem' | 'setItem'>;
 const key = 'report-date-filter-v1';
 
@@ -12,7 +14,7 @@ function validDate(value: unknown): value is string {
 export function validReportFilter(value: unknown): value is SavedReportFilter {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>;
-  if (item.kind === 'today' || item.kind === 'week') return true;
+  if (reportPresets.some(([kind]) => kind === item.kind)) return true;
   return item.kind === 'custom' && validDate(item.from) && validDate(item.through) && item.from <= item.through;
 }
 
