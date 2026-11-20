@@ -112,13 +112,14 @@ export default function App() {
         try { await refresh(); } catch { /* Odczyt można ponowić osobno. */ }
         return;
       }
+      setReportRevision(version => version + 1);
       try { await refresh(); setNotice(message); }
       catch (e) { setError(`${message} Nie udało się odświeżyć danych: ${String(e)}. Ponów odczyt, nie operację.`); }
     } finally { setBusy(false); }
   }
   async function retryRefresh() {
     setBusy(true); setError(''); setNotice('');
-    try { await refresh(); setNotice('Dane zostały odświeżone.'); }
+    try { await refresh(); setReportRevision(version => version + 1); setNotice('Dane zostały odświeżone.'); }
     catch (e) { setError(`Nie udało się odczytać danych: ${String(e)}`); }
     finally { setBusy(false); }
   }
@@ -194,7 +195,10 @@ export default function App() {
           <button type="submit" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
         </form></div>}
       {notice && <div role="status" className="alert success">{notice}</div>}
-      <SleepPending loaded={loaded} onResolved={refresh} />
+      <SleepPending loaded={loaded} onResolved={async () => {
+        setReportRevision(version => version + 1);
+        await refresh();
+      }} />
       <div className="grid">
         <section className="timer card" aria-label="Pomiar czasu">
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered && !data.active.uncertain ? 'running' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered || data.active?.uncertain ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
