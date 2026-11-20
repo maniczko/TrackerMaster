@@ -1,8 +1,11 @@
 import { Temporal } from '@js-temporal/polyfill';
+import { splitSleepTime } from './sleepTime.ts';
+import type { SleepPeriod } from './sleepTime.ts';
 
-export type ReportEntry = { id: number; started_at: string; ended_at: string; duration_seconds: number };
+export type ReportEntry = { id: number; started_at: string; ended_at: string; duration_seconds: number; sleep_periods?: readonly SleepPeriod[] };
 export type ReportDay = { date: string; seconds: number };
-export type ReportResult = { days: ReportDay[]; totalSeconds: number; averageSeconds: number | null; excludedEntryIds: number[] };
+export type EntryContribution = { id: number; days: ReportDay[]; seconds: number; pendingSeconds: number; hasPendingSleep: boolean };
+export type ReportResult = { days: ReportDay[]; totalSeconds: number; averageSeconds: number | null; excludedEntryIds: number[]; pendingSeconds: number; pendingPeriodCount: number; contributions: EntryContribution[] };
 export type OverlapWarning = { entryIds: number[]; truncated: boolean };
 
 export function validTimeZone(timeZone: string): boolean {
@@ -21,7 +24,9 @@ function validDate(value: string): boolean {
 
 // Split at local midnight and at offset transitions. The latter matters when
 // clocks move backward across midnight, or an entire local date is skipped.
-function pieces(start: number, end: number, zone: string): ReportDay[] {
+// Seconds are counted from `anchor`, so consecutive work segments separated by
+// sleep share one timeline and sub-second remainders are carried, not lost.
+function pieces(start: number, end: number, zone: string, anchor = start): ReportDay[] {
   const result: ReportDay[] = [];
   let cursor = start;
   while (cursor < end) {
@@ -37,7 +42,7 @@ function pieces(start: number, end: number, zone: string): ReportDay[] {
     const transition = zoned.getTimeZoneTransition('next');
     if (transition && transition.epochMilliseconds > cursor) candidates.push(transition.epochMilliseconds);
     const boundary = Math.min(...candidates);
-    const seconds = Math.floor((boundary - start) / 1000) - Math.floor((cursor - start) / 1000);
+    const seconds = Math.floor((boundary - anchor) / 1000) - Math.floor((cursor - anchor) / 1000);
     result.push({ date: day, seconds });
     cursor = boundary;
   }
@@ -50,7 +55,21 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
   if (!validTimeZone(timeZone)) throw new Error('Nieprawidłowa strefa czasowa.');
   const totals = new Map<string, number>();
   const excludedEntryIds: number[] = [];
+  const contributions: EntryContribution[] = [];
+  let pendingSeconds = 0;
+  let pendingPeriodCount = 0;
   const ids = new Set<number>();
+  const inRange = (date: string) => date >= from && date <= through;
+
+  function addEntry(id: number, days: ReportDay[], pending: number, hasPendingSleep: boolean) {
+    const seconds = days.reduce((sum, day) => sum + day.seconds, 0);
+    for (const day of days) {
+      if (day.seconds > 0) totals.set(day.date, (totals.get(day.date) ?? 0) + day.seconds);
+    }
+    pendingSeconds += pending;
+    contributions.push({ id, days, seconds, pendingSeconds: pending, hasPendingSleep });
+  }
+
   for (const entry of entries) {
     if (ids.has(entry.id)) throw new Error('Powtórzony wpis w danych raportu.');
     ids.add(entry.id);
@@ -60,25 +79,60 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
         end - start > 3660 * 86400_000 || !Number.isSafeInteger(entry.duration_seconds) || entry.duration_seconds < 0) {
       excludedEntryIds.push(entry.id); continue;
     }
+    if (entry.sleep_periods !== undefined) {
+      // Pending and rejected sleep is never counted as work. The native source
+      // must supply exactly the resulting work duration, otherwise fail closed.
+      try {
+        if (!Array.isArray(entry.sleep_periods)) throw new Error('Nieprawidłowe okresy.');
+        const split = splitSleepTime(entry.id, start, end, entry.sleep_periods);
+        if (entry.duration_seconds !== Math.floor(split.workMs / 1000)) throw new Error('Niespójny czas pracy.');
+        let workElapsed = 0, pendingElapsed = 0, entryPendingSeconds = 0, entryPendingPeriods = 0;
+        const entryTotals = new Map<string, number>();
+        for (const part of split.segments) {
+          if (part.kind === 'excluded') continue;
+          const elapsed = part.kind === 'work' ? workElapsed : pendingElapsed;
+          let intersectsRange = false;
+          for (const day of pieces(part.startedMs, part.endedMs, timeZone, part.startedMs - elapsed)) {
+            if (!inRange(day.date)) continue;
+            intersectsRange = true;
+            if (day.seconds <= 0) continue;
+            if (part.kind === 'work') entryTotals.set(day.date, (entryTotals.get(day.date) ?? 0) + day.seconds);
+            else entryPendingSeconds += day.seconds;
+          }
+          if (part.kind === 'pending' && intersectsRange) entryPendingPeriods++;
+          if (part.kind === 'work') workElapsed += part.endedMs - part.startedMs;
+          else pendingElapsed += part.endedMs - part.startedMs;
+        }
+        pendingPeriodCount += entryPendingPeriods;
+        if (entryTotals.size || entryPendingPeriods || (start === end && inRange(dateInZone(start, timeZone)))) {
+          addEntry(entry.id, Array.from(entryTotals, ([date, seconds]) => ({ date, seconds })),
+            entryPendingSeconds, entry.sleep_periods.some(period => period.decision === 'pending'));
+        }
+      } catch { excludedEntryIds.push(entry.id); }
+      continue;
+    }
+    if (start === end) {
+      if (entry.duration_seconds !== 0) excludedEntryIds.push(entry.id);
+      else if (inRange(dateInZone(start, timeZone))) addEntry(entry.id, [], 0, false);
+      continue;
+    }
     const segments = pieces(start, end, timeZone);
-    const inRange = (date: string) => date >= from && date <= through;
     if (segments.length && !segments.some(segment => inRange(segment.date))) continue;
     const difference = Math.abs(Math.floor((end - start) / 1000) - entry.duration_seconds);
     if (difference !== 0) {
       const dates = new Set(segments.map(segment => segment.date));
       if (difference <= 2 && dates.size === 1) {
         const day = segments[0].date;
-        if (inRange(day) && entry.duration_seconds > 0) totals.set(day, (totals.get(day) ?? 0) + entry.duration_seconds);
+        if (inRange(day) && entry.duration_seconds > 0) addEntry(entry.id, [{ date: day, seconds: entry.duration_seconds }], 0, false);
       } else excludedEntryIds.push(entry.id);
       continue;
     }
-    for (const segment of segments) {
-      if (inRange(segment.date) && segment.seconds > 0) totals.set(segment.date, (totals.get(segment.date) ?? 0) + segment.seconds);
-    }
+    const included = segments.filter(segment => inRange(segment.date) && segment.seconds > 0);
+    if (included.length) addEntry(entry.id, included, 0, false);
   }
   const days = [...totals].sort(([a], [b]) => a.localeCompare(b)).map(([date, seconds]) => ({ date, seconds }));
   const totalSeconds = days.reduce((sum, day) => sum + day.seconds, 0);
-  return { days, totalSeconds, averageSeconds: days.length ? totalSeconds / days.length : null, excludedEntryIds };
+  return { days, totalSeconds, averageSeconds: days.length ? totalSeconds / days.length : null, excludedEntryIds, pendingSeconds, pendingPeriodCount, contributions };
 }
 
 export const reportByWarsawDay = (entries: ReportEntry[], from: string, through: string) => reportByDay(entries, from, through, 'Europe/Warsaw');

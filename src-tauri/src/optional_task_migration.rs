@@ -16,8 +16,12 @@ pub enum TimerAction<'a> {
 /// transaction. A stale UI, archived target, overlapping time or failed write
 /// leaves the prior persisted timer intact.
 pub fn transition(tracker: &mut crate::Tracker, expected: Option<i64>, at: &str, action: TimerAction<'_>) -> std::result::Result<(), String> {
+    transition_with_power(tracker, expected, at, action, crate::power_sample())
+}
+
+fn transition_with_power(tracker: &mut crate::Tracker, expected: Option<i64>, at: &str, action: TimerAction<'_>, power: crate::Cmd<crate::PowerSample>) -> std::result::Result<(), String> {
     crate::ensure_available(tracker)?;
-    let elapsed = tracker.running_since.as_ref().map(|clock| clock.since.elapsed().as_secs() as i64);
+
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(crate::db_err)?;
     let active: Option<(i64, i64, Option<i64>, String)> = tx.query_row("SELECT id,project_id,task_id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(crate::db_err)?;
     if active.as_ref().map(|a| a.0) != expected { return Err("Pomiar zmienił się w innym oknie. Odśwież dane i spróbuj ponownie.".into()); }
@@ -29,14 +33,20 @@ pub fn transition(tracker: &mut crate::Tracker, expected: Option<i64>, at: &str,
     };
     if let Some((project_id,task_id,description,_)) = &target { crate::valid_description(description)?; target_billing(&tx,*project_id,*task_id)?; }
     if let Some((id, active_project, active_task, started)) = active {
-        let seconds = elapsed.ok_or("Pomiar wymaga ręcznego ustalenia czasu zakończenia.")?;
-        let uncertain = match crate::power_sample() { Ok(end_power) => crate::sleep_or_invalid(tracker.running_since.as_ref().unwrap().power,end_power), Err(_) => true };
-        if uncertain { drop(tx); tracker.running_since=None; return Err("Wykryto przerwę w pracy systemu lub błąd zegara. Pomiar wymaga weryfikacji; nie został zakończony.".into()); }
         if !resume && target.as_ref().is_some_and(|t| t.0==active_project && t.1==active_task) { return Ok(()); }
         let start = DateTime::parse_from_rfc3339(&started).map_err(|_| "Niepoprawny zapis czasu w bazie.")?;
         let end = DateTime::parse_from_rfc3339(at).map_err(|_| "Niepoprawny czas systemowy.")?;
-        let wall = end.signed_duration_since(start).num_seconds();
-        if wall < 0 || (wall-seconds).abs()>2 { drop(tx); tracker.running_since=None; return Err("Wykryto zmianę zegara lub przerwę w pracy systemu. Pomiar wymaga weryfikacji; nie został zakończony.".into()); }
+        let projection = crate::active_projection(&tx,tracker.running_since.as_ref(),id,&started,end.with_timezone(&Utc),&power);
+        let seconds = match projection {
+            Some(value) => value.seconds,
+            None => {
+                let version: i64 = tx.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(crate::db_err)?;
+                let has_sleep = version >= 12 && !crate::sleep_periods::list_for_entry(&tx,id).map_err(crate::db_err)?.is_empty();
+                drop(tx);
+                if !has_sleep { tracker.running_since=None; }
+                return Err("Nie można bezpiecznie ustalić czasu. Pomiar nie został zakończony; sprawdź okresy uśpienia i zegar.".into());
+            }
+        };
         if end>start {
             if let Err(error)=crate::ensure_no_overlap(&tx,start.with_timezone(&Utc),end.with_timezone(&Utc),Some(id)) { drop(tx); tracker.running_since=None; return Err(format!("{error} Pomiar wymaga weryfikacji; nie został zakończony.")); }
         }
@@ -344,4 +354,109 @@ mod tests {
         assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),crate::LATEST_SCHEMA_VERSION);
         assert_eq!(db.query_row("SELECT project_id FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
+    #[test]
+    fn stopping_after_verified_sleep_preserves_individual_pending_decision() {
+        let mut db=Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        let start=DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(41,?1,?2)",params![start+3_600_000,start+10_800_000]).unwrap();
+        let clock=crate::RunningClock { since:Instant::now(),power:crate::PowerSample { total_ms:1_000_000,awake_ms:1_000_000 } };
+        let mut tracker=crate::Tracker { db,running_since:Some(clock),restored:false };
+        let power=Ok(crate::PowerSample { total_ms:11_800_000,awake_ms:4_600_000 });
+        transition_with_power(&mut tracker,Some(41),"2026-01-01T13:00:00Z",TimerAction::Stop,power).unwrap();
+        assert!(tracker.running_since.is_none());
+        let (ended,seconds):(String,i64)=tracker.db.query_row("SELECT ended_at,duration_seconds FROM time_entries WHERE id=41",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((ended.as_str(),seconds),("2026-01-01T13:00:00Z",3600));
+        let periods=crate::sleep_periods::list_for_entry(&tracker.db,41).unwrap();
+        assert_eq!((periods.len(),periods[0].decision.as_str()),(1,"pending"));
+    }
+    #[test]
+    fn stopping_with_unrecorded_sleep_keeps_entry_open() {
+        let mut db=Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        let clock=crate::RunningClock { since:Instant::now(),power:crate::PowerSample { total_ms:1_000_000,awake_ms:1_000_000 } };
+        let mut tracker=crate::Tracker { db,running_since:Some(clock),restored:false };
+        let power=Ok(crate::PowerSample { total_ms:11_800_000,awake_ms:4_600_000 });
+        assert!(transition_with_power(&mut tracker,Some(41),"2026-01-01T13:00:00Z",TimerAction::Stop,power).is_err());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE id=41 AND ended_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn multiple_sleep_periods_remain_pending_until_individually_decided_and_match_csv() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');
+            INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        let first = crate::sleep_periods::record_suspend(&mut db, 41, start + 3_600_000).unwrap();
+        crate::sleep_periods::record_resume(&mut db, 41, first, start + 7_200_000).unwrap();
+        let second = crate::sleep_periods::record_suspend(&mut db, 41, start + 8_100_000).unwrap();
+        crate::sleep_periods::record_resume(&mut db, 41, second, start + 9_000_000).unwrap();
+
+        let clock = crate::RunningClock {
+            since: Instant::now(),
+            power: crate::PowerSample { total_ms: 1_000_000, awake_ms: 1_000_000 },
+        };
+        let mut tracker = crate::Tracker { db, running_since: Some(clock), restored: false };
+        let power = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 7_300_000 });
+        transition_with_power(
+            &mut tracker, Some(41), "2026-01-01T13:00:00Z", TimerAction::Stop, power,
+        ).unwrap();
+
+        let stored_seconds: i64 = tracker.db.query_row(
+            "SELECT duration_seconds FROM time_entries WHERE id=41", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(stored_seconds, 6_300); // Neither pending period is silently included.
+        let current = DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
+        let report = crate::report_data(&tracker, current, Err("no active timer".into())).unwrap();
+        assert_eq!(report.entries[0].duration_seconds, 6_300);
+        assert_eq!(crate::pending_sleep(&tracker.db).unwrap().len(), 2);
+        assert_eq!(crate::client_export_data(&tracker.db, 1).unwrap().entries[0].duration_seconds, 6_300);
+
+        crate::sleep_periods::resolve(&mut tracker.db, 41, first, true, start + 12_000_000).unwrap();
+        assert_eq!(crate::pending_sleep(&tracker.db).unwrap().len(), 1);
+        assert_eq!(crate::report_data(&tracker, current, Err("no active timer".into())).unwrap().entries[0].duration_seconds, 9_900);
+        assert_eq!(crate::client_export_data(&tracker.db, 1).unwrap().entries[0].duration_seconds, 9_900);
+
+        crate::sleep_periods::resolve(&mut tracker.db, 41, second, false, start + 12_001_000).unwrap();
+        assert!(crate::pending_sleep(&tracker.db).unwrap().is_empty());
+        assert_eq!(crate::report_data(&tracker, current, Err("no active timer".into())).unwrap().entries[0].duration_seconds, 9_900);
+        assert_eq!(crate::client_export_data(&tracker.db, 1).unwrap().entries[0].duration_seconds, 9_900);
+        assert_eq!(tracker.db.query_row(
+            "SELECT duration_seconds FROM time_entries WHERE id=41", [], |r| r.get::<_,i64>(0)
+        ).unwrap(), 6_300); // Immutable raw value; finalized reports use the decision ledger.
+    }
+
+    #[test]
+    fn open_sleep_period_prevents_stop_without_mutating_the_timer_or_decision() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');
+            INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        let period = crate::sleep_periods::record_suspend(&mut db, 41, start + 3_600_000).unwrap();
+        let clock = crate::RunningClock {
+            since: Instant::now(),
+            power: crate::PowerSample { total_ms: 1_000_000, awake_ms: 1_000_000 },
+        };
+        let mut tracker = crate::Tracker { db, running_since: Some(clock), restored: false };
+        let power = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 7_300_000 });
+        assert!(transition_with_power(
+            &mut tracker, Some(41), "2026-01-01T13:00:00Z", TimerAction::Stop, power,
+        ).is_err());
+        assert!(tracker.running_since.is_some());
+        assert_eq!(tracker.db.query_row(
+            "SELECT COUNT(*) FROM time_entries WHERE id=41 AND ended_at IS NULL", [], |r| r.get::<_,i64>(0)
+        ).unwrap(), 1);
+        let pending = crate::sleep_periods::list_for_entry(&tracker.db, 41).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, period);
+        assert_eq!(pending[0].ended_ms, None);
+        assert_eq!(pending[0].decision, "pending");
+    }
+
 }
