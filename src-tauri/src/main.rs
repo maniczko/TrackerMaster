@@ -8,6 +8,8 @@ mod ui_preferences;
 mod entry_drafts;
 mod editor_close;
 #[cfg(windows)]
+mod quit_dialog;
+#[cfg(windows)]
 mod instance_activation;
 
 const LATEST_SCHEMA_VERSION: i64 = 13;
@@ -125,7 +127,6 @@ impl Default for HotkeyState {
 }
 type Hotkey = Mutex<HotkeyState>;
 struct HotkeyChange(Mutex<()>);
-struct QuitDialog(std::sync::atomic::AtomicBool);
 #[derive(Default)]
 struct RestoreState { sequence: u64, pending: Option<storage_safety::PreparedRestore> }
 type Restore = Mutex<RestoreState>;
@@ -1405,11 +1406,10 @@ fn start_project_from_shortcut(tracker: &mut Tracker, project_id: i64, task_id: 
 }
 
 fn request_quit(app: &tauri::AppHandle) {
-    use std::sync::atomic::Ordering;
-    // Check before reading the timer: it can change while a confirmation is open.
-    if app.state::<QuitDialog>().0.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        return;
-    }
+    // Acquire before reading state or spawning a dialog. Repeated tray Quit clicks
+    // are ignored while the first request is in progress.
+    #[cfg(windows)]
+    let Some(quit_permit) = app.state::<quit_dialog::QuitDialog>().try_begin() else { return; };
     let shared = app.state::<Shared>();
     let guard = shared.lock();
     let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
@@ -1423,12 +1423,7 @@ fn request_quit(app: &tauri::AppHandle) {
         {
             let app = app.clone();
             std::thread::spawn(move || {
-                struct ResetQuit<'a>(&'a std::sync::atomic::AtomicBool);
-                impl Drop for ResetQuit<'_> {
-                    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
-                }
-                let pending = app.state::<QuitDialog>();
-                let _reset = ResetQuit(&pending.0);
+                let _quit_permit = quit_permit;
                 match active {
                 Ok(Some(entry)) if entry.uncertain && !entry.recovered => {
                     let shared = app.state::<Shared>();
@@ -1531,7 +1526,8 @@ fn main() {
             }
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(HotkeyChange(Mutex::new(())));
-            app.manage(QuitDialog(std::sync::atomic::AtomicBool::new(false)));
+            #[cfg(windows)]
+            app.manage(quit_dialog::QuitDialog::default());
             app.manage(Mutex::new(RestoreState::default()));
             app.manage(editor_close::EditorClose::default());
             let saved = std::fs::read_to_string(dir.join("shortcut.txt")).ok().filter(|value| valid_shortcut(value)).unwrap_or_else(|| DEFAULT_SHORTCUT.into());
@@ -1775,6 +1771,31 @@ mod tests {
             let number: i64 = tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).unwrap();
             assert_eq!(number, 1);
         }
+    }
+
+    // Not in PR #8: the global shortcut must refuse archived targets and
+    // schemas it cannot handle without creating a running entry.
+    #[cfg(windows)]
+    #[test]
+    fn global_shortcut_refuses_archived_targets_and_unsupported_schema() {
+        let open_entries = |tracker: &Tracker| tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap();
+        for archive in ["INSERT INTO task_archives VALUES(1)", "UPDATE projects SET archived=1 WHERE id=1", "INSERT INTO client_archives(client_id) VALUES(1)"] {
+            let mut tracker = seeded();
+            initialise(&mut tracker.db).unwrap();
+            tracker.db.execute(archive, []).unwrap();
+            assert!(start_project_from_shortcut(&mut tracker, 1, Some(1), &now()).is_err(), "{archive}");
+            assert_eq!(open_entries(&tracker), 0, "{archive}");
+        }
+        let mut tracker = seeded();
+        initialise(&mut tracker.db).unwrap();
+        for version in [9, LATEST_SCHEMA_VERSION + 1] {
+            tracker.db.pragma_update(None, "user_version", version).unwrap();
+            assert_eq!(start_project_from_shortcut(&mut tracker, 1, None, &now()).unwrap_err(), "Nie można odczytać wersji bazy danych.");
+            assert_eq!(open_entries(&tracker), 0);
+        }
+        let mut tracker = seeded();
+        assert!(start_project_from_shortcut(&mut tracker, 1, None, &now()).is_err());
+        assert_eq!(open_entries(&tracker), 0);
     }
 
     #[test]
