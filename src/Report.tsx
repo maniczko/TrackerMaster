@@ -27,7 +27,7 @@ function duration(value: number) {
   return [Math.floor(seconds / 3600), Math.floor(seconds % 3600 / 60), seconds % 60].map(n => String(n).padStart(2, '0')).join(':');
 }
 
-export default function Report({ clients, projects, loaded, onEditEntry }: { clients: Client[]; projects: Project[]; loaded: boolean; onEditEntry: (entry: Completed) => void }) {
+export default function Report({ clients, projects, loaded, revision, onEditEntry }: { clients: Client[]; projects: Project[]; loaded: boolean; revision: number; onEditEntry: (entry: Completed) => void }) {
   const [open, setOpen] = useState(false);
   const [initialFilter] = useState(() => { try { return readReportFilter(window.localStorage); } catch { return { filter: null, problem: true }; } });
   const [from, setFrom] = useState(() => initialFilter.filter?.kind === 'custom' ? initialFilter.filter.from : todayWarsaw().slice(0, 8) + '01');
@@ -36,7 +36,10 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   const [filterStorageProblem, setFilterStorageProblem] = useState(initialFilter.problem);
   const [now, setNow] = useState(Date.now);
   const [client, setClient] = useState('');
-  const [data, setData] = useState<Data | null>(null);
+  // Keep the revision alongside the fetched data so an older report can never
+  // appear as current during the first render after a committed edit.
+  const [snapshot, setSnapshot] = useState<{ revision: number; data: Data } | null>(null);
+  const data = snapshot?.revision === revision ? snapshot.data : null;
   const [error, setError] = useState('');
   const [refresh, setRefresh] = useState(0);
   const [zoneDraft, setZoneDraft] = useState('');
@@ -53,22 +56,22 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
   }
 
   useEffect(() => {
-    if (!open || !loaded) { setData(null); return; }
+    if (!open || !loaded) { setSnapshot(null); return; }
     let cancelled = false;
     let timer: number | undefined;
     async function update() {
       try {
         const next = await invoke<Data>('get_report_data');
-        if (!cancelled) { setData(next); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
+        if (!cancelled) { setSnapshot({ revision, data: next }); setError(''); if (!zoneInitialised.current) { setZoneDraft(next.time_zone); if (!hasUserChoice.current && validTimeZone(next.time_zone)) { const today = dateInZone(Date.now(), next.time_zone); setFrom(today.slice(0, 8) + '01'); setThrough(today); } zoneInitialised.current = true; } }
       } catch (e) {
-        if (!cancelled) { setData(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
+        if (!cancelled) { setSnapshot(null); setError(`Nie można odczytać raportu: ${String(e)}`); }
       } finally {
         if (!cancelled) timer = window.setTimeout(update, 5000);
       }
     }
     void update();
     return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [open, loaded, refresh]);
+  }, [open, loaded, refresh, revision]);
 
   useEffect(() => {
     const zone = data?.time_zone;
@@ -126,7 +129,7 @@ export default function Report({ clients, projects, loaded, onEditEntry }: { cli
         {result.active && !result.active.unresolved && <p className="muted">Aktywny pomiar jest tymczasowy i aktualizuje się co kilka sekund.</p>}
         {result.combined.days.length === 0 ? <p className="muted">Brak zakończonych lub aktywnych pomiarów w wybranym zakresie.</p> : <div className="table-wrap"><table><thead><tr><th>Dzień</th><th>Czas</th></tr></thead><tbody>{result.combined.days.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
       </>}
-      {data && result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <ReportExport key={JSON.stringify([client, range.from, range.through, data.time_zone])} client={client} from={range.from} through={range.through} zone={data.time_zone} />}
+      {data && result && !result.invalidZone && 'invalidRange' in result && !result.invalidRange && <ReportExport key={JSON.stringify([client, range.from, range.through, data.time_zone, revision])} client={client} from={range.from} through={range.through} zone={data.time_zone} />}
     </>}
   </section>;
 }

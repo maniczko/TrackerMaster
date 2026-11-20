@@ -69,6 +69,7 @@ export default function App() {
   const entryEditor = useRef<EntryDraftEditorHandle>(null);
   const descriptionRef = useRef<HTMLElement>(null);
   const [loaded, setLoaded] = useState(false);
+  const [reportRevision, setReportRevision] = useState(0);
   const [now, setNow] = useState(Date.now());
   useEffect(() => { if (describe) descriptionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [describe?.id]);
   useEffect(() => { if (revisions?.reveal) revisionSection.current?.scrollIntoView({ block: 'start' }); }, [revisions]);
@@ -112,13 +113,14 @@ export default function App() {
         try { await refresh(); } catch { /* Odczyt można ponowić osobno. */ }
         return;
       }
+      setReportRevision(version => version + 1);
       try { await refresh(); setNotice(message); }
       catch (e) { setError(`${message} Nie udało się odświeżyć danych: ${String(e)}. Ponów odczyt, nie operację.`); }
     } finally { setBusy(false); }
   }
   async function retryRefresh() {
     setBusy(true); setError(''); setNotice('');
-    try { await refresh(); setNotice('Dane zostały odświeżone.'); }
+    try { await refresh(); setReportRevision(version => version + 1); setNotice('Dane zostały odświeżone.'); }
     catch (e) { setError(`Nie udało się odczytać danych: ${String(e)}`); }
     finally { setBusy(false); }
   }
@@ -194,7 +196,10 @@ export default function App() {
           <button type="submit" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
         </form></div>}
       {notice && <div role="status" className="alert success">{notice}</div>}
-      <SleepPending loaded={loaded} onResolved={refresh} />
+      <SleepPending loaded={loaded} onResolved={async () => {
+        setReportRevision(version => version + 1);
+        await refresh();
+      }} />
       <div className="grid">
         <section className="timer card" aria-label="Pomiar czasu">
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered && !data.active.uncertain ? 'running' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered || data.active?.uncertain ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
@@ -231,7 +236,7 @@ export default function App() {
         </aside>
       </div>
       {describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
-      <Report clients={data.clients} projects={data.projects} loaded={loaded} onEditEntry={entry => entryEditor.current?.openEntry(Number(entry.id), 'start')} />
+      <Report clients={data.clients} projects={data.projects} loaded={loaded} revision={reportRevision} onEditEntry={entry => entryEditor.current?.openEntry(Number(entry.id), 'start')} />
       <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
         <p className="muted">Pomiary zapisane przed dodaniem rozliczalności mają domyślnie status nierozliczalny. Możesz go zmienić dla każdego wpisu.</p>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta i projekt powyżej; zadanie jest opcjonalne. Podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
@@ -244,6 +249,8 @@ export default function App() {
         <EntryDraftEditor ref={entryEditor} clients={data.clients} projects={data.projects} tasks={data.tasks}
           enabled={loaded && !busy} onCommitted={async entryId => {
             setNotice('Zmiany wpisu zostały zapisane.');
+            // Backend potwierdził commit; odśwież raport nawet, gdy odczyt historii się nie powiedzie.
+            setReportRevision(version => version + 1);
             try {
               await refresh();
               if (revisions && same(revisions.entryId, entryId)) await showRevisions(entryId);
