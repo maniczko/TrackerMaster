@@ -10,6 +10,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::Cmd;
 
+const WIDGET_PIN_FILE: &str = "widget-on-top.txt";
 const DRAFT_SORT_FILE: &str = "draft-sort.txt";
 
 pub(super) fn save_preference(dir: &Path, name: &str, value: &str) -> io::Result<()> {
@@ -78,4 +79,94 @@ pub(super) fn set_draft_sort(app: AppHandle, order: DraftSort) -> Cmd<()> {
     };
     save_preference(&dir, DRAFT_SORT_FILE, value)
         .map_err(|_| "Nie udało się zapamiętać sortowania.".into())
+}
+
+fn widget_pin_at(dir: &Path, legacy_on_top: Option<bool>) -> Cmd<bool> {
+    if let Some(stored) = read_preference(dir, WIDGET_PIN_FILE)? {
+        return stored
+            .parse()
+            .map_err(|_| "Nieprawidłowe ustawienie przypięcia okna.".into());
+    }
+    if let Some(on_top) = legacy_on_top {
+        save_widget_pin(dir, on_top)?;
+    }
+    Ok(legacy_on_top.unwrap_or(false))
+}
+
+fn save_widget_pin(dir: &Path, on_top: bool) -> Cmd<()> {
+    save_preference(dir, WIDGET_PIN_FILE, if on_top { "true" } else { "false" })
+        .map_err(|_| "Nie udało się zapisać przypięcia okna.".into())
+}
+
+#[tauri::command]
+pub(super) fn restore_widget_on_top(app: AppHandle, legacy_on_top: Option<bool>) -> Cmd<bool> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    let window = app
+        .get_webview_window("widget")
+        .ok_or("Nie znaleziono widgetu.")?;
+    let on_top = widget_pin_at(&dir, legacy_on_top)?;
+    window
+        .set_always_on_top(on_top)
+        .map_err(|e| e.to_string())?;
+    Ok(on_top)
+}
+
+#[tauri::command]
+pub(super) fn set_widget_on_top(app: AppHandle, on_top: bool) -> Cmd<()> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    let window = app
+        .get_webview_window("widget")
+        .ok_or("Nie znaleziono widgetu.")?;
+    let old = window.is_always_on_top().map_err(|e| e.to_string())?;
+    window
+        .set_always_on_top(on_top)
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = save_widget_pin(&dir, on_top) {
+        window
+            .set_always_on_top(old)
+            .map_err(|e| format!("{error} {e}"))?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_directory(label: &str) -> std::path::PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tracker-{label}-{}-{timestamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn clean_up(dir: &Path, name: &str) {
+        fs::remove_file(dir.join(name)).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn widget_pin_uses_the_native_value_after_migration() {
+        let dir = test_directory("widget-pin");
+        let dir = dir.as_path();
+        assert!(!widget_pin_at(dir, None).unwrap());
+        assert!(widget_pin_at(dir, Some(true)).unwrap());
+        save_widget_pin(dir, false).unwrap();
+        assert!(!widget_pin_at(dir, Some(true)).unwrap());
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 1);
+        clean_up(dir, WIDGET_PIN_FILE);
+    }
 }

@@ -17,7 +17,7 @@ use std::{sync::{Arc, Mutex}, time::Instant};
 use tauri::{Emitter, Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 struct RunningClock { since: Instant, power: PowerSample }
 #[derive(Clone, Copy)]
@@ -78,9 +78,13 @@ fn confirm_stop_and_exit() -> bool {
     unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), 0x4 | 0x20 | 0x100) == 6 }
 }
 type Shared = Arc<Mutex<Tracker>>;
-#[derive(Default)]
-struct HotkeyState { project_id: Option<i64>, task_id: Option<i64>, registered: bool, widget_ready: bool, message: String }
+const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
+struct HotkeyState { project_id: Option<i64>, task_id: Option<i64>, registered: bool, widget_ready: bool, message: String, shortcut: String }
+impl Default for HotkeyState {
+    fn default() -> Self { Self { project_id: None, task_id: None, registered: false, widget_ready: false, message: String::new(), shortcut: DEFAULT_SHORTCUT.into() } }
+}
 type Hotkey = Mutex<HotkeyState>;
+struct HotkeyChange(Mutex<()>);
 #[derive(Default)]
 struct RestoreState { sequence: u64, pending: Option<storage_safety::PreparedRestore> }
 type Restore = Mutex<RestoreState>;
@@ -411,6 +415,10 @@ fn exit_after_restore(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<()
     Ok(())
 }
 
+const WIDGET_WIDTH: f64 = 440.0;
+const WIDGET_COMPACT_HEIGHT: f64 = 76.0;
+const WIDGET_EXPANDED_HEIGHT: f64 = 390.0;
+
 #[tauri::command]
 async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
     if let Some(window) = app.get_webview_window("widget") {
@@ -420,7 +428,7 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
     } else {
         if let Ok(mut hotkey) = app.state::<Hotkey>().lock() { hotkey.widget_ready = false; }
         let window = tauri::WebviewWindowBuilder::new(&app, "widget", tauri::WebviewUrl::default())
-            .title("TrackerMaster — mini timer").inner_size(520.0, 76.0)
+            .title("TrackerMaster — mini timer").inner_size(WIDGET_WIDTH, WIDGET_COMPACT_HEIGHT)
             .decorations(false).resizable(false).build().map_err(|e| e.to_string())?;
         let position_path = app.path().app_data_dir().map_err(|e| e.to_string())?.join("widget-position.txt");
         if let Ok(saved) = std::fs::read_to_string(&position_path) {
@@ -450,7 +458,7 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
 #[tauri::command]
 async fn widget_panel(app: tauri::AppHandle, expanded: bool) -> Cmd<()> {
     let window = app.get_webview_window("widget").ok_or("Widget nie jest otwarty.")?;
-    let height = if expanded { 390.0 } else { 76.0 };
+    let height = if expanded { WIDGET_EXPANDED_HEIGHT } else { WIDGET_COMPACT_HEIGHT };
     if expanded {
         if let (Ok(Some(monitor)), Ok(position), Ok(scale)) = (window.current_monitor(), window.outer_position(), window.scale_factor()) {
             let bottom = i64::from(monitor.position().y) + i64::from(monitor.size().height);
@@ -461,7 +469,7 @@ async fn widget_panel(app: tauri::AppHandle, expanded: bool) -> Cmd<()> {
             }
         }
     }
-    window.set_size(tauri::LogicalSize::new(520.0, height)).map_err(|e| e.to_string())
+    window.set_size(tauri::LogicalSize::new(WIDGET_WIDTH, height)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -489,11 +497,6 @@ async fn show_main(app: tauri::AppHandle) -> Cmd<()> {
     }
 }
 
-#[tauri::command]
-fn set_widget_on_top(app: tauri::AppHandle, on_top: bool) -> Cmd<()> {
-    app.get_webview_window("widget").ok_or("Nie znaleziono widgetu.")?
-        .set_always_on_top(on_top).map_err(|e| e.to_string())
-}
 #[tauri::command]
 fn create_client(state: State<'_, Shared>, name: String) -> Cmd<i64> {
     let tracker = locked(&state)?;
@@ -836,11 +839,66 @@ fn widget_shortcut_ready(state: State<'_, Hotkey>) -> Cmd<()> {
     Ok(())
 }
 #[derive(Serialize)]
-struct ShortcutStatus { registered: bool, message: String }
+struct ShortcutStatus { registered: bool, message: String, shortcut: String }
 #[tauri::command]
 fn shortcut_status(state: State<'_, Hotkey>) -> Cmd<ShortcutStatus> {
     let hotkey = state.lock().map_err(|_| "Błąd skrótu.".to_string())?;
-    Ok(ShortcutStatus { registered: hotkey.registered, message: hotkey.message.clone() })
+    Ok(ShortcutStatus { registered: hotkey.registered, message: hotkey.message.clone(), shortcut: hotkey.shortcut.clone() })
+}
+
+fn valid_shortcut(value: &str) -> bool {
+    let key = value.strip_prefix("Ctrl+Shift+").or_else(|| value.strip_prefix("Ctrl+Alt+"));
+    let Some(key) = key else { return false; };
+    let valid_key = key == "Space" || (key.len() == 1 && key.as_bytes()[0].is_ascii_uppercase()) ||
+        key.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n) && key == format!("F{n}"));
+    valid_key && value.parse::<Shortcut>().is_ok()
+}
+
+fn save_shortcut_preference(dir: &std::path::Path, value: &str) -> Cmd<()> {
+    if !valid_shortcut(value) { return Err("Nieprawidłowy skrót.".into()); }
+    ui_preferences::save_preference(dir, "shortcut.txt", value)
+        .map_err(|_| "Nie udało się zapisać ustawienia skrótu.".into())
+}
+
+fn replace_shortcut<R, P, U>(old: &str, new: &str, registered: bool, mut register: R, mut persist: P, mut unregister: U) -> Cmd<()>
+where R: FnMut(&str) -> Cmd<()>, P: FnMut(&str) -> Cmd<()>, U: FnMut(&str) -> Cmd<()> {
+    register(new).map_err(|_| "Ten skrót jest niedostępny lub zajęty. Poprzedni skrót pozostaje bez zmian.".to_string())?;
+    if let Err(err) = persist(new) {
+        if unregister(new).is_err() { return Err("Nie udało się zapisać ustawienia ani zwolnić nowego skrótu. Uruchom aplikację ponownie i sprawdź ustawienia.".into()); }
+        return Err(err);
+    }
+    if registered && old != new && unregister(old).is_err() {
+        let restored = persist(old).is_ok();
+        let removed = unregister(new).is_ok();
+        return Err(if restored && removed { "Nie udało się zmienić skrótu. Poprzedni pozostał aktywny." } else { "Nie udało się w pełni przywrócić ustawienia skrótu. Uruchom aplikację ponownie i sprawdź ustawienia." }.into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_global_shortcut(app: tauri::AppHandle, shortcut: String, expected: String) -> Cmd<ShortcutStatus> {
+    if !valid_shortcut(&shortcut) { return Err("Wybierz poprawną kombinację klawiszy.".into()); }
+    let change = app.state::<HotkeyChange>();
+    let _change = change.0.lock().map_err(|_| "Błąd ustawień skrótu.")?;
+    let (old, registered) = {
+        let state = app.state::<Hotkey>();
+        let hotkey = state.lock().map_err(|_| "Błąd skrótu.")?;
+        if hotkey.shortcut != expected { return Err("Ustawienie zmieniło się w innym oknie. Odśwież i spróbuj ponownie.".into()); }
+        (hotkey.shortcut.clone(), hotkey.registered)
+    };
+    if shortcut.ends_with("+F12") && shortcut != old {
+        return Err("Klawisz F12 jest zarezerwowany przez system Windows. Wybierz inny klawisz.".into());
+    }
+    if old == shortcut && registered { return shortcut_status(app.state::<Hotkey>()); }
+    let dir = app.path().app_data_dir().map_err(|_| "Nie można ustalić katalogu ustawień.")?;
+    replace_shortcut(&old, &shortcut, registered,
+        |value| app.global_shortcut().register(value).map_err(|_| "Błąd rejestracji.".into()),
+        |value| save_shortcut_preference(&dir, value),
+        |value| app.global_shortcut().unregister(value).map_err(|_| "Błąd wyrejestrowania.".into()))?;
+    let state = app.state::<Hotkey>();
+    let mut hotkey = state.lock().map_err(|_| "Błąd skrótu.")?;
+    hotkey.shortcut = shortcut; hotkey.registered = true; hotkey.message.clear();
+    Ok(ShortcutStatus { registered: true, message: String::new(), shortcut: hotkey.shortcut.clone() })
 }
 
 #[tauri::command]
@@ -1248,6 +1306,23 @@ fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: 
     initialise(db)
 }
 
+// Reuse the same schema capabilities for global shortcuts as normal project
+// starts. v12 adds sleep-period storage without removing v11 project timers.
+fn start_project_from_shortcut(tracker: &mut Tracker, project_id: i64, task_id: Option<i64>, at: &str) -> Cmd<()> {
+    let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    match version {
+        11..=LATEST_SCHEMA_VERSION => optional_task_migration::transition(
+            tracker, None, at,
+            optional_task_migration::TimerAction::Start { project_id, task_id, description: "" },
+        ),
+        10 => match task_id {
+            Some(task_id) => close_active(tracker, at, Some(task_id)),
+            None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()),
+        },
+        _ => Err("Nie można odczytać wersji bazy danych.".into()),
+    }
+}
+
 fn request_quit(app: &tauri::AppHandle) {
     let shared = app.state::<Shared>();
     let guard = shared.lock();
@@ -1295,10 +1370,11 @@ fn request_quit(app: &tauri::AppHandle) {
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
+        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| {
             if event.state() != ShortcutState::Pressed { return; }
             let hotkey = app.state::<Hotkey>();
             let Ok(mut hotkey) = hotkey.lock() else { return; };
+            if !hotkey.registered || hotkey.shortcut.parse::<Shortcut>().map(|active| active.id()).ok() != Some(shortcut.id()) { return; }
             if let Some(widget) = app.get_webview_window("widget") {
                 if !hotkey.widget_ready {
                     hotkey.message = "Mini timer nie jest jeszcze gotowy do obsługi skrótu.".into();
@@ -1312,11 +1388,7 @@ fn main() {
             let result = match snapshot(&tracker) {
                 Ok(current) if current.active.is_some() => close_active(&mut tracker, &now(), None),
                 Ok(_) => match (hotkey.project_id,hotkey.task_id) {
-                    (Some(project_id),task_id) => match tracker.db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)) {
-                        Ok(11..=LATEST_SCHEMA_VERSION) => optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id,task_id,description:"" }),
-                        Ok(10) => match task_id { Some(task_id) => close_active(&mut tracker,&now(),Some(task_id)), None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()) },
-                        _ => Err("Nie można odczytać wersji bazy danych.".into()),
-                    },
+                    (Some(project_id), task_id) => start_project_from_shortcut(&mut tracker, project_id, task_id, &now()),
                     (None,Some(task_id)) => close_active(&mut tracker, &now(), Some(task_id)),
                     (None,None) => Err("Wybierz projekt w mini timerze przed użyciem skrótu.".into()),
                 },
@@ -1360,12 +1432,15 @@ fn main() {
                 show_start_error("Nie udało się uruchomić monitorowania uśpienia. Po przerwie pomiar może wymagać ręcznej weryfikacji.");
             }
             app.manage(Mutex::new(HotkeyState::default()));
+            app.manage(HotkeyChange(Mutex::new(())));
             app.manage(Mutex::new(RestoreState::default()));
             app.manage(editor_close::EditorClose::default());
-            let registered = app.global_shortcut().register("Ctrl+Shift+Space");
+            let saved = std::fs::read_to_string(dir.join("shortcut.txt")).ok().filter(|value| valid_shortcut(value)).unwrap_or_else(|| DEFAULT_SHORTCUT.into());
+            let registered = app.global_shortcut().register(saved.as_str());
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
+                state.shortcut = saved;
                 state.registered = registered.is_ok();
-                if registered.is_err() { state.message = "Globalny skrót Ctrl+Shift+Spacja jest niedostępny lub zajęty. Działa tylko w oknie widgetu.".into(); }
+                if registered.is_err() { state.message = "Wybrany globalny skrót jest niedostępny lub zajęty. Możesz wybrać inny w ustawieniach.".into(); }
             }
             let show = MenuItem::with_id(app, "show", "Otwórz TrackerMaster", true, None::<&str>)?;
             let widget = MenuItem::with_id(app, "widget", "Otwórz mini timer", true, None::<&str>)?;
@@ -1404,7 +1479,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }
@@ -1436,6 +1511,82 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_shortcut_starts_project_after_v12_sleep_migration() {
+        for task_id in [None, Some(1)] {
+            let mut tracker = seeded();
+            initialise(&mut tracker.db).unwrap();
+            let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+            assert_eq!(version, LATEST_SCHEMA_VERSION);
+            start_project_from_shortcut(&mut tracker, 1, task_id, &now()).unwrap();
+            let active = snapshot(&tracker).unwrap().active.expect("Shortcut should create one running entry");
+            assert_eq!(active.project_id, 1);
+            assert_eq!(active.task_id, task_id);
+            let number: i64 = tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).unwrap();
+            assert_eq!(number, 1);
+        }
+    }
+
+    // Not in PR #8: the global shortcut must refuse archived targets and
+    // schemas it cannot handle without creating a running entry.
+    #[cfg(windows)]
+    #[test]
+    fn global_shortcut_refuses_archived_targets_and_unsupported_schema() {
+        let open_entries = |tracker: &Tracker| tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap();
+        for archive in ["INSERT INTO task_archives VALUES(1)", "UPDATE projects SET archived=1 WHERE id=1", "INSERT INTO client_archives(client_id) VALUES(1)"] {
+            let mut tracker = seeded();
+            initialise(&mut tracker.db).unwrap();
+            tracker.db.execute(archive, []).unwrap();
+            assert!(start_project_from_shortcut(&mut tracker, 1, Some(1), &now()).is_err(), "{archive}");
+            assert_eq!(open_entries(&tracker), 0, "{archive}");
+        }
+        let mut tracker = seeded();
+        initialise(&mut tracker.db).unwrap();
+        for version in [9, LATEST_SCHEMA_VERSION + 1] {
+            tracker.db.pragma_update(None, "user_version", version).unwrap();
+            assert_eq!(start_project_from_shortcut(&mut tracker, 1, None, &now()).unwrap_err(), "Nie można odczytać wersji bazy danych.");
+            assert_eq!(open_entries(&tracker), 0);
+        }
+        let mut tracker = seeded();
+        assert!(start_project_from_shortcut(&mut tracker, 1, None, &now()).is_err());
+        assert_eq!(open_entries(&tracker), 0);
+    }
+
+    #[test]
+    fn shortcut_validation_and_preference_survive_replacement() {
+        assert!(valid_shortcut("Ctrl+Shift+Space"));
+        assert!(valid_shortcut("Ctrl+Alt+Q"));
+        assert!(valid_shortcut("Ctrl+Shift+F12"));
+        for bad in ["Ctrl+S", "Ctrl+Shift+F13", "Ctrl+Alt+F01", "Ctrl+Alt+q", "Ctrl+Shift+Space\n"] { assert!(!valid_shortcut(bad)); }
+        let suffix=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir=std::env::temp_dir().join(format!("tracker-shortcut-{}-{suffix}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        save_shortcut_preference(&dir,"Ctrl+Shift+Space").unwrap();
+        save_shortcut_preference(&dir,"Ctrl+Alt+Q").unwrap();
+        assert!(save_shortcut_preference(&dir,"bad").is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("shortcut.txt")).unwrap(),"Ctrl+Alt+Q");
+        std::fs::remove_file(dir.join("shortcut.txt")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_shortcut_conflict_or_save_keeps_the_old_registration() {
+        use std::{cell::RefCell, collections::HashSet, rc::Rc};
+        let old="Ctrl+Shift+Space"; let new="Ctrl+Alt+Q";
+        let registered=Rc::new(RefCell::new(HashSet::from([old.to_string()])));
+        let saved=Rc::new(RefCell::new(old.to_string()));
+        let r=registered.clone(); let p=saved.clone(); let u=registered.clone();
+        assert!(replace_shortcut(old,new,true, move |_| Err("occupied".into()), move |v| { *p.borrow_mut()=v.into(); Ok(()) }, move |v| { u.borrow_mut().remove(v); Ok(()) }).is_err());
+        assert!(r.borrow().contains(old)); assert_eq!(&*saved.borrow(),old);
+        let r=registered.clone(); let u=registered.clone();
+        assert!(replace_shortcut(old,new,true, move |v| { r.borrow_mut().insert(v.into()); Ok(()) }, move |_| Err("disk".into()), move |v| { u.borrow_mut().remove(v); Ok(()) }).is_err());
+        assert!(registered.borrow().contains(old)); assert!(!registered.borrow().contains(new)); assert_eq!(&*saved.borrow(),old);
+        let r=registered.clone(); let p=saved.clone(); let u=registered.clone();
+        replace_shortcut(old,new,true, move |v| { r.borrow_mut().insert(v.into()); Ok(()) }, move |v| { *p.borrow_mut()=v.into(); Ok(()) }, move |v| { u.borrow_mut().remove(v); Ok(()) }).unwrap();
+        assert!(!registered.borrow().contains(old)); assert!(registered.borrow().contains(new)); assert_eq!(&*saved.borrow(),new);
     }
 
     #[test]
