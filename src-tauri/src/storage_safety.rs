@@ -632,6 +632,7 @@ mod tests {
         assert!(create_backup(&db, &dir).is_err());
         assert!(!dir.join("backups").exists());
     }
+
     #[test]
     fn v11_backup_migration_and_restore_preserve_pending_sleep() {
         let source_path=test_path("sleep-source");
@@ -649,6 +650,7 @@ mod tests {
         let before=Connection::open_with_flags(&backups[0],OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(before.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),11);
         assert_eq!(before.query_row("SELECT COUNT(*) FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(source.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),crate::LATEST_SCHEMA_VERSION);
         let start=chrono::DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
         let id=crate::sleep_periods::record_suspend(&mut source,41,start).unwrap();
         crate::sleep_periods::record_resume(&mut source,41,id,start+7200000).unwrap();
@@ -662,5 +664,15 @@ mod tests {
         validate_database(&dest).unwrap();
     }
 
+    #[test]
+    fn backup_with_tampered_sleep_schema_is_refused() {
+        let path=test_path("sleep-tampered");
+        let _cleanup=Cleanup(path.clone());
+        let mut db=Connection::open(&path).unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("DROP TRIGGER sleep_periods_no_delete;").unwrap();
+        drop(db);
+        assert!(prepare_restore(&path).is_err());
+    }
 }
 

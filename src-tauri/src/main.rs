@@ -990,6 +990,7 @@ fn widget_stop(state: State<'_, Shared>, entry_id: i64) -> Cmd<Snapshot> {
     snapshot(&tracker)
 }
 
+
 fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -> Cmd<()> {
     if tracker.running_since.is_some() { return Err("Ten pomiar nadal działa. Użyj przycisku Zatrzymaj.".into()); }
     let end = DateTime::parse_from_rfc3339(end).map_err(|_| "Podaj poprawną datę zakończenia.")?.with_timezone(&Utc);
@@ -1001,6 +1002,8 @@ fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -
     if end < start { return Err("Zakończenie nie może być przed rozpoczęciem pomiaru.".into()); }
     if end > start { ensure_no_overlap(&tx, start, end, Some(id))?; }
     let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
+    // Pending and excluded sleep is never stored as work; an unfinished or
+    // out-of-range period blocks recovery instead of being guessed.
     let seconds = if has_sleep_periods(&tx,id)? {
         sleep_periods::completed_periods(&tx,id,&start_text,&end_text).map_err(|_| "Najpierw ustal prawidłowy koniec każdego okresu uśpienia; nie może on wypadać po końcu pomiaru.")?.ok_or("Brakuje danych okresu uśpienia.")?.0
     } else { (end - start).num_seconds() };
@@ -3045,4 +3048,67 @@ mod tests {
         assert_eq!(period.decision,"pending");
     }
 
+
+    #[test]
+    fn fresh_and_v11_databases_reach_v12_with_valid_sleep_schema() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        assert_eq!(db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
+        sleep_periods::validate(&db).unwrap();
+        initialise(&mut db).unwrap();
+        assert_eq!(db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
+        db.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION + 1).unwrap();
+        assert!(initialise(&mut db).is_err());
+        let mut legacy = Connection::open_in_memory().unwrap();
+        initialise_v10(&mut legacy).unwrap();
+        optional_task_migration::migrate(&mut legacy).unwrap();
+        legacy.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(7,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600);").unwrap();
+        assert_eq!(legacy.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 11);
+        initialise(&mut legacy).unwrap();
+        assert_eq!(legacy.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(legacy.query_row("SELECT duration_seconds FROM time_entries WHERE id=7", [], |r| r.get::<_, i64>(0)).unwrap(), 3600);
+        assert_eq!(legacy.query_row("SELECT COUNT(*) FROM sleep_periods", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn entries_with_sleep_periods_cannot_be_corrected_or_deleted() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',3600),(2,1,'2026-01-02T10:00:00Z','2026-01-02T11:00:00Z',3600);").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(1,?1,?2)", params![start, start + 7_200_000]).unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let current = DateTime::parse_from_rfc3339("2026-01-03T10:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(correct_entry(&mut tracker, 1, "2026-01-01T10:00:00Z", "2026-01-01T13:00:00Z", "2026-01-01T10:30:00Z", "2026-01-01T13:00:00Z", current).is_err());
+        assert!(mark_entry_deleted(&mut tracker, 1, "2026-01-01T10:00:00Z", "2026-01-01T13:00:00Z", "2026-01-03T10:00:00Z").is_err());
+        let unchanged: (String, String, i64) = tracker.db.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(unchanged, ("2026-01-01T10:00:00Z".to_string(), "2026-01-01T13:00:00Z".to_string(), 3600));
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_deletions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        // An entry without sleep periods keeps the existing correction path.
+        correct_entry(&mut tracker, 2, "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z", "2026-01-02T10:00:00Z", "2026-01-02T10:30:00Z", current).unwrap();
+        mark_entry_deleted(&mut tracker, 2, "2026-01-02T10:00:00.000Z", "2026-01-02T10:30:00.000Z", "2026-01-03T10:00:00Z").unwrap();
+    }
+
+    #[test]
+    fn recovered_timer_with_sleep_stores_only_work_and_keeps_decision_pending() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at) VALUES(1,1,'2026-01-01T10:00:00Z');").unwrap();
+        let suspend = DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        let id = sleep_periods::record_suspend(&mut db, 1, suspend).unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let now = DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
+        // An unfinished sleep period blocks recovery instead of guessing.
+        assert!(resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).is_err());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE id=1 AND ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        sleep_periods::record_resume_manual(&mut tracker.db, 1, id, suspend + 7_200_000, now.timestamp_millis()).unwrap();
+        // The end may not cut through a recorded sleep period.
+        assert!(resolve_recovered(&mut tracker, "2026-01-01T12:00:00Z", now).is_err());
+        resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).unwrap();
+        let seconds: i64 = tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(seconds, 3600); // 3 h wall time minus 2 h pending sleep.
+        let periods = sleep_periods::list_for_entry(&tracker.db, 1).unwrap();
+        assert_eq!((periods.len(), periods[0].manual_resume, periods[0].decision.as_str()), (1, true, "pending"));
+    }
 }
