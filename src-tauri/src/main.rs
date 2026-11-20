@@ -7,6 +7,8 @@ mod optional_task_migration;
 mod ui_preferences;
 mod entry_drafts;
 mod editor_close;
+#[cfg(windows)]
+mod quit_dialog;
 
 const LATEST_SCHEMA_VERSION: i64 = 13;
 
@@ -1249,6 +1251,10 @@ fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: 
 }
 
 fn request_quit(app: &tauri::AppHandle) {
+    // Acquire before reading state or spawning a dialog. Repeated tray Quit clicks
+    // are ignored while the first request is in progress.
+    #[cfg(windows)]
+    let Some(quit_permit) = app.state::<quit_dialog::QuitDialog>().try_begin() else { return; };
     let shared = app.state::<Shared>();
     let guard = shared.lock();
     let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
@@ -1261,7 +1267,9 @@ fn request_quit(app: &tauri::AppHandle) {
         #[cfg(windows)]
         {
             let app = app.clone();
-            std::thread::spawn(move || match active {
+            std::thread::spawn(move || {
+                let _quit_permit = quit_permit;
+                match active {
                 Ok(Some(entry)) if entry.uncertain && !entry.recovered => {
                     let shared = app.state::<Shared>();
                     let released = match shared.lock() {
@@ -1288,6 +1296,7 @@ fn request_quit(app: &tauri::AppHandle) {
                 Ok(Some(_)) => show_start_error("Pomiar wymaga ręcznej weryfikacji. Rozlicz go przed zakończeniem aplikacji."),
                 Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
                 Ok(None) => {}
+                }
             });
         }
     }
@@ -1362,6 +1371,8 @@ fn main() {
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(Mutex::new(RestoreState::default()));
             app.manage(editor_close::EditorClose::default());
+            #[cfg(windows)]
+            app.manage(quit_dialog::QuitDialog::default());
             let registered = app.global_shortcut().register("Ctrl+Shift+Space");
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
                 state.registered = registered.is_ok();
