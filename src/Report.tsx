@@ -13,6 +13,7 @@ import { makeReportView } from './reportView';
 import type { ActiveReportEntry, CompletedReportEntry } from './reportView';
 import { allReportClients, changeReportScope, resolveReportScope } from './reportScope';
 import type { ReportCatalog, ReportScope } from './reportScope';
+import { clientLabels } from './clientLabels';
 
 type Data = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
 type Props = ReportCatalog & {
@@ -189,6 +190,18 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
   const validTask = taskChoices.some(item => Number(item.id) === reportScope.taskId);
   const clientArchived = resolved.client?.archived;
   const projectArchived = clientArchived || resolved.project?.archived;
+  const clientLabelById = useMemo(() => clientLabels(clients), [clients]);
+  const selectedClientLabel = resolved.client ? clientLabelById.get(String(resolved.client.id)) : undefined;
+  const clientLabelByEntry = useMemo(() => {
+    const projectOwners = new Map(projects.map(project => [String(project.id), String(project.client_id)]));
+    const labels = new Map<number, string>();
+    for (const entry of [...(data?.entries ?? []), ...(data?.active ? [data.active] : [])]) {
+      const ownerId = projectOwners.get(String(entry.project_id));
+      const label = ownerId ? clientLabelById.get(ownerId) : undefined;
+      if (label) labels.set(entry.id, label);
+    }
+    return labels;
+  }, [data, projects, clientLabelById]);
 
   function changeScope(field: keyof ReportScope, value: string) {
     if (!allowFilterChange()) return;
@@ -234,7 +247,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
           {reportScope.clientId !== null && !resolved.client &&
             <option value={reportScope.clientId} disabled>Zapisany klient jest niedostępny</option>}
           <option value="">Wszyscy klienci</option>
-          {clients.map(item => <option key={item.id} value={item.id}>{archivedName(item.name, item.archived)}</option>)}
+          {clients.map(item => <option key={item.id} value={item.id}>{archivedName(clientLabelById.get(String(item.id)) ?? item.name, item.archived)}</option>)}
         </select></div>
         <div><label htmlFor="report-project">Projekt</label><select id="report-project" disabled={!loaded || !scopeReady || !!scopeReadProblem || !resolved.client} value={reportScope.projectId ?? ''}
           onChange={event => changeScope('projectId', event.target.value)}>
@@ -268,7 +281,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
       {result?.error && <div role="alert" className="alert error">{result.error}</div>}
       {view && data && <>
         <ul className="report-scope-summary" aria-label="Aktywne filtry raportu">
-          <li>{resolved.client ? archivedName(resolved.client.name, clientArchived) : 'Wszyscy klienci'}</li>
+          <li>{resolved.client ? archivedName(selectedClientLabel ?? resolved.client.name, clientArchived) : 'Wszyscy klienci'}</li>
           {resolved.project && <li>{archivedName(resolved.project.name, projectArchived)}</li>}
           {resolved.task && <li>{archivedName(resolved.task.name, projectArchived || resolved.task.archived)}</li>}
         </ul>
@@ -308,10 +321,10 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
           {view.liveDays.length === 0 ? <p className="muted">Brak czasu pracy w wybranym zakresie.</p> :
             <div className="table-wrap"><table><thead><tr><th scope="col">Dzień</th><th scope="col">Czas z aktywnym pomiarem</th></tr></thead>
               <tbody>{view.liveDays.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
-        </> : <ReportDetails key={`details:${viewKey}`} rows={view.rows}
+        </> : <ReportDetails key={`details:${viewKey}`} rows={view.rows} clientLabelByEntry={clientLabelByEntry}
           finalizedSeconds={view.finalizedSeconds} liveSeconds={view.liveSeconds} zone={data.time_zone} onEdit={onEditEntry} onHistory={onShowHistory} />}
         <ReportExport key={`export:${viewKey}`} scope={reportScope} from={range.from}
-          through={range.through} zone={data.time_zone} expectedRows={view.finalizedRows} incomplete={incomplete} />
+          through={range.through} zone={data.time_zone} expectedRows={view.finalizedRows} incomplete={incomplete} clientLabel={selectedClientLabel} />
       </>}
     </>}
   </section>;

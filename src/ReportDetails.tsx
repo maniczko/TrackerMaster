@@ -5,6 +5,7 @@ import type { ReportDetailRow, ReportSortField } from './reportView';
 
 type Props = {
   rows: ReportDetailRow[];
+  clientLabelByEntry: ReadonlyMap<number, string>;
   zone: string;
   finalizedSeconds: number;
   liveSeconds: number;
@@ -25,7 +26,7 @@ function ReportTimestamp({ value, zone }: { value: string; zone: string }) {
   return <time dateTime={value}>{day}<small>{clock}</small></time>;
 }
 
-export default function ReportDetails({ rows, zone, finalizedSeconds, liveSeconds, onEdit, onHistory }: Props) {
+export default function ReportDetails({ rows, zone, finalizedSeconds, liveSeconds, onEdit, onHistory, clientLabelByEntry }: Props) {
   const [sort, setSort] = useState<{ field: ReportSortField; descending: boolean }>({ field: 'start', descending: true });
   const [page, setPage] = useState(0);
   const [hidden, setHidden] = useState<OptionalColumn[]>([]);
@@ -74,7 +75,7 @@ export default function ReportDetails({ rows, zone, finalizedSeconds, liveSecond
         </tr></thead>
         <tbody>{currentRows.map(({ source, status, contribution, pendingSeconds }) => <tr key={source.id}>
           <th scope="row">#{source.id}<span className="report-row-status" data-state={status}>{statusLabels[status]}</span></th>
-          {visibleColumns.map(([key]) => <td className={`report-column-${key}`} key={key}>{key === 'billable' ? source.billable ? 'Tak' : 'Nie' : source[key] || '—'}</td>)}
+          {visibleColumns.map(([key]) => <td className={`report-column-${key}`} key={key}>{key === 'billable' ? source.billable ? 'Tak' : 'Nie' : key === 'client' ? clientLabelByEntry.get(source.id) ?? source.client : source[key] || '—'}</td>)}
           <td className="report-timestamp"><ReportTimestamp value={source.started_at} zone={zone} /></td>
           <td className="report-timestamp">{status === 'running' ? 'W trakcie' : <ReportTimestamp value={source.ended_at} zone={zone} />}</td>
           <td className="duration">{formatDuration(source.duration_seconds)}</td>

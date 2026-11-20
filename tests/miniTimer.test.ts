@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { Snapshot } from '../src/App.tsx';
 import { activeContext, choicesFor, clockState, createRequestGate, descriptionCommand, durationText, pickerGroups, pickerKey, readLegacyPin, recentChoices, toggleCommand } from '../src/miniTimerModel.ts';
+import { clientLabels } from '../src/clientLabels.ts';
 
 const entry = { id: 9, task_id: '3', project_id: 2, started_at: '2026-11-17T09:00:00Z', ended_at: null, billable: true, description: 'Szkic' };
 const snapshot: Snapshot = {
@@ -11,6 +12,24 @@ const snapshot: Snapshot = {
   active: null, entries: [],
 };
 const choices = choicesFor(snapshot);
+
+test('duplicate client names have stable distinct labels in selection and active context', () => {
+  const duplicates: Snapshot = {
+    ...snapshot,
+    clients: [{ id: 1, name: 'Łódź', archived: false }, { id: 52, name: 'Łódź', archived: false }],
+    projects: [snapshot.projects[0], { ...snapshot.projects[1], name: 'Wdrożenie' }],
+  };
+  const labels = clientLabels(duplicates.clients);
+  assert.equal(labels.get('1'), 'ID 1 · Łódź');
+  assert.equal(labels.get('52'), 'ID 52 · Łódź');
+  const groups = pickerGroups(choicesFor(duplicates), [], '', true);
+  assert.deepEqual(groups.map(group => group.label), ['ID 1 · Łódź / Wdrożenie', 'ID 52 · Łódź / Wdrożenie']);
+  assert.equal(activeContext(duplicates, entry).path, 'ID 1 · Łódź / Wdrożenie');
+  assert.equal(clientLabels(snapshot.clients).get('1'), 'Łódź');
+  assert.equal(clientLabels([{ id: 1, name: 'ŻÓŁĆ' }, { id: 2, name: 'żółć' }]).get('2'), 'ID 2 · żółć');
+  const ambiguous = clientLabels([{ id: 1, name: 'X' }, { id: 2, name: 'X' }, { id: 3, name: 'ID 1 · X' }]);
+  assert.equal(new Set(ambiguous.values()).size, 3);
+});
 
 test('clock renders idle, long running, recovered and disconnected without rolling over at 24 h', () => {
   const now = Date.parse('2026-11-18T12:04:03Z');

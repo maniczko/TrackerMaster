@@ -5,6 +5,7 @@ import { draftRange, editableFields, matchesFields, mergeDraftFields, sourceFiel
 import type { DraftApplication, DraftFields, DraftList, DraftSource, DraftSourceStatus, EditableField, EntryDraft } from './entryDraft';
 import { createDraftSort } from './draftSort';
 import type { DraftSort, DraftSortState } from './draftSort';
+import { clientLabels } from './clientLabels';
 
 type NamedItem = { id: number | string; name: string; archived: boolean };
 type Project = NamedItem & { client_id: number | string };
@@ -406,6 +407,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     return (sort.order === 'newest' ? -byTime : byTime) || left.source.entryId - right.source.entryId;
   });
   const availableClients = clients.filter(item => !item.archived);
+  const clientLabelById = clientLabels(clients);
   const availableProjects = projects.filter(item => !item.archived && String(item.client_id) === editor?.target.clientId);
   const availableTasks = tasks.filter(item => !item.archived && String(item.project_id) === editor?.target.projectId);
   const readableCount = count === 1 ? 'Masz 1 niezapisany szkic.' : `Niezapisane szkice (${count})`;
@@ -417,7 +419,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
         <p className="muted">Strefa wpisywanych godzin {editor.fields.inputTimeZone}</p>
         {!editor.base && <div className="selectors">
           <label>Klient<select required value={editor.target.clientId} disabled={working} onChange={e => updateTarget({ ...emptyTarget, clientId: e.target.value })}>
-            <option value="">Wybierz klienta</option>{availableClients.map(client => <option key={client.id} value={client.id}>{client.name}</option>)}
+            <option value="">Wybierz klienta</option>{availableClients.map(client => <option key={client.id} value={client.id}>{clientLabelById.get(String(client.id))}</option>)}
           </select></label>
           <label>Projekt<select required value={editor.target.projectId} disabled={working || !editor.target.clientId} onChange={e => updateTarget({ ...editor.target, projectId: e.target.value, taskId: '' })}>
             <option value="">Wybierz projekt</option>{availableProjects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}

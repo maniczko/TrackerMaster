@@ -1,19 +1,22 @@
 import type { Snapshot } from './App';
+import { clientLabels } from './clientLabels.ts';
 
 type Entry = NonNullable<Snapshot['active']>;
 export type Choice = {
   key: string;
   project: Snapshot['projects'][number];
   client: Snapshot['clients'][number];
+  clientLabel: string;
   task: Snapshot['tasks'][number] | null;
 };
 
 const keyOf = (entry: Entry) => entry.task_id === null ? `project:${entry.project_id}` : `task:${entry.task_id}`;
 export const taskName = (choice: Choice) => choice.task?.name ?? 'Bez zadania';
-export const projectPath = (choice: Choice) => `${choice.client.name} / ${choice.project.name}`;
+export const projectPath = (choice: Choice) => `${choice.clientLabel} / ${choice.project.name}`;
 
 export function choicesFor(snapshot: Snapshot | null): Choice[] {
   if (!snapshot) return [];
+  const labels = clientLabels(snapshot.clients);
   const clients = new Map(snapshot.clients.filter(client => !client.archived).map(client => [String(client.id), client]));
   const tasks = new Map<string, Snapshot['tasks']>();
   for (const task of snapshot.tasks) {
@@ -25,7 +28,8 @@ export function choicesFor(snapshot: Snapshot | null): Choice[] {
   return snapshot.projects.flatMap((project): Choice[] => {
     const client = clients.get(String(project.client_id));
     if (project.archived || !client) return [];
-    return [{ key: `project:${project.id}`, project, client, task: null }, ...(tasks.get(String(project.id)) ?? []).map(task => ({ key: `task:${task.id}`, project, client, task }))];
+    const clientLabel = labels.get(String(client.id)) ?? client.name;
+    return [{ key: `project:${project.id}`, project, client, clientLabel, task: null }, ...(tasks.get(String(project.id)) ?? []).map(task => ({ key: `task:${task.id}`, project, client, clientLabel, task }))];
   });
 }
 
@@ -72,7 +76,8 @@ export function activeContext(snapshot: Snapshot, entry: Entry) {
   const project = snapshot.projects.find(item => String(item.id) === String(entry.project_id));
   const client = snapshot.clients.find(item => project && String(item.id) === String(project.client_id));
   const task = snapshot.tasks.find(item => entry.task_id !== null && String(item.id) === String(entry.task_id));
-  return { title: entry.task_id === null ? 'Bez zadania' : task?.name ?? 'Nieznane zadanie', path: `${client?.name ?? 'Nieznany klient'} / ${project?.name ?? 'Nieznany projekt'}` };
+  const label = client ? clientLabels(snapshot.clients).get(String(client.id)) : undefined;
+  return { title: entry.task_id === null ? 'Bez zadania' : task?.name ?? 'Nieznane zadanie', path: `${label ?? 'Nieznany klient'} / ${project?.name ?? 'Nieznany projekt'}` };
 }
 
 export function durationText(seconds: number) {

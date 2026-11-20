@@ -14,13 +14,14 @@ type Props = {
   zone: string;
   expectedRows: readonly ExportRow[];
   incomplete: boolean;
+  clientLabel?: string;
 };
 
-export default function ReportExport({ scope, from, through, zone, expectedRows, incomplete }: Props) {
+export default function ReportExport({ scope, from, through, zone, expectedRows, incomplete, clientLabel }: Props) {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const key = JSON.stringify([scope, from, through, zone]);
+  const key = JSON.stringify([scope, from, through, zone, clientLabel]);
   const current = preview?.key === key && !incomplete && sameExportRows(preview.rows, expectedRows) ? preview : null;
 
   async function prepare() {
@@ -55,7 +56,7 @@ export default function ReportExport({ scope, from, through, zone, expectedRows,
     {incomplete && <p className="muted">Przygotowanie CSV będzie możliwe po poprawieniu danych raportu.</p>}
     {preview && !current && <p role="status">Dane w raporcie się zmieniły. Przygotuj nowy podgląd przed pobraniem.</p>}
     {current && <div className="export-preview">
-      <p>Klient: <strong>{spreadsheetText(current.client)}</strong> · {current.from} — {current.through} · {current.zone}</p>
+      <p>Klient: <strong>{spreadsheetText(clientLabel ?? current.client)}</strong> · {current.from} — {current.through} · {current.zone}</p>
       <p>Liczba wpisów: <strong>{current.rows.length}</strong> · Czas w okresie: <strong>{formatDuration(current.total)}</strong></p>
       <p className="muted">Podgląd i plik zawierają te same zakończone wpisy. Tekst podobny do formuły otrzyma apostrof ochronny.</p>
       {current.rows.length === 0 && <p className="muted">Brak zakończonych, rozstrzygniętych wpisów spełniających filtry.</p>}

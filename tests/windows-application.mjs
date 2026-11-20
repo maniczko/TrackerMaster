@@ -931,6 +931,60 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   console.log('PASS: validation and SQLite failures preserved the edit; retry saved exactly one revision');
 }
 
+async function verifyDuplicateClientChoices(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const db = new DatabaseSync(testDb, { readOnly: true });
+  let primaryId, secondId, primaryMarker, secondMarker;
+  try {
+    primaryId = db.prepare('SELECT id FROM clients WHERE name=?').get(primaryClient).id;
+    secondId = db.prepare('SELECT id FROM clients WHERE name=?').get(secondClient).id;
+    primaryMarker = db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description;
+    secondMarker = db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description;
+    assert.notEqual(primaryMarker, secondMarker);
+  } finally { db.close(); }
+  const rename = (expected, name) => evaluate(`window.__TAURI_INTERNALS__.invoke('rename_item', ${JSON.stringify({ kind: 'client', id: primaryId, expectedName: expected, name })})`);
+  await rename(primaryClient, secondClient);
+  try {
+    await waitFor('duplicate names are distinct in the timer selector', () => evaluate(`(() => {
+      const options = [...document.querySelectorAll('[aria-label="Pomiar czasu"] select')[0].options];
+      return [${primaryId}, ${secondId}].every(id => options.some(option => option.value === String(id) && option.textContent.startsWith('ID ' + id + ' · ')));
+    })()`));
+    await evaluate(`(() => {
+      const section = document.querySelector('[aria-label="Raport czasu"]');
+      const button = [...section.querySelectorAll('button')].find(item => item.textContent.trim() === 'Otwórz raport');
+      button?.click();
+    })()`);
+    await waitFor('duplicate client report selector', () => evaluate(`(() => {
+      const select = document.querySelector('#report-client');
+      return select && [${primaryId}, ${secondId}].every(id => [...select.options].some(option => option.value === String(id) && option.textContent.startsWith('ID ' + id + ' · ')));
+    })()`));
+    for (const [id, included, excluded] of [[primaryId, primaryMarker, secondMarker], [secondId, secondMarker, primaryMarker]]) {
+      await evaluate(`(() => {
+        const select = document.querySelector('#report-client');
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, ${JSON.stringify(String(id))});
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      })()`);
+      await waitFor(`selected duplicate client ${id} in report`, () => evaluate(`document.querySelector('.report-scope-summary')?.textContent.includes(${JSON.stringify(`ID ${id} · `)})`));
+      await waitFor(`CSV preview button for client ${id}`, () => evaluate(`(() => {
+        const button = [...document.querySelectorAll('[aria-label="Raport czasu"] button')].find(item => item.textContent.trim() === 'Przygotuj podgląd CSV');
+        return button && !button.disabled;
+      })()`));
+      await evaluate(`[...document.querySelectorAll('[aria-label="Raport czasu"] button')].find(item => item.textContent.trim() === 'Przygotuj podgląd CSV').click()`);
+      await waitFor(`CSV preview isolates client ${id}`, () => evaluate(`(() => {
+        const preview = document.querySelector('.export-preview');
+        return preview?.textContent.includes(${JSON.stringify(`ID ${id} · `)}) && preview.textContent.includes(${JSON.stringify(included)}) && !preview.textContent.includes(${JSON.stringify(excluded)});
+      })()`));
+    }
+    console.log('PASS: identical client names are distinguishable and each CSV preview contains only its own entries');
+  } finally {
+    await rename(secondClient, primaryClient);
+  }
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -1040,7 +1094,10 @@ async function runWindow(port, phase, recovery) {
     }
     if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase, child);
     if (phase === 'draft-reopen') await verifyRestoreRetry(cdp, sessionId);
-    if (phase === 'hotkey-restart') await verifyShortcutAfterRestart(cdp, sessionId);
+    if (phase === 'hotkey-restart') {
+      await verifyShortcutAfterRestart(cdp, sessionId);
+      await verifyDuplicateClientChoices(cdp, sessionId);
+    }
     return seconds;
   } finally {
     if (phase === 'initial') {
