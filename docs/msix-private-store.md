@@ -4,22 +4,22 @@ Zakres: **wyłącznie izolowana wersja testowa**, bez danych klientów, bez publ
 
 ## Gdzie szukać paczki
 
-- Na PR dla tego workflow: GitHub Actions → `TrackerMaster private Store MSIX` → Artifacts → `TrackerMaster-isolated-MSIX-pull_request`.
-- **Artefakt z PR jest demonstracyjny**: ma `TrackerMaster.TestOnly` i **nie pasuje** do zarezerwowanej tożsamości Partner Center. Nie przesyłać go do Store.
-- Po zaakceptowaniu i scaleniu PR można uruchomić `workflow_dispatch` z tożsamością ze Store. Wynik: `TrackerMaster-isolated-MSIX-workflow_dispatch`, wewnątrz `TrackerMaster-private-store-candidate-x64.msix`.
+- Na PR dla tego workflow: GitHub Actions → `TrackerMaster private Store MSIX` → Artifacts → `TrackerMaster-PartnerCenter-private-MSIX-pull_request`.
+- **Artefakt z PR używa dokładnej tożsamości z Partner Center**, podanej przez właściciela aplikacji 20.11.2026, ale jest kandydatem do weryfikacji, nie ukończonym odbiorem QA. Po PASS może zostać ręcznie przesłany do Partner Center → Packages (bez automatycznej publikacji).
+- Po zaakceptowaniu i scaleniu PR można także uruchamiać `workflow_dispatch` z tożsamością ze Store. Wynik: `TrackerMaster-PartnerCenter-private-MSIX-workflow_dispatch`, wewnątrz `TrackerMaster-private-store-candidate-x64.msix`.
 - Pakiet jest niepodpisany. Nie jest przeznaczony do lokalnego instalowania przez dwuklik. Do instalowania prywatnie użyj certyfikacji i podpisu Microsoft Store. Lokalne testy instalacji/aktualizacji wymagają osobnej podpisanej paczki deweloperskiej i Windows 11.
 
 ## Wejście w Microsoft Partner Center
 
-Na ekranie TrackerMaster → Product management → **Product Identity** skopiuj dokładnie:
+Potwierdzone na zrzucie z Partner Center 20.11.2026:
 
-1. `Package/Identity/Name` → `package_name`,
-2. `Package/Identity/Publisher` → `publisher`,
-3. `Package/Properties/PublisherDisplayName` → `publisher_display_name`.
+1. `Package/Identity/Name` = `vatlar.TrackerMaster`,
+2. `Package/Identity/Publisher` = `CN=EBE2824B-F077-49B4-A180-73C366094CBA`,
+3. `Package/Properties/PublisherDisplayName` = `vatlar`.
 
-Wartości muszą dokładnie zgadzać się z tożsamością produktu; nie zamieniaj widocznej nazwy „TrackerMaster” na `Package/Identity/Name` bez sprawdzenia. Ustal także `package_version` (np. `0.1.0.0`; czwarta część wersji równa zero).
+Wersja pierwszego testowego pakietu: `0.1.0.0`. Czwarta część wersji równa zero. Parametry są danymi publicznej tożsamości produktu, **nie** certyfikatem podpisującym.
 
-Na GitHub → Actions → `TrackerMaster private Store MSIX` → **Run workflow** wprowadź trzy wartości tożsamości i wersję. Nie uruchamiaj builda z danymi produkcyjnymi; aplikacja używa `pl.tracker.personal.testonly`.
+Na GitHub → Actions → `TrackerMaster private Store MSIX` w gałęzi PR pipeline automatycznie używa trzech potwierdzonych wartości. Dla kolejnych wersji po scaleniu możesz ręcznie wywołać **Run workflow** z wartościami tożsamości i nową wersją. Nie uruchamiaj builda z danymi produkcyjnymi; aplikacja używa `pl.tracker.personal.testonly`.
 
 Po PASS pobierz artefakt z tego konkretnego uruchomienia i ręcznie prześlij MSIX do Partner Center → **Packages**. Zanim wyślesz certyfikację, upewnij się, że **Pricing and availability → Private audience** zawiera tylko Twoje konto do testów.
 
@@ -37,7 +37,7 @@ Po PASS pobierz artefakt z tego konkretnego uruchomienia i ręcznie prześlij MS
 
 - Repozytorium GitHub jest aktualnie **publiczne**. Nie traktuj artefaktów GitHub Actions jako prywatnego kanału dystrybucji. Jeśli celem jest wyłączny dostęp do binariów, trzeba oddzielnie zabezpieczyć repozytorium lub kanał buildów.
 - Manifest zawiera `unvirtualizedResources` oraz wykluczenie profilu SQLite z wirtualizacji, aby wspierać wymaganie zachowania danych po odinstalowaniu. Jest to *restricted capability* i może wymagać uzasadnienia w Partner Center. Zachowanie danych musi zostać zweryfikowane na Windows 11.
-- MSIX z tego PR **nie** publikuje produktu ani nie dodaje odbiorców. Wysyłka do certyfikacji jest oddzielną, ręczną decyzją właściciela.
+- MSIX z tego PR **nie** publikuje produktu ani nie dodaje odbiorców. Wysłanie pakietu i certyfikacja w Partner Center to oddzielne, ręczne decyzje właściciela. Prywatna widoczność zależy od ustawienia **Private audience** i listy uprawnionych kont.
 - Workflow po uruchomieniu z `workflow_dispatch` wymaga zatwierdzonego scalenia PR do domyślnej gałęzi, na której zarejestrowana jest definicja workflow.
 
 Źródła Microsoft:
