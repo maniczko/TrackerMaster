@@ -1,7 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod storage_safety;
+mod sleep_periods;
 mod optional_task_migration;
+
+// v12 adds D4 sleep-period storage. This build does not yet record power
+// events; it migrates, validates, backs up and restores the table, and refuses
+// edits that would desynchronise an entry from its recorded sleep periods.
+const LATEST_SCHEMA_VERSION: i64 = 12;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -143,7 +149,7 @@ fn entry_project_sql(db: &Connection, alias: &str) -> Cmd<String> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     match version {
         10 => Ok(format!("(SELECT project_id FROM tasks WHERE id={alias}.task_id)")),
-        11 => Ok(format!("{alias}.project_id")),
+        11..=LATEST_SCHEMA_VERSION => Ok(format!("{alias}.project_id")),
         _ => Err("Nieobsługiwana wersja bazy danych.".into()),
     }
 }
@@ -561,7 +567,7 @@ fn close_active(tracker: &mut Tracker, end: &str, next_task: Option<i64>) -> Cmd
 
 fn close_active_with_description(tracker: &mut Tracker, end: &str, next_task: Option<i64>, description: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
-    if version == 11 {
+    if (11..=LATEST_SCHEMA_VERSION).contains(&version) {
         let active: Option<i64> = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r|r.get(0)).optional().map_err(db_err)?;
         let action = match next_task {
             Some(task_id) => {
@@ -643,7 +649,7 @@ fn change_timer(tracker: &mut Tracker, end: &str, next_task: Option<i64>, descri
 
 fn resume_saved_entry(tracker: &mut Tracker, source_id: i64, expected_active_id: Option<i64>, at: &str) -> Cmd<()> {
     let version: i64 = tracker.db.pragma_query_value(None, "user_version", |r|r.get(0)).map_err(db_err)?;
-    if version == 11 { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
+    if (11..=LATEST_SCHEMA_VERSION).contains(&version) { return optional_task_migration::transition(tracker,expected_active_id,at,optional_task_migration::TimerAction::Resume { entry_id:source_id }); }
     if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != expected_active_id { return Err("Pomiar zmienił się w innym oknie. Sprawdź aktualny stan i spróbuj ponownie.".into()); }
     change_timer(tracker, at, None, "", Some(source_id))
 }
@@ -736,17 +742,36 @@ fn widget_stop(state: State<'_, Shared>, entry_id: i64) -> Cmd<Snapshot> {
     snapshot(&tracker)
 }
 
+// Sleep periods belong to one entry and are validated against its boundaries.
+// Until the full sleep workflow is available, refuse edits that could leave
+// recorded periods outside the entry or silently count them as work.
+fn has_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<bool> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(false); }
+    db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods WHERE entry_id=?1)", [entry_id], |r| r.get(0)).map_err(db_err)
+}
+fn ensure_no_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<()> {
+    if has_sleep_periods(db,entry_id)? { return Err("Wpis zawiera okresy uśpienia. Jego zmiana wymaga pełnej obsługi tych okresów.".into()); }
+    Ok(())
+}
+
 fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -> Cmd<()> {
     if tracker.running_since.is_some() { return Err("Ten pomiar nadal działa. Użyj przycisku Zatrzymaj.".into()); }
     let end = DateTime::parse_from_rfc3339(end).map_err(|_| "Podaj poprawną datę zakończenia.")?.with_timezone(&Utc);
     if end > current { return Err("Zakończenie nie może być w przyszłości.".into()); }
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let active: Option<(i64, String)> = tx.query_row("SELECT id, started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_err)?;
-    let (id, start) = active.ok_or("Nie ma pomiaru do odzyskania.")?;
-    let start = DateTime::parse_from_rfc3339(&start).map_err(|_| "Niepoprawny zapis czasu w bazie.")?.with_timezone(&Utc);
+    let (id, start_text) = active.ok_or("Nie ma pomiaru do odzyskania.")?;
+    let start = DateTime::parse_from_rfc3339(&start_text).map_err(|_| "Niepoprawny zapis czasu w bazie.")?.with_timezone(&Utc);
     if end < start { return Err("Zakończenie nie może być przed rozpoczęciem pomiaru.".into()); }
     if end > start { ensure_no_overlap(&tx, start, end, Some(id))?; }
-    tx.execute("UPDATE time_entries SET ended_at=?1,duration_seconds=?2,manually_resolved=1 WHERE id=?3 AND ended_at IS NULL", params![end.to_rfc3339_opts(SecondsFormat::Millis, true), (end - start).num_seconds(), id]).map_err(db_err)?;
+    let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
+    // Pending and excluded sleep is never stored as work; an unfinished or
+    // out-of-range period blocks recovery instead of being guessed.
+    let seconds = if has_sleep_periods(&tx,id)? {
+        sleep_periods::completed_periods(&tx,id,&start_text,&end_text).map_err(|_| "Najpierw ustal prawidłowy koniec każdego okresu uśpienia; nie może on wypadać po końcu pomiaru.")?.ok_or("Brakuje danych okresu uśpienia.")?.0
+    } else { (end - start).num_seconds() };
+    tx.execute("UPDATE time_entries SET ended_at=?1,duration_seconds=?2,manually_resolved=1 WHERE id=?3 AND ended_at IS NULL", params![end_text,seconds,id]).map_err(db_err)?;
     tx.commit().map_err(db_err)
 }
 
@@ -795,7 +820,7 @@ fn add_manual_entry(tracker: &mut Tracker, task_id: i64, started_at: &str, ended
 
 fn add_manual_entry_with_description(tracker: &mut Tracker, task_id: i64, started_at: &str, ended_at: &str, current: DateTime<Utc>, description: &str) -> Cmd<i64> {
     let version: i64=tracker.db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(db_err)?;
-    if version == 11 {
+    if (11..=LATEST_SCHEMA_VERSION).contains(&version) {
         let project_id: Option<i64>=tracker.db.query_row("SELECT project_id FROM tasks WHERE id=?1",[task_id],|r|r.get(0)).optional().map_err(db_err)?;
         return optional_task_migration::insert_manual(tracker,project_id.ok_or("Nie znaleziono zadania.")?,Some(task_id),started_at,ended_at,current,description);
     }
@@ -820,6 +845,7 @@ fn correct_entry(tracker: &mut Tracker, entry_id: i64, expected_start: &str, exp
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let previous: Option<(String, String, i64)> = tx.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_err)?;
     let (old_start, old_end, old_seconds) = previous.ok_or("Nie znaleziono zakończonego wpisu.")?;
+    ensure_no_sleep_periods(&tx, entry_id)?;
     if old_start != expected_start || old_end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed korektą.".into()); }
     ensure_no_overlap(&tx, start, end, Some(entry_id))?;
     let new_start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -866,6 +892,7 @@ fn mark_entry_deleted(tracker: &mut Tracker, entry_id: i64, expected_start: &str
     let tx = tracker.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
     let entry: Option<(String, String)> = tx.query_row("SELECT started_at,ended_at FROM time_entries WHERE id=?1 AND ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_err)?;
     let (start, end) = entry.ok_or("Nie znaleziono zakończonego wpisu lub wpis został już usunięty.")?;
+    ensure_no_sleep_periods(&tx, entry_id)?;
     if start != expected_start || end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed usunięciem.".into()); }
     tx.execute("INSERT INTO entry_deletions(entry_id,deleted_at) VALUES(?1,?2)", params![entry_id,deleted_at]).map_err(db_err)?;
     tx.commit().map_err(db_err)
@@ -1058,11 +1085,14 @@ fn initialise_v10(db: &mut Connection) -> rusqlite::Result<()> {
 fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = db.pragma_query_value(None,"user_version",|r|r.get(0))?;
-    if version > 11 { return Err(rusqlite::Error::InvalidQuery); }
+    if !(0..=LATEST_SCHEMA_VERSION).contains(&version) { return Err(rusqlite::Error::InvalidQuery); }
     if version <= 10 {
         initialise_v10(db)?;
         optional_task_migration::migrate(db)?;
     }
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version == 11 { sleep_periods::migrate(db)?; }
+    sleep_periods::validate(db)?;
     validate_schema(db)?;
     validate_revisions_schema(db)?;
     validate_deletions_schema(db)?;
@@ -1079,7 +1109,7 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
 // A failed backup prevents migration; a new installation needs no backup.
 fn initialise_with_backup(db: &mut Connection, dir: &std::path::Path, existing: bool) -> rusqlite::Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if existing && (0..11).contains(&version) {
+    if existing && (0..LATEST_SCHEMA_VERSION).contains(&version) {
         storage_safety::create_backup(db, dir)?;
     }
     initialise(db)
@@ -1105,7 +1135,7 @@ fn main() {
                 Ok(current) if current.active.is_some() => close_active(&mut tracker, &now(), None),
                 Ok(_) => match (hotkey.project_id,hotkey.task_id) {
                     (Some(project_id),task_id) => match tracker.db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)) {
-                        Ok(11) => optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id,task_id,description:"" }),
+                        Ok(11..=LATEST_SCHEMA_VERSION) => optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id,task_id,description:"" }),
                         Ok(10) => match task_id { Some(task_id) => close_active(&mut tracker,&now(),Some(task_id)), None => Err("Ten projekt wymaga aktualizacji bazy przed pomiarem bez zadania.".into()) },
                         _ => Err("Nie można odczytać wersji bazy danych.".into()),
                     },
@@ -1582,7 +1612,7 @@ mod tests {
         assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         initialise_with_backup(&mut tracker.db, &dir, true).unwrap();
-        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(tracker.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
         let backups: Vec<_> = std::fs::read_dir(dir.join("backups")).unwrap().map(|entry| entry.unwrap().path()).collect();
         assert_eq!(backups.len(), 1);
         storage_safety::preflight_existing(&backups[0]).unwrap();
@@ -2297,5 +2327,68 @@ mod tests {
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, 0);
         assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'projects')", [], |r| r.get::<_, bool>(0)).unwrap());
+    }
+
+    #[test]
+    fn fresh_and_v11_databases_reach_v12_with_valid_sleep_schema() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        assert_eq!(db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
+        sleep_periods::validate(&db).unwrap();
+        initialise(&mut db).unwrap();
+        assert_eq!(db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), LATEST_SCHEMA_VERSION);
+        db.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION + 1).unwrap();
+        assert!(initialise(&mut db).is_err());
+        let mut legacy = Connection::open_in_memory().unwrap();
+        initialise_v10(&mut legacy).unwrap();
+        optional_task_migration::migrate(&mut legacy).unwrap();
+        legacy.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(7,1,'2026-01-01T10:00:00Z','2026-01-01T11:00:00Z',3600);").unwrap();
+        assert_eq!(legacy.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 11);
+        initialise(&mut legacy).unwrap();
+        assert_eq!(legacy.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 12);
+        assert_eq!(legacy.query_row("SELECT duration_seconds FROM time_entries WHERE id=7", [], |r| r.get::<_, i64>(0)).unwrap(), 3600);
+        assert_eq!(legacy.query_row("SELECT COUNT(*) FROM sleep_periods", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn entries_with_sleep_periods_cannot_be_corrected_or_deleted() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T10:00:00Z','2026-01-01T13:00:00Z',3600),(2,1,'2026-01-02T10:00:00Z','2026-01-02T11:00:00Z',3600);").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(1,?1,?2)", params![start, start + 7_200_000]).unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let current = DateTime::parse_from_rfc3339("2026-01-03T10:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(correct_entry(&mut tracker, 1, "2026-01-01T10:00:00Z", "2026-01-01T13:00:00Z", "2026-01-01T10:30:00Z", "2026-01-01T13:00:00Z", current).is_err());
+        assert!(mark_entry_deleted(&mut tracker, 1, "2026-01-01T10:00:00Z", "2026-01-01T13:00:00Z", "2026-01-03T10:00:00Z").is_err());
+        let unchanged: (String, String, i64) = tracker.db.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(unchanged, ("2026-01-01T10:00:00Z".to_string(), "2026-01-01T13:00:00Z".to_string(), 3600));
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_deletions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        // An entry without sleep periods keeps the existing correction path.
+        correct_entry(&mut tracker, 2, "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z", "2026-01-02T10:00:00Z", "2026-01-02T10:30:00Z", current).unwrap();
+        mark_entry_deleted(&mut tracker, 2, "2026-01-02T10:00:00.000Z", "2026-01-02T10:30:00.000Z", "2026-01-03T10:00:00Z").unwrap();
+    }
+
+    #[test]
+    fn recovered_timer_with_sleep_stores_only_work_and_keeps_decision_pending() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at) VALUES(1,1,'2026-01-01T10:00:00Z');").unwrap();
+        let suspend = DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        let id = sleep_periods::record_suspend(&mut db, 1, suspend).unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let now = DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
+        // An unfinished sleep period blocks recovery instead of guessing.
+        assert!(resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).is_err());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE id=1 AND ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        sleep_periods::record_resume_manual(&mut tracker.db, 1, id, suspend + 7_200_000, now.timestamp_millis()).unwrap();
+        // The end may not cut through a recorded sleep period.
+        assert!(resolve_recovered(&mut tracker, "2026-01-01T12:00:00Z", now).is_err());
+        resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).unwrap();
+        let seconds: i64 = tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(seconds, 3600); // 3 h wall time minus 2 h pending sleep.
+        let periods = sleep_periods::list_for_entry(&tracker.db, 1).unwrap();
+        assert_eq!((periods.len(), periods[0].manual_resume, periods[0].decision.as_str()), (1, true, "pending"));
     }
 }
