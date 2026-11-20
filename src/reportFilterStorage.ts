@@ -1,6 +1,6 @@
 import { Temporal } from '@js-temporal/polyfill';
-import { reportPresets } from './reportPresets';
-import type { ReportPreset } from './reportPresets';
+import { reportPresets } from './reportPresets.ts';
+import type { ReportPreset } from './reportPresets.ts';
 
 export type SavedReportFilter = { kind: ReportPreset } | { kind: 'custom'; from: string; through: string };
 type StorageAccess = Pick<Storage, 'getItem' | 'setItem'>;
