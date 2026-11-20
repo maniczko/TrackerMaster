@@ -1,6 +1,6 @@
 # TrackerMaster — zasady pracy dla agentów
 
-Lekka aplikacja desktopowa Windows 10/11 do rejestrowania czasu pracy: Tauri 2, React/TypeScript, Rust, lokalny SQLite, dystrybucja MSIX.
+Lekka aplikacja desktopowa do rejestrowania czasu pracy: Tauri 2, React/TypeScript, Rust, lokalny SQLite, dystrybucja MSIX. Oficjalna platforma odbioru MVP (D11): **Windows 11 x64**; Windows 10 nie jest warunkiem akceptacji MVP.
 
 **Zasada nadrzędna:** żadna zmiana nie może prowadzić do niekontrolowanej utraty ani podwójnego naliczenia czasu pracy. Bezpieczeństwo danych ma pierwszeństwo przed rozbudową UI. Przy niepewności system ma odmówić operacji („fail closed”), a nie zgadywać.
 
@@ -46,22 +46,23 @@ Analiza → minimalna zmiana → testy → PR (Draft) → CI → weryfikacja log
 
 ## Schemat SQLite
 
-- Wersję wyznacza `LATEST_SCHEMA_VERSION` w `src-tauri/src/main.rs` (na `main`: 12). Nie wpisuj stałych numerów wersji w nowym kodzie ani testach.
+- Wersję wyznacza `LATEST_SCHEMA_VERSION` w `src-tauri/src/main.rs` (**na `main` @ `73d9e3e`, 20.11.2026: 13**). Przed każdą zmianą ponownie sprawdź wartość w kodzie; nie wpisuj na sztywno aktualnego numeru w nowych testach.
 - Każda migracja: jedna transakcja, zweryfikowana kopia przed migracją (`initialise_with_backup`), walidacja w `initialise`, w preflight i przy odtwarzaniu kopii (`storage_safety::validate_database`).
 - Migracja jest jednokierunkowa: starsze buildy odmawiają nowszej bazy. Zaznacz to w opisie PR.
-- `sleep_periods` (v12): okresy są niezmienne i nieusuwalne (triggery). Na `main` nic ich jeszcze nie zapisuje. Rejestracja zdarzeń zasilania wchodzi dopiero **razem** z UI rozstrzygania (`SleepPending`), bo otwarty okres blokuje Stop.
+- `sleep_periods` (v12, PR #26): okresy są chronione triggerami przed nadpisaniem i usunięciem. **Na `main` PR #29 podłączył już zdarzenia Windows suspend/resume, komendy D4 i UI `SleepPending`**, wraz z raportami i CSV. Przy brakującym/podejrzanym zdarzeniu stosuj istniejącą ścieżkę `uncertain` / ręcznego rozstrzygnięcia, nie dopisuj czasu automatycznie. Testy symulowane i Windows CI nie zastępują fizycznego suspend/resume na Windows 11.
+- `entry_drafts` (v13, PR #31): szkice wpisów w lokalnym `app_data_dir/entry-drafts` i pokwitowania rozstrzygnięć w SQLite. Migracje wymagają weryfikacji i kopii; wcześniejszy build ze schematem v12 nie otworzy bazy v13. Odbiór szkiców, dialogów zamknięcia i przenoszenia danych wymaga niezależnego E2E Windows 11.
 
-## Stan PR #8
+## Stan PR #8 (migawka 20.11.2026)
 
-Duży Draft (`integration/mvp-hotkey-csv-restore-20261117`) dzielony na wycinki. Nie scalaj go w całości.
+Duży Draft [PR #8](https://github.com/maniczko/TrackerMaster/pull/8) (gałąź `integration/mvp-hotkey-csv-restore-20261117`) jest dzielony na małe wycinki. **Nie scalać całego PR #8.** Przed pracą ponownie zweryfikuj stan PR, HEAD i różnice względem `main`.
 
-- Wydzielone: #16, #17, #18 (wcześniej), #26 (schemat v12 sleep).
-- Następne wycinki:
-  1. Zdarzenia zasilania + projekcja aktywnego pomiaru + komendy + `SleepPending` + sen w raportach i CSV — razem.
-  2. Szkice wpisów (schemat v13).
-  3. Skróty, okno i preferencje.
-  4. Zakres raportów.
-- PR #19 (mini timer) jest zdublowany przez nowszą wersję w PR #8. Nie scalaj go osobno.
+- **Scalone do `main`:** #16 (parser czasu / DST), #17 (segmentacja snu), #18 (nagłówki CSV), #26 (schemat snu v12), **#29 (zdarzenia zasilania + `SleepPending` + raport/CSV)**, **#31 (szkice wpisów + schema v13)**. Tych wycinków nie implementuj ponownie.
+- **Scalone do gałęzi PR #8 (nie do `main`):** #27 i #30 — synchronizacje po #26 i #29.
+- **Otwarty Draft #32** — kolejna synchronizacja gałęzi PR #8 po #31, celem jest *gałąź PR #8*, nie `main`. HEAD sprawdzony 20.11: `333542c524325e53b28b4014b21014018661bfb4`. [GitHub Actions #44729992798](https://github.com/maniczko/TrackerMaster/actions/runs/44729992798): `build`, `windows-application`, `msix-lifecycle` — SUCCESS na tym SHA. To testy Windows CI, **nie** końcowy odbiór Windows 11 / podpisanego Store MSIX.
+- **Pozostałe kandydaty do wydzielenia:** globalne skróty / ustawienia i obsługa okien, zakres i filtry raportów. Każdy wycinek wymaga samodzielnej analizy diff, testów, CI i zgody na merge.
+- [PR #19](https://github.com/maniczko/TrackerMaster/pull/19) — osobny Draft miniwidgetu, zakres częściowo pokrywa się z PR #8; sprawdź różnice i nie scalaj obu niezależnie bez usunięcia duplikacji.
+
+Nie interpretuj poprzedniego CI lub rozwiązanego konfliktu jako dowodu dla nowszego SHA. **Formalna bramka QA-01 nadal jest zablokowana** do wykonania obowiązkowych testów Windows 11 x64 i MSIX.
 
 ## Notion — statusy i dowody
 
