@@ -38,7 +38,7 @@ Analiza → minimalna zmiana → testy → PR (Draft) → CI → weryfikacja log
 
 - Jeden PR = jedna sprawdzalna zmiana. Nie mieszaj MSIX, widgetu, migracji i korekt w jednym PR.
 - Nazwy gałęzi: `test/…`, `fix/…`, `feat/…`, `docs/…`, `merge/…` + ID zadania i data, np. `feat/d4-sleep-schema-v12-20261120`.
-- Scalanie: **squash**, z `--match-head-commit <SHA, który przeszedł CI>`. Scalaj tylko za zgodą właściciela.
+- Scalanie: wycinki i poprawki do `main` metodą **squash**; synchronizacje gałęzi PR #8 z `main` **merge commitem** (żeby `main` pozostał przodkiem i konflikty nie wracały). Zawsze z `--match-head-commit <SHA, który przeszedł CI i recenzję>`. Scalaj tylko za zgodą właściciela (stała zgoda obejmuje wycinki PR #8 po zielonym CI i PASS niezależnego recenzenta).
 - Po CI sprawdź w logu, że **nowe testy faktycznie się wykonały**; samo SUCCESS tego nie dowodzi.
 - Nie usuwaj ani nie osłabiaj testów, żeby uzyskać SUCCESS. Przy FAIL: log → przyczyna → poprawka → ponowne uruchomienie.
 - Do gałęzi cudzego PR (np. PR #8) nie pushuj bezpośrednio. Otwórz PR z bazą w tej gałęzi (przykłady: #25, #27).
@@ -46,7 +46,7 @@ Analiza → minimalna zmiana → testy → PR (Draft) → CI → weryfikacja log
 
 ## Schemat SQLite
 
-- Wersję wyznacza `LATEST_SCHEMA_VERSION` w `src-tauri/src/main.rs` (**na `main` @ `73d9e3e`, 20.11.2026: 13**). Przed każdą zmianą ponownie sprawdź wartość w kodzie; nie wpisuj na sztywno aktualnego numeru w nowych testach.
+- Wersję wyznacza `LATEST_SCHEMA_VERSION` w `src-tauri/src/main.rs` (**na `main` @ `8f12cae`, 20.11.2026: 13**). Przed każdą zmianą ponownie sprawdź wartość w kodzie. Nie wpisuj stałych numerów wersji w nowym kodzie ani testach — używaj `LATEST_SCHEMA_VERSION`.
 - Każda migracja: jedna transakcja, zweryfikowana kopia przed migracją (`initialise_with_backup`), walidacja w `initialise`, w preflight i przy odtwarzaniu kopii (`storage_safety::validate_database`).
 - Migracja jest jednokierunkowa: starsze buildy odmawiają nowszej bazy. Zaznacz to w opisie PR.
 - `sleep_periods` (v12, PR #26): okresy są chronione triggerami przed nadpisaniem i usunięciem. **Na `main` PR #29 podłączył już zdarzenia Windows suspend/resume, komendy D4 i UI `SleepPending`**, wraz z raportami i CSV. Przy brakującym/podejrzanym zdarzeniu stosuj istniejącą ścieżkę `uncertain` / ręcznego rozstrzygnięcia, nie dopisuj czasu automatycznie. Testy symulowane i Windows CI nie zastępują fizycznego suspend/resume na Windows 11.
@@ -56,11 +56,10 @@ Analiza → minimalna zmiana → testy → PR (Draft) → CI → weryfikacja log
 
 Duży Draft [PR #8](https://github.com/maniczko/TrackerMaster/pull/8) (gałąź `integration/mvp-hotkey-csv-restore-20261117`) jest dzielony na małe wycinki. **Nie scalać całego PR #8.** Przed pracą ponownie zweryfikuj stan PR, HEAD i różnice względem `main`.
 
-- **Scalone do `main`:** #16 (parser czasu / DST), #17 (segmentacja snu), #18 (nagłówki CSV), #26 (schemat snu v12), **#29 (zdarzenia zasilania + `SleepPending` + raport/CSV)**, **#31 (szkice wpisów + schema v13)**. Tych wycinków nie implementuj ponownie.
-- **Scalone do gałęzi PR #8 (nie do `main`):** #27 i #30 — synchronizacje po #26 i #29.
-- **Otwarty Draft #32** — kolejna synchronizacja gałęzi PR #8 po #31, celem jest *gałąź PR #8*, nie `main`. HEAD sprawdzony 20.11: `333542c524325e53b28b4014b21014018661bfb4`. [GitHub Actions #44729992798](https://github.com/maniczko/TrackerMaster/actions/runs/44729992798): `build`, `windows-application`, `msix-lifecycle` — SUCCESS na tym SHA. To testy Windows CI, **nie** końcowy odbiór Windows 11 / podpisanego Store MSIX.
-- **Pozostałe kandydaty do wydzielenia:** globalne skróty / ustawienia i obsługa okien, zakres i filtry raportów. Każdy wycinek wymaga samodzielnej analizy diff, testów, CI i zgody na merge.
-- [PR #19](https://github.com/maniczko/TrackerMaster/pull/19) — osobny Draft miniwidgetu, zakres częściowo pokrywa się z PR #8; sprawdź różnice i nie scalaj obu niezależnie bez usunięcia duplikacji.
+- **Scalone do `main`:** #16 (parser czasu / DST), #17 (segmentacja snu), #18 (nagłówki CSV), #26 (schemat snu v12), **#29 (zdarzenia zasilania + `SleepPending` + raport/CSV, poprawka B1)**, **#31 (szkice wpisów + schema v13)**, #35 (jeden strażnik dialogu „Zakończ” — `quit_dialog`), #36 (szybkie okresy raportu), **#37 (wycinek 4a: konfigurowalny skrót, mini timer, przypięcie widgetu)**, #34 (odświeżanie raportu i podglądu CSV). Tych zmian nie implementuj ponownie.
+- **Scalone do gałęzi PR #8 (nie do `main`), merge commitami:** #27, #30, #32, #38 — synchronizacje po #26, #29, #31 i #34–#37. HEAD gałęzi PR #8 po #38: `e22a382`; `main` jest jej przodkiem. PR #8 używa tylko strażnika `quit_dialog` z `main` (bez własnego `QuitDialog`).
+- **Pozostałe wycinki** (mapa z PR #37): **4b** — `instance_activation`, okno startowe, E2E `tests/windows-application.mjs` i `windows-*.ps1`, job `windows-application`; **5** — zakres i filtry raportu (`ReportScope`, `reportView`, `ReportDetails`, `ReportTimezone`, filtry w `ui_preferences`); **6** — `packaging/msix` i job `msix-lifecycle`. Każdy wycinek wymaga samodzielnej analizy diff, testów, CI, niezależnej recenzji i zgody na merge.
+- [PR #19](https://github.com/maniczko/TrackerMaster/pull/19) — zastąpiony wersją mini timera z PR #8 (w `main` przez #37). **Nie scalaj go osobno.**
 
 Nie interpretuj poprzedniego CI lub rozwiązanego konfliktu jako dowodu dla nowszego SHA. **Formalna bramka QA-01 nadal jest zablokowana** do wykonania obowiązkowych testów Windows 11 x64 i MSIX.
 
