@@ -199,7 +199,7 @@ export default function App() {
       {loaded && data.active?.recovered && <div role="alert" className="alert pending"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto: {formatDate(data.active.started_at)}. Podaj faktyczny czas zakończenia. {data.active.has_sleep ? 'Zapisane okresy uśpienia pozostają osobno do Twojej decyzji. Jeśli nie mają czasu wybudzenia, uzupełnij go na liście poniżej przed zapisaniem końca pomiaru. Pozostały czas między początkiem a wskazanym końcem, także niezarejestrowane przerwy, zostanie zaliczony jako praca.' : 'Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.'}
         <form onSubmit={e => { e.preventDefault(); const end = new Date(recoveryEnd); if (!recoveryEnd || Number.isNaN(end.getTime())) { setError('Podaj poprawną datę zakończenia.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
           <label>Data i godzina zakończenia <input type="datetime-local" step="1" required value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
-          <button type="submit" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
+          <button type="submit" className="primary" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
         </form></div>}
       {notice && <div role="status" className="alert success">{notice}</div>}
       <SleepPending loaded={loaded} onResolved={async () => {
