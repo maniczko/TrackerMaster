@@ -99,7 +99,7 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
   return <>
     {error && <div role="alert" className="alert error">{error} <button type="button" disabled={busy} onClick={() => void refresh()}>Ponów</button></div>}
     {showBanner && items.length > 0 && <div role="status" className="alert"><strong>Uśpienie do rozstrzygnięcia: {summary}.</strong> <button type="button" onClick={showList}>Przejdź do listy</button></div>}
-    {items.length > 0 && <section ref={listRef} className="card" aria-label="Okresy uśpienia do rozstrzygnięcia">
+    {items.length > 0 && <section ref={listRef} className="card pending-card" aria-label="Okresy uśpienia do rozstrzygnięcia">
       <div className="section-top"><div><h2>Uśpienie do rozstrzygnięcia</h2><p className="muted">{summary}. Te okresy nie są zaliczane do pracy przed decyzją.</p></div><button type="button" className="secondary" aria-expanded={open} onClick={() => setOpen(value => !value)}>{open ? 'Ukryj listę' : 'Pokaż listę'}</button></div>
       {open && <div className="table-wrap"><table><thead><tr><th>Okres</th><th>Klient / projekt / zadanie</th><th>Czas</th><th>Decyzja</th></tr></thead><tbody>{items.map(item => <tr key={item.id}>
         <td>{dateTime(item.startedMs)} – {item.endedMs === null ? 'brak czasu wybudzenia' : dateTime(item.endedMs)}</td>

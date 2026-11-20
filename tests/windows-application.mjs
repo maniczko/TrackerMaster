@@ -30,6 +30,51 @@ const csvSnapshot = async () => {
   try { return await readdir(csvDirectory); }
   catch (error) { return { error: error.code ?? error.message }; }
 };
+// UIQ-01/08 layout evidence: screenshots are uploaded as a CI artifact. These helpers only observe the app.
+const screenshotDirectory = resolve('test-results', 'ui-screenshots');
+await mkdir(screenshotDirectory, { recursive: true });
+async function saveScreenshot(cdp, sessionId, name) {
+  const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', fromSurface: true }, sessionId);
+  await writeFile(join(screenshotDirectory, `${name}.png`), Buffer.from(data, 'base64'));
+}
+const inspectMainLayout = `(() => {
+  const root = document.documentElement;
+  const timer = document.querySelector('[aria-label="Pomiar czasu"]');
+  const action = timer?.querySelector('.timer-stop button') ?? timer?.querySelector('.timer-start button');
+  const box = action?.getBoundingClientRect();
+  return { scrollWidth: root.scrollWidth, clientWidth: root.clientWidth, scrollY: window.scrollY,
+    action: box ? { text: action.textContent.trim(), top: Math.round(box.top), bottom: Math.round(box.bottom),
+      left: Math.round(box.left), right: Math.round(box.right), height: Math.round(box.height) } : null };
+})()`;
+async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = true } = {}) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  for (const [width, height] of [[1280, 720], [1920, 1080]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false }, sessionId);
+    try {
+      await waitFor(`${state} layout at ${width}x${height}`, () => evaluate(`window.innerWidth === ${width} && window.innerHeight === ${height}`));
+      await evaluate('window.scrollTo(0, 0)');
+      await delay(300);
+      const layout = await evaluate(inspectMainLayout);
+      console.log(`UI_LAYOUT main-${state} ${width}x${height} ${JSON.stringify(layout)}`);
+      assert.ok(layout.scrollWidth <= layout.clientWidth,
+        `${state} ${width}x${height}: the page scrolls horizontally (${layout.scrollWidth} > ${layout.clientWidth})`);
+      if (requireTimerAction) {
+        assert.ok(layout.action, `${state}: Start/Stop button is missing`);
+        assert.equal(layout.scrollY, 0);
+        assert.ok(layout.action.top >= 0 && layout.action.bottom <= height && layout.action.left >= 0 && layout.action.right <= width,
+          `${state} ${width}x${height}: Start/Stop is not visible without scrolling`);
+        assert.ok(layout.action.height >= 40, `${state}: Start/Stop is lower than 40px`);
+      }
+      await saveScreenshot(cdp, sessionId, `main-${state}-${width}x${height}`);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+}
 const primaryClient = 'Klient Żuraw QA';
 const secondClient = 'Klient Beta QA';
 const project = 'Projekt kontrolny';
@@ -387,6 +432,7 @@ async function verifyMiniTimer(cdp, mainSession) {
   assert.ok(idleBar.actionWidth >= 44 && idleBar.actionHeight >= 44, 'Timer action should have a 44px target');
   assert.ok(idleBar.clockRight <= idleBar.actionLeft && idleBar.actionRight <= idleBar.barRight,
     'Timer action should follow the clock and fit inside the bar');
+  await saveScreenshot(cdp, widget, 'widget-compact-idle');
   await evaluate(widget, `document.querySelector('[aria-label="Rozwiń panel"]').click()`);
   await waitFor('mini timer opens the focused project search', () => evaluate(widget,
     `document.activeElement === document.querySelector('[role="combobox"]')`));
@@ -399,6 +445,7 @@ async function verifyMiniTimer(cdp, mainSession) {
     const options = [...document.querySelectorAll('[role="option"]')];
     return options.length === 1 && options[0].getAttribute('aria-label') === ${JSON.stringify(`Bez zadania — ${secondClient} / ${project}`)};
   })()`));
+  await saveScreenshot(cdp, widget, 'widget-expanded-search');
   const press = key => evaluate(widget, `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }))`);
   await press('ArrowDown');
   await waitFor('keyboard highlights the search result', () => evaluate(widget,
@@ -457,6 +504,7 @@ async function verifyMiniTimer(cdp, mainSession) {
   assert.equal(runningBar.actionWidth, idleBar.actionWidth, 'Timer action width changes when running');
   assert.equal(runningBar.actionHeight, idleBar.actionHeight, 'Timer action height changes when running');
   assert.equal(runningBar.actionLeft, idleBar.actionLeft, 'Timer action moves when running');
+  await saveScreenshot(cdp, widget, 'widget-expanded-running');
   const started = readInterruptedTimer();
   const close = session => evaluate(session, `document.querySelector('[aria-label="Zamknij mini timer"]').click()`)
     .catch(error => { if (!/Execution context was destroyed|Target closed|Session with given id not found/i.test(error.message)) throw error; });
@@ -529,6 +577,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     entryId = rows[3].id;
   } finally { activeDb.close(); }
   await waitFor('main window shows the active timer', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button:not(:disabled)'))`));
+  await captureMainLayout(cdp, mainSession, 'running');
   await evaluate(mainSession, `(() => {
     const select = document.querySelectorAll('[aria-label="Pomiar czasu"] select')[0];
     const option = [...select.options].find(item => item.textContent === ${JSON.stringify(primaryClient)});
@@ -997,6 +1046,8 @@ async function runWindow(port, phase, recovery) {
       });
       console.log('PASS: Start without a project opens the picker and leaves the timer stopped');
     }
+    if (phase === 'initial') await captureMainLayout(cdp, sessionId, 'empty');
+    if (phase === 'recover') await captureMainLayout(cdp, sessionId, 'recovered', { requireTimerAction: false });
     if (phase === 'initial') await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory, eventsEnabled: true });
     const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription, interruptedDescription, recovery };
     const result = await cdp.send('Runtime.evaluate', {
@@ -1039,6 +1090,7 @@ async function runWindow(port, phase, recovery) {
       assert.ok(!rows[1].includes(secondClient) && !rows[1].includes(secondDescription));
       assert.equal(Number(rows[1].split(';')[10].replaceAll('"', '')), seconds);
       console.log('First window: downloaded CSV matched the report total and CSV preview');
+      await captureMainLayout(cdp, sessionId, 'idle-with-history');
       console.log(`CSV_DIAGNOSTIC phase=after-read protocol=${JSON.stringify(cdp.downloadEvents)} directory=${JSON.stringify(await csvSnapshot())}`);
     } else {
       const files = await readdir(csvDirectory);
