@@ -761,6 +761,35 @@ fn resume_entry(state: State<'_, Shared>, source_id: i64, expected_active_id: Op
     snapshot(&tracker)
 }
 
+// A running entry whose time cannot be verified (unmatched sleep, clock change
+// or a missed power event) keeps its clock only while one of its sleep periods
+// is still open, so SleepPending can supply the wake time. Otherwise the entry
+// goes to manual recovery, which already accounts for its recorded periods.
+fn keeps_clock_for_open_sleep(db: &Connection, entry_id: i64) -> Cmd<bool> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(false); }
+    Ok(sleep_periods::list_for_entry(db, entry_id).map_err(db_err)?.iter().any(|period| period.ended_ms.is_none()))
+}
+fn unverifiable_timer_message(keep: bool) -> &'static str {
+    if keep { "Nie można bezpiecznie ustalić czasu. Pomiar nie został zakończony; uzupełnij czas wybudzenia na liście okresów uśpienia." }
+    else { "Nie można bezpiecznie ustalić czasu. Pomiar nie został zakończony; podaj faktyczny czas zakończenia w oknie aplikacji." }
+}
+
+// Used when quitting from the tray: never stop an unverifiable entry, but
+// leave it in a state the main window can resolve instead of a dead end.
+fn release_unverifiable_timer(tracker: &mut Tracker, expected_id: i64, current: DateTime<Utc>, power: Cmd<PowerSample>) -> Cmd<()> {
+    ensure_available(tracker)?;
+    if tracker.running_since.is_none() { return Ok(()); }
+    let active: Option<(i64, String)> = tracker.db.query_row("SELECT id,started_at FROM time_entries WHERE ended_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(db_err)?;
+    let (id, started_at) = active.ok_or("Pomiar zmienił się podczas zamykania. Sprawdź aktualny stan.")?;
+    if id != expected_id { return Err("Pomiar zmienił się podczas zamykania. Sprawdź aktualny stan.".into()); }
+    if active_projection(&tracker.db, tracker.running_since.as_ref(), id, &started_at, current, &power).is_some() {
+        return Err("Pomiar zmienił się podczas zamykania. Sprawdź aktualny stan.".into());
+    }
+    if !keeps_clock_for_open_sleep(&tracker.db, id)? { tracker.running_since = None; }
+    Ok(())
+}
+
 fn stop_expected_for_exit(tracker: &mut Tracker, expected_id: i64) -> Cmd<()> {
     if snapshot(tracker)?.active.as_ref().map(|entry| entry.id) != Some(expected_id) {
         return Err("Pomiar zmienił się podczas potwierdzania. Sprawdź aktualny stan i spróbuj ponownie.".into());
@@ -1305,6 +1334,17 @@ fn main() {
                             {
                                 let app = app.clone();
                                 std::thread::spawn(move || match active {
+                                    Ok(Some(entry)) if entry.uncertain && !entry.recovered => {
+                                        let shared = app.state::<Shared>();
+                                        let released = match shared.lock() {
+                                            Ok(mut tracker) => release_unverifiable_timer(&mut tracker, entry.id, Utc::now(), power_sample()),
+                                            Err(_) => Err("Nie można odczytać pomiaru.".into()),
+                                        };
+                                        match released {
+                                            Ok(()) => show_start_error("Nie można wiarygodnie ustalić czasu pomiaru (uśpienie komputera lub zmiana zegara). Rozlicz go w oknie aplikacji przed zakończeniem.\n\nAplikacja pozostaje otwarta."),
+                                            Err(err) => show_start_error(&format!("{err}\n\nAplikacja pozostaje otwarta.")),
+                                        }
+                                    }
                                     Ok(Some(entry)) if !entry.recovered => {
                                         if !confirm_stop_and_exit() { return; }
                                         let shared = app.state::<Shared>();
@@ -2457,6 +2497,30 @@ mod tests {
         let pending=pending_sleep(&tracker.db).unwrap();
         assert_eq!(pending.len(),1);
         assert_eq!(pending[0].entry_id,2);
+    }
+
+    #[test]
+    fn tray_exit_hands_unverifiable_timer_to_recovery_without_stopping_it() {
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        let current = DateTime::parse_from_rfc3339("2026-01-01T13:00:00Z").unwrap().with_timezone(&Utc);
+        let power = || Ok(PowerSample { total_ms: 11_800_000, awake_ms: 8_200_000 });
+        for closed in [true, false] {
+            let mut db = Connection::open_in_memory().unwrap();
+            initialise(&mut db).unwrap();
+            db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P'); INSERT INTO time_entries(id,project_id,started_at) VALUES(1,1,'2026-01-01T10:00:00Z');").unwrap();
+            let period = sleep_periods::record_suspend(&mut db, 1, start + 3_600_000).unwrap();
+            // A manual wake time 10 s away from the counters cannot be verified.
+            if closed { sleep_periods::record_resume_manual(&mut db, 1, period, start + 7_210_000, start + 10_800_000).unwrap(); }
+            let clock = RunningClock { since: Instant::now(), power: PowerSample { total_ms: 1_000_000, awake_ms: 1_000_000 } };
+            let mut tracker = Tracker { db, running_since: Some(clock), restored: false };
+            assert!(release_unverifiable_timer(&mut tracker, 2, current, power()).is_err());
+            assert!(tracker.running_since.is_some());
+            release_unverifiable_timer(&mut tracker, 1, current, power()).unwrap();
+            // Closed periods: manual recovery form. Open period: SleepPending supplies the wake time.
+            assert_eq!(tracker.running_since.is_none(), closed);
+            assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            assert_eq!(sleep_periods::list_for_entry(&tracker.db, 1).unwrap()[0].decision, "pending");
+        }
     }
 
     #[test]

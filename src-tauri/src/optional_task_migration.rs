@@ -40,11 +40,12 @@ fn transition_with_power(tracker: &mut crate::Tracker, expected: Option<i64>, at
         let seconds = match projection {
             Some(value) => value.seconds,
             None => {
-                let version: i64 = tx.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(crate::db_err)?;
-                let has_sleep = version >= 12 && !crate::sleep_periods::list_for_entry(&tx,id).map_err(crate::db_err)?.is_empty();
+                // Keep the clock only while an open sleep period can still be
+                // completed; otherwise hand over to manual recovery (B1).
+                let keep = crate::keeps_clock_for_open_sleep(&tx,id)?;
                 drop(tx);
-                if !has_sleep { tracker.running_since=None; }
-                return Err("Nie można bezpiecznie ustalić czasu. Pomiar nie został zakończony; sprawdź okresy uśpienia i zegar.".into());
+                if !keep { tracker.running_since=None; }
+                return Err(crate::unverifiable_timer_message(keep).into());
             }
         };
         if end>start {
@@ -459,4 +460,72 @@ mod tests {
         assert_eq!(pending[0].decision, "pending");
     }
 
+
+    // B1 regression: a closed sleep period that cannot be matched to the
+    // power counters must not leave the running timer permanently blocked.
+    fn running_with_sleep(resume: impl FnOnce(&mut Connection, i64, i64)) -> (crate::Tracker, i64) {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');
+            INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        let period = crate::sleep_periods::record_suspend(&mut db, 41, start + 3_600_000).unwrap();
+        resume(&mut db, period, start);
+        let clock = crate::RunningClock {
+            since: Instant::now(),
+            power: crate::PowerSample { total_ms: 1_000_000, awake_ms: 1_000_000 },
+        };
+        (crate::Tracker { db, running_since: Some(clock), restored: false }, period)
+    }
+
+    fn recover_and_check(tracker: &mut crate::Tracker, period: i64, expected_seconds: i64) {
+        let now = DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
+        crate::resolve_recovered(tracker, "2026-01-01T13:00:00Z", now).unwrap();
+        let snapshot = crate::snapshot(tracker).unwrap();
+        assert!(snapshot.active.is_none());
+        assert_eq!(snapshot.entries[0].id, 41);
+        assert_eq!(snapshot.entries[0].duration_seconds, expected_seconds);
+        let periods = crate::sleep_periods::list_for_entry(&tracker.db, 41).unwrap();
+        assert_eq!((periods.len(), periods[0].id, periods[0].decision.as_str()), (1, period, "pending"));
+    }
+
+    #[test]
+    fn manual_wake_time_outside_tolerance_moves_running_timer_to_recovery() {
+        // Counters report 3 600 s of sleep; the manually supplied wake time adds 10 s.
+        let (mut tracker, period) = running_with_sleep(|db, period, start| {
+            crate::sleep_periods::record_resume_manual(db, 41, period, start + 7_210_000, start + 10_800_000).unwrap();
+        });
+        let power = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 8_200_000 });
+        let error = transition_with_power(&mut tracker, Some(41), "2026-01-01T13:00:00Z", TimerAction::Stop, power).unwrap_err();
+        assert!(error.contains("faktyczny czas zakończenia"), "{error}");
+        assert!(tracker.running_since.is_none());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE id=41 AND ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let active = crate::snapshot(&tracker).unwrap().active.unwrap();
+        assert!(active.recovered && active.has_sleep);
+        recover_and_check(&mut tracker, period, 7_190);
+    }
+
+    #[test]
+    fn clock_change_with_recorded_sleep_moves_running_timer_to_recovery() {
+        let (mut tracker, period) = running_with_sleep(|db, period, start| {
+            crate::sleep_periods::record_resume(db, 41, period, start + 7_200_000).unwrap();
+        });
+        // The wall clock moved forward 5 s relative to the monotonic counter.
+        let power = Ok(crate::PowerSample { total_ms: 11_795_000, awake_ms: 8_195_000 });
+        assert!(transition_with_power(&mut tracker, Some(41), "2026-01-01T13:00:00Z", TimerAction::Stop, power).is_err());
+        assert!(tracker.running_since.is_none());
+        assert!(crate::snapshot(&tracker).unwrap().active.unwrap().recovered);
+        recover_and_check(&mut tracker, period, 7_200);
+    }
+
+    #[test]
+    fn open_sleep_period_keeps_clock_and_points_to_wake_time() {
+        let (mut tracker, _) = running_with_sleep(|_, _, _| {});
+        let power = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 8_200_000 });
+        let error = transition_with_power(&mut tracker, Some(41), "2026-01-01T13:00:00Z", TimerAction::Stop, power).unwrap_err();
+        assert!(error.contains("czas wybudzenia"), "{error}");
+        assert!(tracker.running_since.is_some());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
 }
