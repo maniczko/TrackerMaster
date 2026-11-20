@@ -60,7 +60,7 @@ fn validate_database(db: &Connection) -> Result<()> {
         return Err(invalid());
     }
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if !(0..=11).contains(&version) {
+    if !(0..=crate::LATEST_SCHEMA_VERSION).contains(&version) {
         return Err(invalid());
     }
 
@@ -90,6 +90,7 @@ fn validate_database(db: &Connection) -> Result<()> {
     if version >= 9 { crate::validate_task_archives_schema(db)?; }
     if version >= 10 { crate::validate_description_schema(db)?; }
     if version >= 11 { crate::optional_task_migration::validate(db)?; crate::validate_project_timer_activity(db)?; }
+    if version >= 12 { crate::sleep_periods::validate(db)?; }
     // A PRAGMA integrity_check does not detect broken relationships, and
     // stored data may have been written with foreign_keys disabled.
     for (table, from, target, to) in [
@@ -414,7 +415,7 @@ mod tests {
         source.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO time_entries(id,task_id,project_id,started_at,ended_at,duration_seconds) VALUES(41,NULL,1,'2026-01-01T09:00:00Z','2026-01-01T10:00:00Z',3600); INSERT INTO entry_descriptions VALUES(41,'Opis'); INSERT INTO billable_entries VALUES(41);").unwrap();
         let backup=create_backup(&source,&dir).unwrap();
         let prepared=prepare_restore(&backup).unwrap();
-        assert_eq!((prepared.health.schema_version,prepared.health.completed_entries),(11,1));
+        assert_eq!((prepared.health.schema_version,prepared.health.completed_entries),(crate::LATEST_SCHEMA_VERSION,1));
         let mut destination=Connection::open(&dest_path).unwrap();
         crate::initialise(&mut destination).unwrap();
         restore_prepared(&mut destination,&prepared,&dir).unwrap();
@@ -435,7 +436,7 @@ mod tests {
         assert!(prepare_restore(&invalid_path).is_err());
         let mut source = Connection::open(&source_path).unwrap();
         crate::initialise_v10(&mut source).unwrap();
-        source.pragma_update(None, "user_version", 12).unwrap();
+        source.pragma_update(None, "user_version", crate::LATEST_SCHEMA_VERSION + 1).unwrap();
         assert!(prepare_restore(&source_path).is_err());
         source.pragma_update(None, "user_version", 10).unwrap();
         let prepared = prepare_restore(&source_path).unwrap();
@@ -455,7 +456,7 @@ mod tests {
         crate::initialise_v10(&mut source).unwrap();
         source.execute_batch("INSERT INTO clients VALUES(1,'Legacy'); DROP TABLE description_revisions; DROP TABLE entry_descriptions; DROP TABLE task_archives; DROP TABLE billing_revisions; DROP TABLE billable_entries; DROP TABLE billable_projects; DROP TABLE client_archives; DROP TABLE app_settings; DROP TABLE entry_deletions; DROP TABLE entry_revisions; PRAGMA user_version=3;").unwrap();
         let prepared = prepare_restore(&path).unwrap();
-        assert_eq!((prepared.health.schema_version, prepared.health.clients), (11, 1));
+        assert_eq!((prepared.health.schema_version, prepared.health.clients), (crate::LATEST_SCHEMA_VERSION, 1));
         assert_eq!(source.pragma_query_value(None, "user_version", |r| r.get::<_,i64>(0)).unwrap(), 3);
         assert!(!source.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entry_revisions')", [], |r| r.get::<_,bool>(0)).unwrap());
     }
@@ -629,6 +630,48 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         assert!(create_backup(&db, &dir).is_err());
         assert!(!dir.join("backups").exists());
+    }
+
+    #[test]
+    fn v11_backup_migration_and_restore_preserve_pending_sleep() {
+        let source_path=test_path("sleep-source");
+        let dest_path=test_path("sleep-dest");
+        let _source_cleanup=Cleanup(source_path.clone());
+        let _dest_cleanup=Cleanup(dest_path.clone());
+        let dir=dest_path.with_extension("dir");
+        let mut source=Connection::open(&source_path).unwrap();
+        crate::initialise_v10(&mut source).unwrap();
+        crate::optional_task_migration::migrate(&mut source).unwrap();
+        source.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        crate::initialise_with_backup(&mut source,&dir,true).unwrap();
+        let backups:Vec<_>=std::fs::read_dir(dir.join("backups")).unwrap().map(|entry|entry.unwrap().path()).collect();
+        assert_eq!(backups.len(),1);
+        let before=Connection::open_with_flags(&backups[0],OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(before.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),11);
+        assert_eq!(before.query_row("SELECT COUNT(*) FROM time_entries WHERE id=41",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(source.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),crate::LATEST_SCHEMA_VERSION);
+        let start=chrono::DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().timestamp_millis();
+        let id=crate::sleep_periods::record_suspend(&mut source,41,start).unwrap();
+        crate::sleep_periods::record_resume(&mut source,41,id,start+7200000).unwrap();
+        let backup=create_backup(&source,&dir).unwrap();
+        let prepared=prepare_restore(&backup).unwrap();
+        let mut dest=Connection::open(&dest_path).unwrap();
+        crate::initialise(&mut dest).unwrap();
+        restore_prepared(&mut dest,&prepared,&dir).unwrap();
+        let periods=crate::sleep_periods::list_for_entry(&dest,41).unwrap();
+        assert_eq!((periods.len(),periods[0].started_ms,periods[0].ended_ms,periods[0].decision.as_str()),(1,start,Some(start+7200000),"pending"));
+        validate_database(&dest).unwrap();
+    }
+
+    #[test]
+    fn backup_with_tampered_sleep_schema_is_refused() {
+        let path=test_path("sleep-tampered");
+        let _cleanup=Cleanup(path.clone());
+        let mut db=Connection::open(&path).unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("DROP TRIGGER sleep_periods_no_delete;").unwrap();
+        drop(db);
+        assert!(prepare_restore(&path).is_err());
     }
 }
 
