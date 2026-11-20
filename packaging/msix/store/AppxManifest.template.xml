@@ -3,8 +3,9 @@
          xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
          xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
          xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
          xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
-         IgnorableNamespaces="uap uap10 rescap virtualization">
+         IgnorableNamespaces="uap uap10 rescap desktop6 virtualization">
   <!-- TEST-ONLY identity: the workflow substitutes exact Partner Center fields for Store candidates. -->
   <Identity Name="TrackerMaster.TestOnly"
             Publisher="CN=TrackerMaster-TestOnly, OID.2.25.311729368913984317654407730594956997722=1"
@@ -13,6 +14,8 @@
     <DisplayName>TrackerMaster</DisplayName>
     <PublisherDisplayName>TrackerMaster Test</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
+    <!-- Windows 10 fallback: persist AppData; Windows 11 uses the narrower exclusion below. -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
     <!-- Keep the isolated SQLite profile outside uninstall-cleaned MSIX virtualization. -->
     <virtualization:FileSystemWriteVirtualization>
       <virtualization:ExcludedDirectories>
