@@ -1,0 +1,96 @@
+name: TrackerMaster private Store MSIX
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-msix-store.yml'
+      - 'packaging/msix/store/**'
+      - 'src-tauri/tauri.store-test.conf.json'
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Exact Package/Identity/Name from Partner Center'
+        required: true
+        type: string
+      publisher:
+        description: 'Exact Package/Identity/Publisher (CN=...) from Partner Center'
+        required: true
+        type: string
+      publisher_display_name:
+        description: 'Exact PublisherDisplayName from Partner Center'
+        required: true
+        type: string
+      package_version:
+        description: 'Four-part Store version (fourth field must be 0)'
+        required: true
+        type: string
+        default: '0.1.0.0'
+
+permissions:
+  contents: read
+
+jobs:
+  msix:
+    name: Build isolated unsigned MSIX (not published)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject tracked SQLite customer data
+        shell: pwsh
+        run: |
+          $databaseFiles = @(git ls-files | Where-Object { $_ -match '(?i)\.(?:db|sqlite3?)(?:-(?:wal|shm|journal)|\.partial)?$' })
+          if ($databaseFiles.Count -gt 0) {
+            $databaseFiles | ForEach-Object { Write-Host "Tracked database file: $_" }
+            throw 'Refusing to build a commit containing SQLite database files.'
+          }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build isolated Tauri executable
+        env:
+          VITE_TRACKER_TEST_MODE: '1'
+        run: npm run tauri -- build --no-bundle --config src-tauri/tauri.store-test.conf.json
+      - name: Package and validate unsigned MSIX
+        shell: pwsh
+        env:
+          STORE_PACKAGE_NAME: ${{ inputs.package_name }}
+          STORE_PUBLISHER: ${{ inputs.publisher }}
+          STORE_PUBLISHER_DISPLAY_NAME: ${{ inputs.publisher_display_name }}
+          STORE_VERSION: ${{ inputs.package_version }}
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $pkgName = $env:STORE_PACKAGE_NAME
+            $publisher = $env:STORE_PUBLISHER
+            $publisherDisplayName = $env:STORE_PUBLISHER_DISPLAY_NAME
+            $version = $env:STORE_VERSION
+            if ([string]::IsNullOrWhiteSpace($pkgName) -or
+                [string]::IsNullOrWhiteSpace($publisher) -or
+                [string]::IsNullOrWhiteSpace($publisherDisplayName)) {
+              throw 'Provide all three exact Product Identity values from Partner Center.'
+            }
+          } else {
+            # Test-only identity: never use the pull-request artifact for Partner Center.
+            $pkgName = 'TrackerMaster.TestOnly'
+            $publisher = 'CN=TrackerMaster-TestOnly, OID.2.25.311729368913984317654407730594956997722=1'
+            $publisherDisplayName = 'TrackerMaster Test'
+            $version = '0.1.0.0'
+          }
+          & ./packaging/msix/store/New-PrivateStoreMsix.ps1 `
+            -Executable ./src-tauri/target/release/tracker-master.exe `
+            -Output ./dist/TrackerMaster-private-store-candidate-x64.msix `
+            -PackageName $pkgName -Publisher $publisher `
+            -PublisherDisplayName $publisherDisplayName -Version $version
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+            throw "MSIX packaging failed with exit code $LASTEXITCODE"
+          }
+      - name: Upload unsigned MSIX for owner review
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackerMaster-isolated-MSIX-${{ github.event_name }}
+          path: dist/TrackerMaster-private-store-candidate-x64.msix
+          if-no-files-found: error
+          retention-days: 7
