@@ -46,7 +46,7 @@ test('all quick presets survive a restart without freezing the date range', () =
     const restored = readReportFilter(storage).filter;
     if (!restored || restored.kind === 'custom') throw new Error(`Relative preset ${kind} was not restored`);
     // A stored selection persists, but dates must be computed at the current instant.
-    const before = reportPresetRange(restored.kind, Date.parse('2026-11-30T12:00:00Z'), 'Europe/Warsaw');
+    const before = reportPresetRange(restored.kind, Date.parse('2026-11-29T12:00:00Z'), 'Europe/Warsaw');
     const after = reportPresetRange(restored.kind, Date.parse('2026-12-01T12:00:00Z'), 'Europe/Warsaw');
     assert.notDeepEqual(before, after, `Preset ${kind} must follow the local calendar`);
   }
