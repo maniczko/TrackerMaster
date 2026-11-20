@@ -37,6 +37,17 @@ textarea:focus{outline:2px solid var(--tm-focus);outline-offset:1px}
 .entry-draft-panel h3,.entry-draft-panel h4,.entry-draft-dialog h3{margin:0}
 .entry-draft-panel .actions,.entry-draft-dialog .actions{flex-wrap:wrap;align-items:center;margin-top:12px}
 .entry-draft-panel .selectors,.entry-draft-review{margin:14px 0}
+.timer .clock-caption{color:#526d66;font-size:12px}
+.timer .selectors label,.timer-description,.timer .actions button{font-size:14px}
+.timer .selectors select,.timer-description input{font-size:14px;text-overflow:ellipsis}
+.timer-description{display:block;margin-top:12px;color:var(--tm-ink)}
+.timer-description input{margin-top:8px}
+.timer-description input::placeholder{color:#526d66}
+.timer-stop{margin:0 0 16px}
+.timer-start{margin-top:14px}
+.timer-start button{flex:1}
+.timer-settings{margin-top:14px;padding-top:12px;border-top:1px solid #e3eeea}
+.timer button:focus-visible,.timer select:focus-visible,.timer input:focus-visible,.timer summary:focus-visible{outline:2px solid var(--tm-primary);outline-offset:3px}
 .entry-draft-panel textarea{margin-top:6px;width:100%;resize:vertical}
 .entry-draft-sort{display:grid;gap:6px;max-width:230px;margin:12px 0}
 .entry-draft-list{list-style:none;padding:0;margin:0}
