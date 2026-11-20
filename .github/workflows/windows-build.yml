@@ -32,7 +32,7 @@ jobs:
       - name: Check frontend
         run: npm run build
       - name: Check report calculations
-        run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts tests/reportPresets.test.ts tests/reportFilterStorage.test.ts tests/reportCsv.test.ts tests/localDateTime.test.ts tests/sleepPeriods.test.mjs tests/sleepTime.test.ts tests/entryDraft.test.ts tests/clientLabels.test.ts
+        run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts tests/reportPresets.test.ts tests/reportFilterStorage.test.ts tests/reportCsv.test.ts tests/localDateTime.test.ts tests/sleepPeriods.test.mjs tests/sleepTime.test.ts tests/entryDraft.test.ts tests/clientLabels.test.ts tests/reportRefresh.test.mjs
       - name: Run Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build Windows executable
