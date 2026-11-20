@@ -91,6 +91,7 @@ fn validate_database(db: &Connection) -> Result<()> {
     if version >= 10 { crate::validate_description_schema(db)?; }
     if version >= 11 { crate::optional_task_migration::validate(db)?; crate::validate_project_timer_activity(db)?; }
     if version >= 12 { crate::sleep_periods::validate(db)?; }
+    if version >= 13 { crate::entry_drafts::validate_resolution_schema(db)?; }
     // A PRAGMA integrity_check does not detect broken relationships, and
     // stored data may have been written with foreign_keys disabled.
     for (table, from, target, to) in [

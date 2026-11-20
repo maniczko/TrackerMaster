@@ -3,6 +3,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
 import SleepPending from './SleepPending';
+import EntryDraftEditor from './EntryDraftEditor';
+import type { EntryDraftEditorHandle } from './EntryDraftEditor';
+import { parseLocalDate } from './localDateTime';
+import { clientLabels } from './clientLabels';
 
 type Id = number | string;
 type Client = { id: Id; name: string; archived: boolean };
@@ -13,6 +17,7 @@ type DeletedEntry = { id: Id; task_id: Id | null; project_id: Id; started_at: st
 type Revision = { id: Id; changed_at: string; before_start: string; before_end: string; before_seconds: number; after_start: string; after_end: string; after_seconds: number };
 type BillingRevision = { id: Id; changed_at: string; before_billable: boolean; after_billable: boolean };
 type DescriptionRevision = { id: Id; changed_at: string; before_description: string; after_description: string };
+type DraftOrigin = { sourceEntryId: Id; createdAt: string };
 type DatabaseHealth = { schema_version: number; clients: number; projects: number; tasks: number; completed_entries: number; open_entries: number };
 type RestorePreview = { token: string; health: DatabaseHealth };
 export type Snapshot = { clients: Client[]; projects: Project[]; tasks: Task[]; active: Entry | null; entries: Entry[] };
@@ -27,31 +32,9 @@ const formatDate = (value: string | null) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'short' });
 };
-const localInputValue = (value: string) => {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-};
 const formatPreciseDate = (value: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'medium' });
-};
-const parseLocalDate = (value: string) => {
-  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
-  if (!parts) return null;
-  const date = new Date(value);
-  const expected = parts.slice(1).map(part => Number(part || 0));
-  const actual = [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()];
-  if (Number.isNaN(date.getTime()) || actual.some((part, index) => part !== expected[index])) return null;
-  // A repeated local time at the end of daylight saving does not identify one instant.
-  for (let minutes = -180; minutes <= 180; minutes++) {
-    if (minutes === 0) continue;
-    const other = new Date(date.getTime() + minutes * 60_000);
-    const components = [other.getFullYear(), other.getMonth() + 1, other.getDate(), other.getHours(), other.getMinutes(), other.getSeconds()];
-    if (components.every((part, index) => part === expected[index])) return null;
-  }
-  return date;
 };
 
 export default function App() {
@@ -71,7 +54,6 @@ export default function App() {
   const [timerDescription, setTimerDescription] = useState('');
   const [manualDescription, setManualDescription] = useState('');
   const [describe, setDescribe] = useState<{ id: Id; expected: string; value: string } | null>(null);
-  const [editing, setEditing] = useState<{ id: Id; expectedStart: string; expectedEnd: string; start: string; end: string } | null>(null);
   const [deleting, setDeleting] = useState<Entry | null>(null);
   const [deleted, setDeleted] = useState<DeletedEntry[] | null>(null);
   const [lastBackup, setLastBackup] = useState('');
@@ -80,13 +62,15 @@ export default function App() {
   const [restorePreview, setRestorePreview] = useState<RestorePreview | null>(null);
   const [restoreConfirmed, setRestoreConfirmed] = useState(false);
   const [restoreDone, setRestoreDone] = useState('');
-  const [revisions, setRevisions] = useState<{ entryId: Id; items: Revision[]; billing: BillingRevision[]; descriptions: DescriptionRevision[] } | null>(null);
+  const [revisions, setRevisions] = useState<{ entryId: Id; items: Revision[]; billing: BillingRevision[]; descriptions: DescriptionRevision[]; origin: DraftOrigin | null; reveal: boolean } | null>(null);
   const revisionsRequest = useRef(0);
-  const historyRef = useRef<HTMLElement>(null);
+  const revisionSection = useRef<HTMLElement>(null);
+  const entryEditor = useRef<EntryDraftEditorHandle>(null);
   const descriptionRef = useRef<HTMLElement>(null);
   const [loaded, setLoaded] = useState(false);
   const [now, setNow] = useState(Date.now());
   useEffect(() => { if (describe) descriptionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [describe?.id]);
+  useEffect(() => { if (revisions?.reveal) revisionSection.current?.scrollIntoView({ block: 'start' }); }, [revisions]);
   const refresh = useCallback(async () => {
     try {
       const next = await invoke<Snapshot>('get_snapshot');
@@ -108,6 +92,7 @@ export default function App() {
   const projects = data.projects.filter(p => same(p.client_id, clientId) && (showArchived || !p.archived));
   const selectedProject = data.projects.find(p => same(p.id, projectId));
   const selectedClient = data.clients.find(c => same(c.id, clientId));
+  const clientLabelById = useMemo(() => clientLabels(data.clients), [data.clients]);
   const selectedTask = data.tasks.find(t => same(t.id, taskId));
   const tasks = data.tasks.filter(t => same(t.project_id, projectId) && (showArchived || !t.archived));
   const activeTask = data.tasks.find(t => same(t.id, data.active?.task_id));
@@ -136,11 +121,17 @@ export default function App() {
     catch (e) { setError(`Nie udało się odczytać danych: ${String(e)}`); }
     finally { setBusy(false); }
   }
-  async function showRevisions(entryId: Id) {
+  async function showRevisions(entryId: Id, reveal = false) {
     const request = ++revisionsRequest.current;
     try {
-      const [items, billing, descriptions] = await Promise.all([invoke<Revision[]>('entry_revisions', { entryId: Number(entryId) }), invoke<BillingRevision[]>('billing_revisions', { entryId: Number(entryId) }), invoke<DescriptionRevision[]>('description_revisions', { entryId: Number(entryId) })]);
-      if (request === revisionsRequest.current) setRevisions({ entryId, items, billing, descriptions });
+      const args = { entryId: Number(entryId) };
+      const [items, billing, descriptions, origin] = await Promise.all([
+        invoke<Revision[]>('entry_revisions', args),
+        invoke<BillingRevision[]>('billing_revisions', args),
+        invoke<DescriptionRevision[]>('description_revisions', args),
+        invoke<DraftOrigin | null>('get_entry_draft_origin', args),
+      ]);
+      if (request === revisionsRequest.current) setRevisions({ entryId, items, billing, descriptions, origin, reveal });
     } catch (e) { if (request === revisionsRequest.current) setError(`Nie udało się odczytać historii zmian: ${String(e)}`); }
   }
   async function loadDeleted() {
@@ -160,6 +151,10 @@ export default function App() {
   }
   async function applyRestore() {
     if (!restorePreview || !restoreConfirmed) return;
+    if (entryEditor.current?.hasUnsavedChanges()) {
+      setError('Zapisz lub zachowaj szkic edycji przed przywróceniem kopii.');
+      return;
+    }
     setBusy(true); setError(''); setNotice('');
     try {
       const safetyPath = await invoke<string>('apply_backup_restore', { token: restorePreview.token, confirmed: true });
@@ -203,9 +198,9 @@ export default function App() {
         <section className="timer card" aria-label="Pomiar czasu">
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered && !data.active.uncertain ? 'running' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered || data.active?.uncertain ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
           <div className="clock" aria-live="off">{!loaded || data.active?.recovered || data.active?.uncertain ? '—:—:—' : formatDuration(displayElapsed)}</div><p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered || data.active?.uncertain ? 'Pomiar wymaga weryfikacji' : data.active ? 'Czas na ekranie jest orientacyjny' : 'Wybierz klienta i projekt, aby rozpocząć'}</p>
-          {loaded && data.active && <div className="active-info"><span>AKTYWNY POMIAR</span><strong>{data.active.task_id === null ? 'Bez zadania' : activeTask?.name || 'Nieznane zadanie'}</strong><small>{activeClient?.name || '—'} / {activeProject?.name || '—'}</small><small>{data.active.description || 'Bez opisu'}</small><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe({ id: data.active!.id, expected: data.active!.description, value: data.active!.description })}>Zmień opis</button></div>}
+          {loaded && data.active && <div className="active-info"><span>AKTYWNY POMIAR</span><strong>{data.active.task_id === null ? 'Bez zadania' : activeTask?.name || 'Nieznane zadanie'}</strong><small>{activeClient ? clientLabelById.get(String(activeClient.id)) : '—'} /{activeProject?.name || '—'}</small><small>{data.active.description || 'Bez opisu'}</small><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe({ id: data.active!.id, expected: data.active!.description, value: data.active!.description })}>Zmień opis</button></div>}
           <div className="selectors">
-            <label>Klient<select value={clientId} disabled={busy || !loaded} onChange={e => { setClientId(e.target.value); setProjectId(''); setTaskId(''); }}><option value="">Wybierz klienta</option>{data.clients.filter(c => showArchived || !c.archived).map(c => <option key={c.id} value={c.id}>{c.name}{c.archived ? ' (archiwum)' : ''}</option>)}</select></label>
+            <label>Klient<select title={selectedClient ? clientLabelById.get(String(selectedClient.id)) : undefined} value={clientId}disabled={busy || !loaded} onChange={e => { setClientId(e.target.value); setProjectId(''); setTaskId(''); }}><option value="">Wybierz klienta</option>{data.clients.filter(c => showArchived || !c.archived).map(c => <option key={c.id} value={c.id}>{clientLabelById.get(String(c.id))}{c.archived ? ' (archiwum)' : ''}</option>)}</select></label>
             <label>Projekt<select value={projectId} disabled={busy || !loaded || !clientId} onChange={e => { setProjectId(e.target.value); setTaskId(''); }}><option value="">Wybierz projekt</option>{projects.map(p => <option key={p.id} value={p.id}>{p.name}{p.archived ? ' (archiwum)' : ''}</option>)}</select></label>
             <label>Zadanie<select value={taskId} disabled={busy || !loaded || !projectId} onChange={e => setTaskId(e.target.value)}><option value="">Bez zadania</option>{tasks.map(t => <option key={t.id} value={t.id}>{t.name}{t.archived ? ' (archiwum)' : ''}</option>)}</select></label>
           </div>
@@ -228,8 +223,8 @@ export default function App() {
         </aside>
       </div>
       {describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
-      <Report clients={data.clients} projects={data.projects} loaded={loaded} onEditEntry={entry => { setEditing({ id: entry.id, expectedStart: entry.started_at, expectedEnd: entry.ended_at, start: localInputValue(entry.started_at), end: localInputValue(entry.ended_at) }); historyRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }} />
-      <section ref={historyRef} className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
+      <Report clients={data.clients} projects={data.projects} loaded={loaded} onEditEntry={entry => entryEditor.current?.openEntry(Number(entry.id), 'start')} />
+      <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
         <p className="muted">Pomiary zapisane przed dodaniem rozliczalności mają domyślnie status nierozliczalny. Możesz go zmienić dla każdego wpisu.</p>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta i projekt powyżej; zadanie jest opcjonalne. Podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
           <form onSubmit={e => { e.preventDefault(); const start = parseLocalDate(manualStart); const end = parseLocalDate(manualEnd); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('create_project_manual_entry', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, startedAt: start.toISOString(), endedAt: end.toISOString(), description: manualDescription }); setManualStart(''); setManualEnd(''); setManualDescription(''); }, 'Wpis czasu został dodany.'); }}>
@@ -238,15 +233,18 @@ export default function App() {
             <button className="secondary" type="submit" disabled={busy || !loaded || !projectId || !!selectedClient?.archived || !!selectedProject?.archived || !!selectedTask?.archived || !manualStart || !manualEnd}>Dodaj wpis</button>
           </form>
         </details>
-        {editing && <form aria-label="Korekta wpisu" onSubmit={e => { e.preventDefault(); const start = parseLocalDate(editing.start); const end = parseLocalDate(editing.end); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('edit_time_entry', { entryId: Number(editing.id), expectedStart: editing.expectedStart, expectedEnd: editing.expectedEnd, startedAt: start.toISOString(), endedAt: end.toISOString() }); setEditing(null); if (revisions && same(revisions.entryId, editing.id)) await showRevisions(editing.id); }, 'Korekta została zapisana.'); }}>
-          <h3>Korekta wpisu</h3><p className="muted">Podaj godziny w strefie czasowej komputera. Poprzednie wartości pozostaną w historii zmian.</p>
-          <div className="selectors"><label>Rozpoczęcie<input type="datetime-local" step="1" required value={editing.start} onChange={e => setEditing({ ...editing, start: e.target.value })} /></label><label>Zakończenie<input type="datetime-local" step="1" required value={editing.end} onChange={e => setEditing({ ...editing, end: e.target.value })} /></label></div>
-          <button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz korektę</button>{' '}<button className="secondary" type="button" onClick={() => setEditing(null)}>Anuluj</button>
-        </form>}
-        {deleting && <div className="alert error" role="alert"><strong>Usunąć wpis #{deleting.id}?</strong> {formatPreciseDate(deleting.started_at)} – {deleting.ended_at && formatPreciseDate(deleting.ended_at)}. Nie będzie uwzględniany w zestawieniach; informacja o usunięciu pozostanie w historii. <button type="button" disabled={busy || !loaded} onClick={() => void execute(async () => { await invoke('delete_time_entry', { entryId: Number(deleting.id), expectedStart: deleting.started_at, expectedEnd: deleting.ended_at }); setDeleting(null); if (editing && same(editing.id, deleting.id)) setEditing(null); if (deleted) await loadDeleted(); }, 'Wpis został usunięty z zestawień.')}>Potwierdź usunięcie</button>{' '}<button type="button" disabled={busy} onClick={() => setDeleting(null)}>Anuluj</button></div>}
-        {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : <div className="table-wrap"><table><thead><tr><th>Zadanie</th><th>Klient / projekt</th><th>Rozpoczęcie</th><th>Zakończenie</th><th>Czas</th><th>Operacje</th></tr></thead><tbody>{entries.map(e => { const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, e.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id)); return <tr key={e.id}><td><strong>{e.task_id === null ? 'Bez zadania' : t?.name || 'Nieznane zadanie'}</strong>{e.description && <small className="entry-description">{e.description}</small>}</td><td>{c?.name || '—'} / {p?.name || '—'}</td><td>{formatDate(e.started_at)}</td><td>{formatDate(e.ended_at)}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td><td className="duration">{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td><td><button type="button" className="secondary" disabled={busy || !loaded || !!data.active?.recovered} aria-label={`Wznów: ${t?.name || 'zadanie'}`} onClick={() => void execute(() => invoke('resume_entry', { sourceId: Number(e.id), expectedActiveId: data.active ? Number(data.active.id) : null }), 'Pomiar wznowiony.')}>Wznów</button>{' '}<button type="button" className="secondary" disabled={busy || !loaded} aria-label={`Zmień opis: ${t?.name || 'zadanie'}`} onClick={() => setDescribe({ id: e.id, expected: e.description, value: e.description })}>Opis</button>{' '}<button type="button" className="secondary" disabled={busy || !loaded} aria-label={`${e.billable ? 'Oznacz jako nierozliczalny' : 'Oznacz jako rozliczalny'}: ${t?.name || 'zadanie'}`} onClick={() => void execute(() => invoke('set_entry_billable', { entryId: Number(e.id), expected: e.billable, billable: !e.billable }), 'Zapisano rozliczalność wpisu.')}>{e.billable ? 'Rozliczalny' : 'Nierozliczalny'}</button>{' '}<button type="button" className="secondary" disabled={busy || !e.ended_at} aria-label={`Popraw wpis: ${t?.name || 'zadanie'}`} onClick={() => e.ended_at && setEditing({ id: e.id, expectedStart: e.started_at, expectedEnd: e.ended_at, start: localInputValue(e.started_at), end: localInputValue(e.ended_at) })}>Popraw</button>{' '}<button type="button" className="secondary" aria-label={`Historia zmian: ${t?.name || 'zadanie'}`} onClick={() => void showRevisions(e.id)}>Historia zmian</button>{' '}<button type="button" className="secondary" disabled={busy || !e.ended_at} aria-label={`Usuń wpis: ${t?.name || 'zadanie'}`} onClick={() => setDeleting(e)}>Usuń</button></td></tr>; })}</tbody></table></div>}
+        <EntryDraftEditor ref={entryEditor} clients={data.clients} projects={data.projects} tasks={data.tasks}
+          enabled={loaded && !busy} onCommitted={async entryId => {
+            setNotice('Zmiany wpisu zostały zapisane.');
+            try {
+              await refresh();
+              if (revisions && same(revisions.entryId, entryId)) await showRevisions(entryId);
+            } catch { setError('Zmiany zostały zapisane. Odśwież historię, aby je zobaczyć.'); }
+          }} />
+        {deleting && <div className="alert error" role="alert"><strong>Usunąć wpis #{deleting.id}?</strong> {formatPreciseDate(deleting.started_at)} – {deleting.ended_at && formatPreciseDate(deleting.ended_at)}. Nie będzie uwzględniany w zestawieniach; informacja o usunięciu pozostanie w historii. <button type="button" disabled={busy || !loaded} onClick={() => void execute(async () => { await invoke('delete_time_entry', { entryId: Number(deleting.id), expectedStart: deleting.started_at, expectedEnd: deleting.ended_at }); setDeleting(null); if (deleted) await loadDeleted(); }, 'Wpis został usunięty z zestawień.')}>Potwierdź usunięcie</button>{' '}<button type="button" disabled={busy} onClick={() => setDeleting(null)}>Anuluj</button></div>}
+        {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : <div className="table-wrap"><table><thead><tr><th>Zadanie</th><th>Klient / projekt</th><th>Rozpoczęcie</th><th>Zakończenie</th><th>Czas</th><th>Operacje</th></tr></thead><tbody>{entries.map(e => { const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, e.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id)); return <tr key={e.id}><td><strong>{e.task_id === null ? 'Bez zadania' : t?.name || 'Nieznane zadanie'}</strong>{e.description && <small className="entry-description">{e.description}</small>}</td><td>{c ? clientLabelById.get(String(c.id)) : '—'} / {p?.name || '—'}</td><td>{formatDate(e.started_at)}</td><td>{formatDate(e.ended_at)}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td><td className="duration">{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td><td><button type="button" className="secondary" disabled={busy || !loaded || !!data.active?.recovered} aria-label={`Wznów: ${t?.name || 'zadanie'}`} onClick={() => void execute(() => invoke('resume_entry', { sourceId: Number(e.id), expectedActiveId: data.active ? Number(data.active.id) : null }), 'Pomiar wznowiony.')}>Wznów</button>{' '}<button type="button" className="secondary" disabled={busy || !loaded} aria-label={`Zmień opis: ${t?.name || 'zadanie'}`} onClick={() => entryEditor.current?.openEntry(Number(e.id), 'description')}>Opis</button>{' '}<button type="button" className="secondary" disabled={busy || !loaded} aria-label={`${e.billable ? 'Oznacz jako nierozliczalny' : 'Oznacz jako rozliczalny'}: ${t?.name || 'zadanie'}`} onClick={() => void execute(() => invoke('set_entry_billable', { entryId: Number(e.id), expected: e.billable, billable: !e.billable }), 'Zapisano rozliczalność wpisu.')}>{e.billable ? 'Rozliczalny' : 'Nierozliczalny'}</button>{' '}<button type="button" className="secondary" disabled={busy || !e.ended_at} aria-label={`Popraw wpis: ${t?.name || 'zadanie'}`} onClick={() => entryEditor.current?.openEntry(Number(e.id), 'start')}>Popraw</button>{' '}<button type="button" className="secondary" aria-label={`Historia zmian: ${t?.name || 'zadanie'}`} onClick={() => void showRevisions(e.id)}>Historia zmian</button>{' '}<button type="button" className="secondary" disabled={busy || !e.ended_at} aria-label={`Usuń wpis: ${t?.name || 'zadanie'}`} onClick={() => setDeleting(e)}>Usuń</button></td></tr>; })}</tbody></table></div>}
         <details onToggle={e => { if (e.currentTarget.open) void loadDeleted(); }}><summary>Usunięte wpisy</summary><p className="muted">Te wpisy nie są uwzględniane w aktywnej historii. Zachowano je wraz z historią zmian.</p><button type="button" className="secondary" onClick={() => void loadDeleted()}>Odśwież listę</button>{deleted === null ? <p className="muted">Odczytywanie lub brak dostępu do listy.</p> : deleted.length === 0 ? <p className="muted">Brak usuniętych wpisów.</p> : <ul>{deleted.map(entry => <li key={entry.id}><strong>{entry.task_id === null ? 'Bez zadania' : data.tasks.find(task => same(task.id, entry.task_id))?.name || 'Nieznane zadanie'}</strong> · {formatPreciseDate(entry.started_at)} – {formatPreciseDate(entry.ended_at)} · {formatDuration(entry.duration_seconds)} · usunięto {formatPreciseDate(entry.deleted_at)}{' '}<button type="button" className="secondary" onClick={() => void showRevisions(entry.id)}>Historia zmian</button></li>)}</ul>}{deleted?.length === 500 && <p className="muted">Wyświetlono ostatnie 500 usuniętych wpisów.</p>}</details>
-        {revisions && <section aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
+        {revisions && <section ref={revisionSection} aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.origin && <p>Wpis powstał z odzyskanego szkicu wpisu #{revisions.origin.sourceEntryId} · {formatPreciseDate(revisions.origin.createdAt)}</p>}{!revisions.origin && revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
       </section>
       <section className="card" aria-label="Bezpieczeństwo danych"><div className="section-top"><div><p className="section-kicker">TWOJE DANE</p><h2>Kopia zapasowa</h2></div></div><p className="muted">Utwórz lokalną kopię bazy danych, również podczas trwającego pomiaru.</p><div className="actions"><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setLastBackup(await invoke<string>('create_backup')); }, 'Kopia została utworzona i sprawdzona.')}>Utwórz kopię</button><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setDatabaseHealth(await invoke<DatabaseHealth>('diagnose_database')); }, 'Sprawdzono bazę danych.')}>Sprawdź bazę</button></div>{lastBackup && <p role="status">Kopia została zapisana: <code>{lastBackup}</code>. Zawiera dane klientów i nie jest szyfrowana.</p>}{databaseHealth && <p role="status">Baza poprawna · Klienci: {databaseHealth.clients} · Projekty: {databaseHealth.projects} · Zadania: {databaseHealth.tasks} · Zakończone wpisy: {databaseHealth.completed_entries} · Otwarte pomiary: {databaseHealth.open_entries}</p>}
         <details><summary>Przywróć kopię</summary><p className="muted">Podaj pełną ścieżkę do pliku kopii. Przed przywróceniem aplikacja sprawdzi plik i utworzy kopię obecnych danych. Zakończ aktywny pomiar.</p><label>Ścieżka do kopii <input type="text" value={restorePath} disabled={busy || !!restorePreview} onChange={e => setRestorePath(e.target.value)} placeholder="C:\\...\\kopia.sqlite3" /></label>{' '}{!restorePreview && <button className="secondary" type="button" disabled={busy || !restorePath.trim()} onClick={() => void prepareRestore()}>Sprawdź kopię</button>}
