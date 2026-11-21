@@ -71,6 +71,21 @@ jobs:
           path: src-tauri/target/release/tracker-master.exe
           if-no-files-found: error
           retention-days: 7
+      - name: Build unsigned test MSIX
+        shell: pwsh
+        run: |
+          $exe = './src-tauri/target/release/tracker-master.exe'
+          ./packaging/msix/New-TestMsix.ps1 -Executable $exe -Output ./TrackerMaster-test-x64.msix
+          ./packaging/msix/New-TestMsix.ps1 -Executable $exe -Output ./TrackerMaster-test-update-x64.msix -Version 0.1.0.1
+      - name: Save unsigned test MSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackerMaster-Windows-isolated-test-msix-unsigned
+          path: |
+            TrackerMaster-test-x64.msix
+            TrackerMaster-test-update-x64.msix
+          if-no-files-found: error
+          retention-days: 7
   windows-application:
     needs: build
     runs-on: windows-2025
@@ -94,3 +109,22 @@ jobs:
           path: test-results/ui-screenshots
           if-no-files-found: warn
           retention-days: 14
+  msix-lifecycle:
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: TrackerMaster-Windows-isolated-test-msix-unsigned
+          path: msix-lifecycle-input
+      - name: Verify packaged application and data retention
+        shell: powershell
+        run: >
+          ./packaging/msix/Test-TestMsixLifecycle.ps1
+          -InitialPackage ./msix-lifecycle-input/TrackerMaster-test-x64.msix
+          -UpdatedPackage ./msix-lifecycle-input/TrackerMaster-test-update-x64.msix
