@@ -67,6 +67,7 @@ export default function App() {
   const revisionsRequest = useRef(0);
   const revisionSection = useRef<HTMLElement>(null);
   const entryEditor = useRef<EntryDraftEditorHandle>(null);
+  const hasUnsavedReportEdit = useCallback(() => entryEditor.current?.hasUnsavedChanges() ?? false, []);
   const descriptionRef = useRef<HTMLElement>(null);
   const [loaded, setLoaded] = useState(false);
   const [reportRevision, setReportRevision] = useState(0);
@@ -241,7 +242,9 @@ export default function App() {
         </div>
       </section>
       {describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
-      <Report clients={data.clients} projects={data.projects} loaded={loaded} revision={reportRevision} onEditEntry={entry => entryEditor.current?.openEntry(Number(entry.id), 'start')} />
+      <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} hasUnsavedEdit={hasUnsavedReportEdit}
+        onEditEntry={entryId => entryEditor.current?.openEntry(entryId, 'start')}
+        onShowHistory={entryId => { void showRevisions(entryId, true); }} />
       <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
         <p className="muted">Pomiary zapisane przed dodaniem rozliczalności mają domyślnie status nierozliczalny. Możesz go zmienić dla każdego wpisu.</p>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta i projekt powyżej; zadanie jest opcjonalne. Podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>

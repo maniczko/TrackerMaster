@@ -47,6 +47,21 @@ export function spreadsheetText(value: string): string {
 const csvField = (value: string) => `"${value.replace(/"/g, '""')}"`;
 export const localTimestamp = (value: string, zone: string) => Temporal.Instant.from(value).toZonedDateTimeISO(zone).toString({ smallestUnit: 'second', timeZoneName: 'never', calendarName: 'never' });
 
+export function sameExportRows(left: readonly ExportRow[], right: readonly ExportRow[]): boolean {
+  if (left.length !== right.length) return false;
+  const expected = new Map(right.map(row => [row.source.id, row]));
+  return left.every(row => {
+    const candidate = expected.get(row.source.id);
+    if (!candidate || candidate.contribution !== row.contribution) return false;
+    expected.delete(row.source.id);
+    const a = row.source;
+    const b = candidate.source;
+    return a.client === b.client && a.project === b.project && a.task === b.task
+      && a.description === b.description && a.billable === b.billable && a.duration_seconds === b.duration_seconds
+      && a.started_at === b.started_at && a.ended_at === b.ended_at;
+  });
+}
+
 export function exportCsv(rows: ExportRow[], zone: string): string {
   const headers = ['ID wpisu', 'Klient', 'Projekt', 'Zadanie', 'Opis', 'Start', 'Koniec', 'Rozliczalność', 'Czas całkowity w sekundach', 'Czas całkowity HH:MM:SS', 'Czas w wybranym okresie w sekundach', 'Czas w wybranym okresie HH:MM:SS'];
   const lines = rows.map(({ source: e, contribution }) => [String(e.id), ...[e.client, e.project, e.task, e.description].map(spreadsheetText), localTimestamp(e.started_at, zone), localTimestamp(e.ended_at, zone), e.billable ? 'Tak' : 'Nie', String(e.duration_seconds), formatDuration(e.duration_seconds), String(contribution), formatDuration(contribution)]);
