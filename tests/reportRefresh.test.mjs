@@ -17,16 +17,22 @@ test('a confirmed draft commit invalidates the report, even if snapshot refresh 
   assert.match(app, /<Report\b[^>]*\brevision=\{reportRevision\}/);
 });
 
+// PR #8 structure (sync after #37/#34): the report request key carries the revision, and the
+// CSV preview exists only for the current view and is re-checked against its rows.
+const exporter = readFileSync(new URL('../src/ReportExport.tsx', import.meta.url), 'utf8');
+
 test('report refresh depends on revision and invalidates stale CSV previews', () => {
   assert.match(report, /revision: number/);
-  assert.match(report, /\}, \[open, loaded, refresh, revision\]\)/);
-  assert.match(report, /<ReportExport key=\{JSON\.stringify\(\[client, range\.from, range\.through, data\.time_zone, revision\]\)\}/);
+  assert.match(report, /const request = JSON\.stringify\(\[revision, refresh, reportScope\]\)/);
+  assert.match(report, /\}, \[canQuery, request, reportScope\]\)/);
+  assert.match(report, /\{view && data && <>[\s\S]*<ReportExport key=/, 'CSV preview must unmount while the new revision loads');
+  assert.match(exporter, /preview\?\.key === key && !incomplete && sameExportRows\(preview\.rows, expectedRows\)/);
 });
 
 test('a new revision does not render old report data or expose its CSV preview', () => {
-  assert.match(report, /const \[snapshot, setSnapshot\] = useState<\{ revision: number; data: Data \} \| null>\(null\)/);
-  assert.match(report, /const data = snapshot\?\.revision === revision \? snapshot\.data : null/);
-  assert.match(report, /setSnapshot\(\{ revision, data: next \}\)/);
+  assert.match(report, /const \[snapshot, setSnapshot\] = useState<\{ request: string; data: Data \} \| null>\(null\)/);
+  assert.match(report, /const data = canQuery && snapshot\?\.request === request \? snapshot\.data : null/);
+  assert.match(report, /setSnapshot\(\{ request, data: next \}\)/);
   assert.doesNotMatch(report, /setData\(/, 'unversioned data must not bypass revision validation');
 });
 

@@ -46,6 +46,38 @@ const inspectMainLayout = `(() => {
     action: box ? { text: action.textContent.trim(), top: Math.round(box.top), bottom: Math.round(box.bottom),
       left: Math.round(box.left), right: Math.round(box.right), height: Math.round(box.height) } : null };
 })()`;
+// Detailed report with the saved client filter and reporting time zone (UIQ evidence; observation only).
+async function captureReportDetail(cdp, sessionId, state) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  for (const [width, height] of [[1280, 720], [1920, 1080]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false }, sessionId);
+    try {
+      await waitFor('report ' + state + ' at ' + width + 'x' + height, () => evaluate('window.innerWidth === ' + width + ' && window.innerHeight === ' + height));
+      await delay(300);
+      const box = await evaluate(`(() => {
+        const report = document.querySelector('[aria-label="Raport czasu"]');
+        if (!report?.querySelector('.report-detail tbody tr') || !report.querySelector('.report-scope-summary li')) return null;
+        report.scrollIntoView({ block: 'start' });
+        const rect = report.getBoundingClientRect();
+        return { x: Math.max(0, rect.left + window.scrollX), y: Math.max(0, rect.top + window.scrollY),
+          width: Math.ceil(rect.width), height: Math.ceil(rect.height),
+          scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
+      })()`);
+      assert.ok(box, state + ': Detailed report with the scope summary is not visible');
+      console.log('UI_LAYOUT report-detail-' + state + ' ' + width + 'x' + height + ' ' + JSON.stringify(box));
+      assert.ok(box.scrollWidth <= box.clientWidth, 'report ' + state + ' ' + width + 'x' + height + ': the page scrolls horizontally');
+      const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true,
+        clip: { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 } }, sessionId);
+      await writeFile(join(screenshotDirectory, 'report-detail-' + state + '-' + width + 'x' + height + '.png'), Buffer.from(data, 'base64'));
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+}
 async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = true } = {}) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
@@ -194,9 +226,7 @@ async function exercisePage(data, phase) {
     element.dispatchEvent(new Event(event, { bubbles: true }));
   }
   const selected = select => select?.selectedOptions[0]?.textContent;
-  // The report on main filters by client in the frontend (no saved ReportScope yet), so select it in every window.
-  const reportClientSelector = `${report} .report-filters select`;
-  const reportClient = () => pick(reportClientSelector);
+  const reportClient = () => pick('#report-client');
   const historyRow = description => [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(description));
   const recoveryMessage = () => [...document.querySelectorAll('[role="alert"] strong')].find(node => node.textContent === 'Pomiar wymaga weryfikacji.');
   async function waitForMeasurement() {
@@ -285,25 +315,37 @@ async function exercisePage(data, phase) {
 
   await click('open report', () => textButton(report, 'Otwórz raport'));
   await until('initial report', () => pick(`${report} .report-summary`));
-  if (!restarted && !textButton(report, 'Przygotuj podgląd CSV').disabled) fail('CSV was available without choosing a client');
-  const option = [...reportClient().options].find(item => item.textContent === data.primaryClient);
-  if (!option) fail('Created client missing from the report');
-  await setValue(reportClientSelector, option.value, 'change');
-  // Fix a range around the test instant so crossing local midnight cannot hide the fixture.
-  const year = new Date().getUTCFullYear();
-  await setValue(`${report} input[type="date"]`, `${year - 1}-12-01`, 'input');
-  await setValue(`${report} input[type="date"]`, `${year + 1}-01-31`, 'input', 1);
-  await until('selected client report', () => selected(reportClient()) === data.primaryClient);
-  await click('prepare CSV', () => textButton(report, 'Przygotuj podgląd CSV'));
-  await until('client CSV preview', () => pick('.export-preview tbody')?.textContent.includes(data.primaryDescription));
-  const previewRows = pick('.export-preview tbody').rows;
-  if (previewRows.length !== 1 || previewRows[0].textContent.includes(data.secondDescription)) fail('CSV preview returned a foreign entry');
-  const contribution = previewRows[0].cells[8]?.textContent.match(/^(\d{2,}:\d{2}:\d{2}) \(\d+ s\)$/)?.[1];
-  if (!contribution) fail('Missing CSV preview duration');
-  // The client report total must match the single entry that the CSV preview exports.
-  await until('report total matches the CSV preview', () =>
-    pick(`${report} .report-summary strong`)?.textContent.trim() === contribution);
-  if (restarted) {
+  if (!restarted) {
+    if (!textButton(report, 'Przygotuj podgląd CSV').disabled) fail('CSV was available without choosing a client');
+    const option = [...reportClient().options].find(item => item.textContent === data.primaryClient);
+    if (!option) fail('Created client missing from the report');
+    await setValue('#report-client', option.value, 'change');
+    // Fix a range around the test instant so crossing local midnight cannot hide the fixture.
+    const year = new Date().getUTCFullYear();
+    await setValue(`${report} input[type="date"]`, `${year - 1}-12-01`, 'input');
+    await setValue(`${report} input[type="date"]`, `${year + 1}-01-31`, 'input', 1);
+  }
+  await until('selected client report', () => selected(reportClient()) === data.primaryClient &&
+    pick(`${report} .report-scope-summary`)?.textContent.includes(data.primaryClient));
+  await click('open detailed report', () => textButton(report, 'Szczegóły'));
+  await until('client A entry in Detailed', () => pick('.report-detail tbody')?.textContent.includes(data.primaryDescription));
+  const detailed = pick('.report-detail tbody');
+  if (detailed.rows.length !== 1 || detailed.textContent.includes(data.secondDescription)) fail('Detailed report returned a foreign entry');
+  const contribution = detailed.querySelectorAll('.duration')[1]?.textContent.trim();
+  if (!/^\d{2,}:\d{2}:\d{2}$/.test(contribution)) fail('Missing detailed duration');
+  // Kept from main: the client total must match the single exported entry (Detailed and CSV preview).
+  await click('open report summary', () => textButton(report, 'Podsumowanie'));
+  await until('report total matches Detailed', () => pick(report + ' .report-summary strong')?.textContent.trim() === contribution);
+  await click('reopen detailed report', () => textButton(report, 'Szczegóły'));
+  await until('Detailed shown again', () => pick('.report-detail tbody')?.textContent.includes(data.primaryDescription));
+  if (!restarted) {
+    await click('prepare CSV', () => textButton(report, 'Przygotuj podgląd CSV'));
+    await until('client CSV preview', () => pick('.export-preview tbody')?.textContent.includes(data.primaryDescription));
+    const previewRows = pick('.export-preview tbody').rows;
+    if (previewRows.length !== 1 || previewRows[0].textContent.includes(data.secondDescription)) fail('CSV preview returned a foreign entry');
+    const previewContribution = previewRows[0].cells[8]?.textContent.match(/^(\d{2,}:\d{2}:\d{2}) \(\d+ s\)$/)?.[1];
+    if (previewContribution !== contribution) fail('CSV preview duration differs from Detailed');
+  } else {
     const settings = '[aria-label="Skrót klawiaturowy"]';
     await setValue(`${settings} select`, 'Alt', 'change');
     await setValue(`${settings} select`, 'F11', 'change', 1);
@@ -956,27 +998,17 @@ async function verifyDuplicateClientChoices(cdp, sessionId) {
       const button = [...section.querySelectorAll('button')].find(item => item.textContent.trim() === 'Otwórz raport');
       button?.click();
     })()`);
-    // The report on main lists clients by name; duplicates stay separate options keyed by client ID.
-    const reportSelect = `document.querySelector('[aria-label="Raport czasu"] .report-filters select')`;
     await waitFor('duplicate client report selector', () => evaluate(`(() => {
-      const select = ${reportSelect};
-      return select && [${primaryId}, ${secondId}].every(id => [...select.options].some(option => option.value === String(id) && option.textContent === ${JSON.stringify(secondClient)}));
+      const select = document.querySelector('#report-client');
+      return select && [${primaryId}, ${secondId}].every(id => [...select.options].some(option => option.value === String(id) && option.textContent.startsWith('ID ' + id + ' · ')));
     })()`));
-    await evaluate(`(() => {
-      const year = new Date().getUTCFullYear();
-      const dates = document.querySelectorAll('[aria-label="Raport czasu"] input[type="date"]');
-      for (const [index, value] of [[0, (year - 1) + '-12-01'], [1, (year + 1) + '-01-31']]) {
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(dates[index], value);
-        dates[index].dispatchEvent(new Event('input', { bubbles: true }));
-      }
-    })()`);
     for (const [id, included, excluded] of [[primaryId, primaryMarker, secondMarker], [secondId, secondMarker, primaryMarker]]) {
       await evaluate(`(() => {
-        const select = ${reportSelect};
+        const select = document.querySelector('#report-client');
         Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, ${JSON.stringify(String(id))});
         select.dispatchEvent(new Event('change', { bubbles: true }));
       })()`);
-      await waitFor(`selected duplicate client ${id} in report`, () => evaluate(`${reportSelect}?.value === ${JSON.stringify(String(id))}`));
+      await waitFor(`selected duplicate client ${id} in report`, () => evaluate(`document.querySelector('.report-scope-summary')?.textContent.includes(${JSON.stringify(`ID ${id} · `)})`));
       await waitFor(`CSV preview button for client ${id}`, () => evaluate(`(() => {
         const button = [...document.querySelectorAll('[aria-label="Raport czasu"] button')].find(item => item.textContent.trim() === 'Przygotuj podgląd CSV');
         return button && !button.disabled;
@@ -984,10 +1016,10 @@ async function verifyDuplicateClientChoices(cdp, sessionId) {
       await evaluate(`[...document.querySelectorAll('[aria-label="Raport czasu"] button')].find(item => item.textContent.trim() === 'Przygotuj podgląd CSV').click()`);
       await waitFor(`CSV preview isolates client ${id}`, () => evaluate(`(() => {
         const preview = document.querySelector('.export-preview');
-        return preview?.textContent.includes(${JSON.stringify(included)}) && !preview.textContent.includes(${JSON.stringify(excluded)});
+        return preview?.textContent.includes(${JSON.stringify(`ID ${id} · `)}) && preview.textContent.includes(${JSON.stringify(included)}) && !preview.textContent.includes(${JSON.stringify(excluded)});
       })()`));
     }
-    console.log('PASS: identical client names stay separate by ID and each CSV preview contains only its own entries');
+    console.log('PASS: identical client names are distinguishable and each CSV preview contains only its own entries');
   } finally {
     await rename(secondClient, primaryClient);
   }
@@ -1060,6 +1092,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'initial' || phase === 'interrupt') {
       assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
       console.log(`${phase}: report matched the selected client (${seconds} s)`);
+      await captureReportDetail(cdp, sessionId, phase === 'initial' ? 'selected-client' : 'restored-scope');
     } else {
       assert.equal(seconds, null);
       if (phase !== 'hotkey-restart') console.log(`${phase}: history showed the manually recovered entry`);
@@ -1089,7 +1122,7 @@ async function runWindow(port, phase, recovery) {
       assert.ok(rows[1].includes(primaryClient) && rows[1].includes(primaryDescription));
       assert.ok(!rows[1].includes(secondClient) && !rows[1].includes(secondDescription));
       assert.equal(Number(rows[1].split(';')[10].replaceAll('"', '')), seconds);
-      console.log('First window: downloaded CSV matched the report total and CSV preview');
+      console.log('First window: downloaded CSV matched Report Details');
       await captureMainLayout(cdp, sessionId, 'idle-with-history');
       console.log(`CSV_DIAGNOSTIC phase=after-read protocol=${JSON.stringify(cdp.downloadEvents)} directory=${JSON.stringify(await csvSnapshot())}`);
     } else {
