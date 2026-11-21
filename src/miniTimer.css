@@ -1,20 +1,20 @@
 /* Mini timer: uses only the shared Quiet Precision tokens from app.css (no separate palette, UIQ-03). */
+/* One surface: the undecorated window is the card; bar and panel are separated by a hairline only. */
 .qp-mini {
   box-sizing: border-box;
   height: 100vh;
   width: 100%;
   max-width: none;
   margin: 0;
-  padding: 3px;
+  padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 3px;
   overflow: auto;
   color: var(--color-text);
-  background: var(--color-bg);
+  background: var(--color-surface);
+  box-shadow: inset 0 0 0 1px var(--color-border);
   font: 400 var(--text-sm)/1.4 var(--font-sans);
 }
-.qp-bar, .qp-panel { border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-surface); }
 .qp-bar {
   min-height: 48px;
   flex: 0 0 auto;
@@ -22,76 +22,119 @@
   grid-template-columns: 14px minmax(0, 1fr) auto 48px auto;
   align-items: center;
   column-gap: var(--space-2);
-  padding: 3px 6px;
-  box-shadow: var(--shadow-card);
+  padding: 0 var(--space-2) 0 6px;
 }
 .qp-mini:not(:has(.qp-panel, .qp-status)) .qp-bar { min-height: 100%; }
-.qp-grip { color: var(--color-text-muted); cursor: grab; display: grid; place-items: center; width: 14px; height: 32px; }
+.qp-grip { color: var(--color-icon-quiet); cursor: grab; display: grid; place-items: center; width: 14px; height: 32px; }
 .qp-grip:active { cursor: grabbing; }
 .qp-grip svg { width: 14px; }
 .qp-mini button { font: inherit; }
 .qp-mini button:focus-visible, .qp-mini textarea:focus-visible, .qp-mini input:focus-visible, .qp-full:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 .qp-mini button[aria-disabled='true'], .qp-mini button:disabled { cursor: not-allowed; }
 .qp-toggle, .qp-icon { display: grid; place-items: center; padding: 0; border: 1px solid transparent; }
+
 /* PO: one round Start/Stop control next to the clock; same position and size in both states. */
-.qp-toggle { width: 48px; height: 48px; border-radius: 50%; background: var(--color-accent); color: var(--color-on-accent); box-shadow: var(--shadow-control); }
-.qp-toggle svg { width: 20px; height: 20px; }
+.qp-toggle { width: 48px; height: 48px; border-radius: 50%; background: var(--color-accent); color: var(--color-on-accent); box-shadow: var(--shadow-control); transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease, transform var(--motion-press) ease, box-shadow var(--motion-fast) ease; }
+.qp-toggle svg { width: 20px; height: 20px; animation: qp-icon-in var(--motion-fast) ease-out; }
 .qp-toggle:hover:not([aria-disabled='true']) { background: var(--color-accent-strong); }
-.qp-toggle:active:not([aria-disabled='true']) { transform: scale(.96); }
+.qp-toggle:active:not([aria-disabled='true']) { transform: scale(.94); box-shadow: none; }
 .qp-toggle.qp-running { background: var(--color-stop); color: var(--color-on-stop); }
 .qp-toggle.qp-running:hover:not([aria-disabled='true']) { background: var(--color-stop-strong); }
 .qp-toggle[aria-disabled='true'], .qp-toggle.qp-running[aria-disabled='true'] { background: var(--color-disabled-bg); color: var(--color-disabled-text); border-color: var(--color-disabled-border); box-shadow: none; }
+@keyframes qp-icon-in { from { opacity: 0; transform: scale(.6); } to { opacity: 1; transform: scale(1); } }
+
 .qp-clock { min-width: 7.1ch; color: var(--color-text); white-space: nowrap; font-size: 1.375rem; line-height: 1; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: -.02em; }
+.qp-mini[data-mode='idle'] .qp-clock { color: var(--color-text-muted); font-weight: 600; }
 .qp-mini[data-mode='recovered'] .qp-clock, .qp-mini[data-mode='unavailable'] .qp-clock { color: var(--color-pending-text); }
-.qp-mini .qp-context { min-width: 0; min-height: 40px; text-align: left; padding: 1px 4px; background: transparent; color: inherit; border: 1px solid transparent; border-radius: var(--radius-md); }
-.qp-context strong, .qp-context small, .qp-option-name, .qp-option-name small, .qp-group { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.qp-context strong { font-size: var(--text-sm); line-height: 1.2; font-weight: 650; }
-.qp-context small { line-height: 1.2; }
+
+/* Context: title (description → task → project) and "client · project" with a decorative project dot. */
+.qp-mini .qp-context { min-width: 0; min-height: 44px; display: grid; align-content: center; gap: 2px; text-align: left; padding: 2px 6px; background: transparent; color: inherit; border: 1px solid transparent; border-radius: var(--radius-md); transition: background-color var(--motion-fast) ease; }
+.qp-context strong, .qp-context small > span:last-child, .qp-option-name, .qp-option-name small, .qp-group > span:last-child { display: block; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.qp-context strong { font-size: var(--text-sm); line-height: 1.25; font-weight: 650; }
+.qp-context small { display: flex; align-items: center; gap: 6px; min-width: 0; line-height: 1.25; }
 .qp-context small, .qp-option-name small { font-size: var(--text-xs); color: var(--color-text-muted); }
-.qp-tools { display: flex; }
-.qp-icon { width: 32px; height: 32px; border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface); }
+.qp-option-name small { display: flex; align-items: center; gap: 6px; }
+.qp-dot { flex: 0 0 auto; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--color-border-control); }
+.qp-dot[data-project-colour='1'] { background: var(--project-1); }
+.qp-dot[data-project-colour='2'] { background: var(--project-2); }
+.qp-dot[data-project-colour='3'] { background: var(--project-3); }
+.qp-dot[data-project-colour='4'] { background: var(--project-4); }
+.qp-dot[data-project-colour='5'] { background: var(--project-5); }
+.qp-dot[data-project-colour='6'] { background: var(--project-6); }
+.qp-dot[data-project-colour='7'] { background: var(--project-7); }
+.qp-dot[data-project-colour='8'] { background: var(--project-8); }
+
+/* Tools stay quiet until the bar is hovered or focused; never hidden, always >= 3:1. */
+.qp-tools { display: flex; gap: 2px; }
+.qp-icon { width: 32px; height: 32px; border-radius: var(--radius-md); color: var(--color-icon-quiet); background: transparent; transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease; }
+.qp-bar:hover .qp-icon, .qp-bar:focus-within .qp-icon { color: var(--color-text-muted); }
 .qp-icon[aria-pressed='true'] { color: var(--color-accent-strong); border-color: var(--color-border-control); background: var(--color-accent-soft); }
 .qp-mini .qp-context:hover, .qp-icon:hover:not([aria-disabled='true']) { background: var(--color-accent-soft); color: var(--color-text); }
-.qp-status { display: flex; flex: 0 0 auto; justify-content: space-between; gap: 6px; align-items: center; min-height: 24px; border: 1px solid transparent; border-radius: var(--radius-md); padding: 0 6px; font-size: var(--text-xs); }
+
+/* Safety status line: always visible when present (uncertain time, conflicts, errors). */
+.qp-status { display: flex; flex: 0 0 auto; justify-content: space-between; gap: 6px; align-items: center; min-height: 24px; margin: 0 var(--space-2) 3px; border: 1px solid transparent; border-radius: var(--radius-md); padding: 0 6px; font-size: var(--text-xs); }
 .qp-status > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qp-status[data-tone='quiet'] { background: var(--color-accent-soft); color: var(--color-text); }
 .qp-status[data-tone='warn'] { background: var(--color-pending-bg); color: var(--color-pending-text); border: 1px dashed var(--color-pending-border); }
 .qp-status[data-tone='error'] { background: var(--color-error-bg); color: var(--color-error-text); border-color: var(--color-error-border); }
-.qp-mini .qp-text-button { border: 1px solid transparent; border-radius: var(--radius-sm); color: var(--color-accent-strong); background: transparent; min-height: 32px; padding: 2px 6px; font-size: var(--text-xs); font-weight: 650; text-align: left; }
+.qp-mini .qp-text-button { border: 1px solid transparent; border-radius: var(--radius-sm); color: var(--color-accent-strong); background: transparent; min-height: 32px; padding: 2px 6px; font-size: var(--text-xs); font-weight: 650; text-align: left; transition: background-color var(--motion-fast) ease; }
 .qp-mini .qp-status .qp-text-button { min-height: 22px; padding: 0 4px; color: inherit; text-decoration: underline; white-space: nowrap; }
 .qp-mini .qp-text-button:hover:not(:disabled) { background: var(--color-accent-soft); }
-.qp-panel { overflow: auto; min-height: 0; padding: 8px 12px 12px; flex: 1 1 auto; scrollbar-gutter: stable; }
-.qp-panel-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px; margin-bottom: 4px; }
+
+/* Expanded panel: continues the same surface below a hairline; content-sized sections. */
+.qp-panel { overflow: auto; min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-2) 14px var(--space-3); border-top: 1px solid var(--color-border); scrollbar-gutter: stable; }
+.qp-panel-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px; }
 .qp-full, .qp-lost-edit, .qp-current { overflow-wrap: anywhere; }
-.qp-full:empty { margin: 0; }
+.qp-full:empty { display: none; }
 .qp-full > strong, .qp-full > span { display: block; }
-.qp-full > span { margin-bottom: 8px; color: var(--color-text-muted); }
-.qp-hint { margin: 4px 0 8px; font-size: var(--text-xs); color: var(--color-text-muted); }
-.qp-fields, .qp-lost-edit { margin-top: 8px; }
-.qp-field-label { display: block; margin-bottom: 4px; color: var(--color-text); font-weight: 650; }
-.qp-search { display: flex; align-items: center; gap: 6px; padding-left: 8px; border: 1px solid var(--color-border-control); border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface); }
+.qp-full > span { margin-bottom: 4px; color: var(--color-text-muted); }
+.qp-hint { margin: 2px 0; font-size: var(--text-xs); color: var(--color-text-muted); }
+.qp-fields, .qp-lost-edit { display: grid; gap: 4px; }
+.qp-field-label { display: block; color: var(--color-text); font-weight: 650; }
+.qp-picker { display: grid; gap: 4px; }
+.qp-search { display: flex; align-items: center; gap: 6px; padding-left: 8px; border: 1px solid var(--color-border-control); border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface); transition: border-color var(--motion-fast) ease; }
 .qp-search:focus-within { border-color: var(--color-accent); }
 .qp-search svg, .qp-option > svg { flex: 0 0 auto; }
 .qp-mini .qp-search input { min-width: 0; height: 32px; min-height: 0; padding: 0 6px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--color-text); box-shadow: none; }
 .qp-search input::placeholder, .qp-mini textarea::placeholder { color: var(--color-text-muted); opacity: 1; }
-.qp-results { max-height: 116px; overflow: auto; margin: 4px 0; scrollbar-gutter: stable; }
-.qp-group { color: var(--color-text-muted); padding: 4px 8px 2px; font-size: var(--text-xs); font-weight: 650; }
-.qp-option { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-height: 32px; cursor: pointer; padding: 4px 8px; border: 1px solid transparent; border-radius: var(--radius-sm); }
+.qp-results { max-height: 116px; overflow: auto; scrollbar-gutter: stable; }
+.qp-group { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--color-text-muted); padding: 4px 8px 2px; font-size: var(--text-xs); font-weight: 650; }
+.qp-option { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-height: 32px; cursor: pointer; padding: 4px 8px; border: 1px solid transparent; border-radius: var(--radius-sm); transition: background-color var(--motion-fast) ease; }
 .qp-option[aria-selected='true'] { color: var(--color-accent-strong); font-weight: 650; }
 .qp-option:hover, .qp-option[data-current='true'] { background: var(--color-accent-soft); }
 .qp-option[data-current='true'] { border-color: var(--color-accent); }
 .qp-results[aria-disabled='true'] .qp-option { cursor: not-allowed; }
 .qp-mini textarea { margin: 0; padding: 6px 8px; border: 1px solid var(--color-border-control); border-radius: var(--radius-md); background: var(--color-surface); color: var(--color-text); resize: vertical; }
-.qp-field-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+/* Description grows with its content up to three lines, then scrolls; no resize handle. */
+.qp-mini textarea.qp-autosize { resize: none; field-sizing: content; min-height: calc(1.4em + 14px); max-height: calc(4.2em + 14px); overflow-y: auto; }
+.qp-field-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .qp-mini .qp-save { padding: 4px 12px; min-height: 32px; border: 1px solid var(--color-accent); border-radius: var(--radius-md); background: var(--color-accent); color: var(--color-on-accent); font-weight: 650; }
 .qp-mini .qp-save:hover:not(:disabled) { background: var(--color-accent-strong); }
-.qp-billing { display: flex; align-items: center; gap: 8px; min-height: 32px; }
-.qp-mini .qp-billing input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--color-accent); }
+
+/* Billable: a token-styled switch (still a native checkbox for keyboard and assistive technology). */
+.qp-billing { display: flex; align-items: center; gap: var(--space-2); min-height: 32px; cursor: pointer; }
+.qp-mini .qp-switch { appearance: none; position: relative; flex: 0 0 auto; width: 34px; height: 20px; min-height: 0; margin: 0; padding: 0; border: 1px solid var(--color-border-control); border-radius: var(--radius-pill); background: var(--color-border-control); cursor: pointer; transition: background-color var(--motion-fast) ease, border-color var(--motion-fast) ease; }
+.qp-mini .qp-switch::before { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--color-surface); box-shadow: var(--shadow-control); transition: transform var(--motion-fast) ease; }
+.qp-mini .qp-switch:checked { background: var(--color-accent); border-color: var(--color-accent); }
+.qp-mini .qp-switch:checked::before { transform: translateX(14px); }
+.qp-mini .qp-switch:disabled { background: var(--color-disabled-bg); border-color: var(--color-disabled-border); cursor: not-allowed; }
+.qp-mini .qp-switch:disabled::before { box-shadow: none; }
+.qp-billing-note { margin: 0; }
+
 @media (max-width: 380px) {
   .qp-bar { column-gap: 4px; grid-template-columns: 12px minmax(0, 1fr) auto 48px auto; padding-inline: 3px; }
   .qp-clock { font-size: 1.25rem; }
 }
+@media (prefers-reduced-motion: reduce) {
+  .qp-mini *, .qp-mini *::before { transition: none !important; animation: none !important; }
+}
 @media (forced-colors: active) {
-  .qp-option[data-current='true'], .qp-icon[aria-pressed='true'], .qp-toggle { border-color: ButtonText; }
+  .qp-option[data-current='true'], .qp-icon[aria-pressed='true'], .qp-toggle, .qp-switch { border-color: ButtonText; }
+  .qp-dot { forced-color-adjust: none; }
   .qp-mini button:focus-visible, .qp-mini textarea:focus-visible, .qp-mini input:focus-visible, .qp-full:focus-visible { outline-color: Highlight; }
 }
+/* Expanded layout anchored to the window: fields take the free space, billing sits in a footer row. */
+.qp-panel > .qp-fields { flex: 1 0 auto; display: flex; flex-direction: column; }
+.qp-fields > .qp-billing, .qp-fields > .qp-billing-note { margin-top: auto; padding-top: var(--space-2); border-top: 1px solid var(--color-border); }
+/* With the panel open the bar keeps its compact height, so Start/Stop stays at the same place. */
+.qp-mini:has(.qp-panel) .qp-bar { min-height: 72px; }

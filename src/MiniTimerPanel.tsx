@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent, RefObject } from 'react';
-import { pickerGroups, pickerKey, projectPath, taskName } from './miniTimerModel';
+import { pickerGroups, pickerKey, projectColour, projectPath, taskName } from './miniTimerModel';
 import type { Choice } from './miniTimerModel';
 
 export function TimerIcon({ name }: { name: 'grip' | 'play' | 'stop' | 'pin' | 'expand' | 'collapse' | 'close' | 'search' | 'check' }) {
@@ -51,9 +51,9 @@ export function MiniTimerTaskPicker({ input, choices, recent, selected, onSelect
     <div className="qp-search"><TimerIcon name="search" /><input id={`${listId}-search`} ref={input} type="text" role="combobox" aria-autocomplete="list" aria-controls={listId} aria-expanded="true" aria-activedescendant={current ? optionId(current) : undefined} placeholder="Szukaj zadania, projektu lub klienta" autoComplete="off" disabled={disabled} value={query} onChange={event => { setQuery(event.target.value); setCursor(null); }} onKeyDown={keyDown} /></div>
     <div className="qp-results" id={listId} role="listbox" tabIndex={-1} aria-label="Projekty i zadania" aria-disabled={disabled}>
       {groups.map(group => <div key={group.id} role="group" aria-label={group.label}>
-        <div className="qp-group" aria-hidden="true">{group.label}</div>
+        <div className="qp-group" aria-hidden="true">{group.id !== 'recent' && <span className="qp-dot" data-project-colour={projectColour(group.id)} />}<span>{group.label}</span></div>
         {group.items.map(choice => <div key={choice.key} id={optionId(choice.key)} ref={current === choice.key ? activeOption : null} role="option" aria-selected={selected === choice.key} aria-label={`${taskName(choice)} — ${projectPath(choice)}`} data-current={current === choice.key} className="qp-option" title={`${taskName(choice)} — ${projectPath(choice)}`} onMouseDown={event => event.preventDefault()} onClick={() => { if (!disabled) { onSelect(choice.key); setCursor(null); } }}>
-          <span className="qp-option-name">{taskName(choice)}{group.id === 'recent' && <small>{projectPath(choice)}</small>}</span>{selected === choice.key && <TimerIcon name="check" />}
+          <span className="qp-option-name">{taskName(choice)}{group.id === 'recent' && <small><span className="qp-dot" data-project-colour={projectColour(choice.project.id)} aria-hidden="true" />{projectPath(choice)}</small>}</span>{selected === choice.key && <TimerIcon name="check" />}
         </div>)}
       </div>)}
     </div>

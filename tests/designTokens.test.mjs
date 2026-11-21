@@ -171,6 +171,40 @@ test('font sizes are at least 12px (helper text) and controls at least 14px', ()
   assert.ok(sizes.length > 20, 'font sizes were found');
 });
 
+test('eight decorative project colours and quiet icons keep at least 3:1 on every widget background', () => {
+  const backgrounds = ['--color-surface', '--color-bg', '--color-surface-muted', '--color-accent-soft'];
+  const colours = Array.from({ length: 8 }, (_, index) => `--project-${index + 1}`);
+  assert.equal(new Set(colours.map(hex)).size, 8, 'project colours are distinct');
+  assert.ok(!tokens.has('--project-9'), 'exactly eight project colours');
+  for (const name of [...colours, '--color-icon-quiet']) {
+    const lowest = Math.min(...backgrounds.map(background => contrast(hex(name), hex(background))));
+    console.log(`${name} ${hex(name)}: lowest contrast ${lowest.toFixed(2)}:1`);
+    assert.ok(lowest >= 3, `${name} is below 3:1 on a widget background`);
+  }
+  for (const name of colours) {
+    assert.ok(hueDistance(hex(name), hex('--color-stop')) >= 15, `${name} must not look like the coral Stop`);
+  }
+  for (let slot = 1; slot <= 8; slot++) {
+    assert.match(miniCss, new RegExp(`\\.qp-dot\\[data-project-colour='${slot}'\\] \\{ background: var\\(--project-${slot}\\); \\}`));
+  }
+});
+
+test('mini timer motion is short and disabled for reduced motion', () => {
+  for (const name of ['--motion-fast', '--motion-press']) {
+    const ms = parseFloat(resolve(name));
+    assert.match(resolve(name), /^\d+ms$/);
+    assert.ok(ms >= 120 && ms <= 150, `${name} must be 120–150 ms`);
+  }
+  assert.match(miniCss, /@media \(prefers-reduced-motion: reduce\) \{\s*\.qp-mini \*, \.qp-mini \*::before \{ transition: none !important; animation: none !important; \}/);
+  const toolRules = [...withoutComments(miniCss).matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, selector]) => /\.qp-(?:tools|icon|bar)\b/.test(selector));
+  assert.ok(toolRules.length >= 3, 'tool rules were found');
+  for (const [, selector, body] of toolRules) {
+    assert.doesNotMatch(body, /opacity\s*:\s*0(?:\.0+)?\s*(?:;|$)|visibility\s*:\s*hidden|display\s*:\s*none/,
+      `toolbar must stay visible at rest: ${selector.trim()}`);
+  }
+});
+
 test('control sizing tokens follow UIQ-05', () => {
   assert.ok(parseFloat(resolve('--control-h')) >= 40);
   assert.ok(parseFloat(resolve('--control-h-sm')) >= 24);

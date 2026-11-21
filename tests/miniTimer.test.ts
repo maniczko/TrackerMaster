@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { Snapshot } from '../src/App.tsx';
-import { activeContext, choicesFor, clockState, createRequestGate, descriptionCommand, durationText, pickerGroups, pickerKey, readLegacyPin, recentChoices, toggleCommand } from '../src/miniTimerModel.ts';
+import { activeContext, barContext, choicesFor, clockState, createRequestGate, descriptionCommand, durationText, pickerGroups, pickerKey, PROJECT_COLOURS, projectColour, readLegacyPin, recentChoices, toggleCommand } from '../src/miniTimerModel.ts';
 import { clientLabels } from '../src/clientLabels.ts';
 
 const entry = { id: 9, task_id: '3', project_id: 2, started_at: '2026-11-17T09:00:00Z', ended_at: null, billable: true, description: 'Szkic' };
@@ -112,4 +112,45 @@ test('pin migration preserves explicit old choices and defers missing or unreada
   assert.equal(readLegacyPin({ getItem: () => 'invalid' }), null);
   assert.equal(readLegacyPin({ getItem: () => { throw Error('Storage unavailable'); } }), null);
   assert.equal(readLegacyPin({ getItem: () => null }), null);
+});
+
+test('bar context: description, then task, then project; second line is client · project without repeating the title', () => {
+  const running = { ...snapshot, active: entry, entries: [entry] };
+  const withDescription = barContext(running, { ...entry, description: '  Przegląd\n umowy  ' }, undefined);
+  assert.equal(withDescription.title, 'Przegląd umowy');
+  assert.equal(withDescription.subtitle, 'Łódź · Wdrożenie');
+  assert.equal(withDescription.full, 'Przegląd umowy — Przygotowanie dokumentacji końcowej dla zespołu wdrożeniowego — Łódź / Wdrożenie');
+  const taskOnly = barContext(running, { ...entry, description: '' }, undefined);
+  assert.equal(taskOnly.title, 'Przygotowanie dokumentacji końcowej dla zespołu wdrożeniowego');
+  assert.equal(taskOnly.subtitle, 'Łódź · Wdrożenie');
+  const projectOnly = barContext(running, { ...entry, task_id: null, description: '' }, undefined);
+  assert.equal(projectOnly.title, 'Wdrożenie');
+  assert.equal(projectOnly.subtitle, 'Łódź');
+  assert.equal(projectOnly.full, 'Bez zadania — Łódź / Wdrożenie');
+  const missing = barContext(running, { ...entry, project_id: 999, task_id: null, description: '' }, undefined);
+  assert.deepEqual([missing.title, missing.subtitle, missing.colour], ['Nieznany projekt', 'Nieznany klient', null]);
+  // Unchanged contract used by the expanded panel and E2E.
+  assert.deepEqual(activeContext(snapshot, entry), { title: 'Przygotowanie dokumentacji końcowej dla zespołu wdrożeniowego', path: 'Łódź / Wdrożenie' });
+});
+
+test('bar context for a stopped timer follows the selected choice and keeps full names for assistive text', () => {
+  const projectChoice = choices.find(choice => choice.task === null)!;
+  const taskChoice = choices.find(choice => choice.task !== null)!;
+  assert.deepEqual(barContext(snapshot, null, projectChoice), { title: 'Wdrożenie', subtitle: 'Łódź', full: 'Bez zadania — Łódź / Wdrożenie', colour: projectColour('2') });
+  assert.equal(barContext(snapshot, null, taskChoice).subtitle, 'Łódź · Wdrożenie');
+  assert.equal(barContext(snapshot, null, taskChoice).full, `${taskChoice.task!.name} — Łódź / Wdrożenie`);
+  assert.deepEqual(barContext(snapshot, null, undefined), { title: 'Wybierz projekt lub zadanie', subtitle: 'Gotowy do nowego pomiaru', full: 'Wybierz projekt lub zadanie — Gotowy do nowego pomiaru', colour: null });
+  assert.equal(barContext(null, null, undefined).subtitle, 'Mini timer');
+});
+
+test('project colour is a stable decorative slot 1…8 for numeric and text IDs', () => {
+  assert.equal(PROJECT_COLOURS, 8);
+  assert.deepEqual([1, 2, 8, 9, 16].map(projectColour), [2, 3, 1, 2, 1]);
+  assert.equal(projectColour('9'), projectColour(9));
+  assert.equal(projectColour('9007199254740993'), Number(9007199254740993n % 8n) + 1);
+  for (const id of ['abc', 'Łódź', '', 'x'.repeat(200)]) {
+    const slot = projectColour(id);
+    assert.ok(Number.isInteger(slot) && slot >= 1 && slot <= 8);
+    assert.equal(projectColour(id), slot);
+  }
 });

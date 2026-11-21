@@ -80,6 +80,49 @@ export function activeContext(snapshot: Snapshot, entry: Entry) {
   return { title: entry.task_id === null ? 'Bez zadania' : task?.name ?? 'Nieznane zadanie', path: `${label ?? 'Nieznany klient'} / ${project?.name ?? 'Nieznany projekt'}` };
 }
 
+/** Number of decorative project colours (--project-1 … --project-8 in app.css). */
+export const PROJECT_COLOURS = 8;
+/** Deterministic, decorative colour slot 1…8 for a project ID. The project name is always shown as text too. */
+export function projectColour(projectId: string | number): number {
+  const text = String(projectId).trim();
+  if (/^\d+$/.test(text)) return Number(BigInt(text) % BigInt(PROJECT_COLOURS)) + 1;
+  let hash = 2166136261;
+  for (const character of text) hash = Math.imul(hash ^ character.codePointAt(0)!, 16777619) >>> 0;
+  return (hash % PROJECT_COLOURS) + 1;
+}
+
+const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim();
+export type BarContext = { title: string; subtitle: string; full: string; colour: number | null };
+/**
+ * Presentation-only text for the compact bar: title is the description, otherwise the task, otherwise the project;
+ * the second line is "client · project" without repeating the title. `full` keeps every name for title/aria-label.
+ */
+export function barContext(snapshot: Snapshot | null, entry: Entry | null, choice: Choice | undefined): BarContext {
+  if (snapshot && entry) {
+    const project = snapshot.projects.find(item => String(item.id) === String(entry.project_id));
+    const clientRecord = snapshot.clients.find(item => project && String(item.id) === String(project.client_id));
+    const client = clientRecord ? clientLabels(snapshot.clients).get(String(clientRecord.id)) ?? clientRecord.name : 'Nieznany klient';
+    const context = activeContext(snapshot, entry);
+    const task = entry.task_id === null ? null : context.title;
+    const projectName = project?.name ?? 'Nieznany projekt';
+    const description = oneLine(entry.description ?? '');
+    const title = description || task || projectName;
+    const subtitle = title === projectName && !description && !task ? client : `${client} · ${projectName}`;
+    return { title, subtitle, full: [description, `${context.title} — ${context.path}`].filter(Boolean).join(' — '), colour: project ? projectColour(project.id) : null };
+  }
+  if (choice) {
+    return {
+      title: choice.task?.name ?? choice.project.name,
+      subtitle: choice.task ? `${choice.clientLabel} · ${choice.project.name}` : choice.clientLabel,
+      full: `${taskName(choice)} — ${projectPath(choice)}`,
+      colour: projectColour(choice.project.id),
+    };
+  }
+  const title = 'Wybierz projekt lub zadanie';
+  const subtitle = snapshot ? 'Gotowy do nowego pomiaru' : 'Mini timer';
+  return { title, subtitle, full: `${title} — ${subtitle}`, colour: null };
+}
+
 export function durationText(seconds: number) {
   const value = Math.max(0, Math.floor(seconds));
   return [Math.floor(value / 3600), Math.floor(value / 60) % 60, value % 60].map(n => String(n).padStart(2, '0')).join(':');
