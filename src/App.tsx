@@ -6,7 +6,9 @@ import ShortcutSettings from './ShortcutSettings';
 import SleepPending from './SleepPending';
 import EntryDraftEditor from './EntryDraftEditor';
 import type { EntryDraftEditorHandle } from './EntryDraftEditor';
-import { parseLocalDate } from './localDateTime';
+import { localInputRange, localRangeProblem, parseLocalDate } from './localDateTime';
+import type { LocalRangeProblem } from './localDateTime';
+import { sentence } from './messageText';
 import { clientLabels } from './clientLabels';
 
 type Id = number | string;
@@ -36,6 +38,13 @@ const formatDate = (value: string | null) => {
 const formatPreciseDate = (value: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('pl-PL', { dateStyle: 'short', timeStyle: 'medium' });
+};
+
+// Wording differs from the backend errors on purpose: the backend message still proves a rejected save.
+const recoveryHints: Record<LocalRangeProblem, string> = {
+  invalid: 'Tej godziny nie da się jednoznacznie ustalić (zmiana czasu). Wybierz inną.',
+  before: 'Ta godzina jest wcześniejsza niż rozpoczęcie pomiaru. Wybierz późniejszą.',
+  after: 'Ta godzina jest w przyszłości. Wybierz czas nie późniejszy niż teraz.',
 };
 
 export default function App() {
@@ -115,13 +124,13 @@ export default function App() {
     try {
       try { await action(); }
       catch (e) {
-        setError(`Nie udało się potwierdzić operacji: ${String(e)}. Sprawdź aktualny stan przed ponowieniem.`);
+        setError(`Nie udało się potwierdzić operacji: ${sentence(e)} Sprawdź aktualny stan przed ponowieniem.`);
         try { await refresh(); } catch { /* Odczyt można ponowić osobno. */ }
         return;
       }
       setReportRevision(version => version + 1);
       try { await refresh(); setNotice(message); }
-      catch (e) { setError(`${message} Nie udało się odświeżyć danych: ${String(e)}. Ponów odczyt, nie operację.`); }
+      catch (e) { setError(`${message} Nie udało się odświeżyć danych: ${sentence(e)} Ponów odczyt, nie operację.`); }
     } finally { setBusy(false); }
   }
   async function retryRefresh() {
@@ -195,6 +204,11 @@ export default function App() {
     }, kind === 'client' ? 'Klient dodany. Możesz teraz dodać projekt.' : kind === 'project' ? 'Projekt dodany. Możesz teraz dodać zadanie.' : 'Zadanie dodane. Możesz rozpocząć pomiar.');
   };
 
+  // UI hints only; recover_timer stays the source of truth (it also rejects an end before the start).
+  const recoveryStart = data.active?.recovered ? Date.parse(data.active.started_at) : null;
+  const recoveryLimits = localInputRange(recoveryStart, now);
+  const recoveryProblem = localRangeProblem(recoveryEnd, recoveryStart, now);
+
   if (restoreDone) return <div className="app-shell"><main><section className="card"><h1>Kopia została przywrócona</h1><p>Ze względów bezpieczeństwa zamknij aplikację i uruchom ją ponownie. Jeśli kopia zawierała otwarty pomiar, po uruchomieniu będzie on wymagał weryfikacji.</p><p>Kopia danych sprzed przywrócenia: <code>{restoreDone}</code>. Nie jest szyfrowana.</p>{error && <div role="alert" className="alert error">{error}</div>}<button className="primary" onClick={() => invoke('exit_after_restore').catch(e => setError(`Nie udało się zamknąć aplikacji: ${String(e)}`))}>Zamknij aplikację</button></section></main></div>;
 
   return <div className="app-shell">
@@ -207,9 +221,10 @@ export default function App() {
       {loaded && data.active?.uncertain && !data.active.recovered && <div role="alert" className="alert pending"><strong>Nie można wiarygodnie wyświetlić czasu pomiaru.</strong> Przyczyną mogło być uśpienie komputera, pominięte zdarzenie zasilania lub zmiana zegara. {data.active.has_sleep ? 'Jeśli na liście okresów uśpienia brakuje czasu wybudzenia, najpierw go uzupełnij. ' : ''}Następnie zatrzymaj pomiar: jeśli czasu nie da się potwierdzić, aplikacja nie zapisze końca i poprosi o faktyczny czas zakończenia.{' '}
         <button type="button" disabled={busy} onClick={() => void execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.')}>Zatrzymaj i rozlicz</button></div>}
       {loaded && data.active?.recovered && <div role="alert" className="alert pending"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto: {formatDate(data.active.started_at)}. Podaj faktyczny czas zakończenia. {data.active.has_sleep ? 'Zapisane okresy uśpienia pozostają osobno do Twojej decyzji. Jeśli nie mają czasu wybudzenia, uzupełnij go na liście poniżej przed zapisaniem końca pomiaru. Pozostały czas między początkiem a wskazanym końcem, także niezarejestrowane przerwy, zostanie zaliczony jako praca.' : 'Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.'}
-        <form onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
-          <label>Data i godzina zakończenia <input type="datetime-local" step="1" required value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
-          <button type="submit" className="primary" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
+        <form noValidate onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
+          <label>Data i godzina zakończenia <input type="datetime-local" step="1" required min={recoveryLimits.min} max={recoveryLimits.max} aria-invalid={recoveryProblem !== null} aria-describedby={recoveryProblem ? 'recovery-end-problem' : undefined} value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
+          <button type="submit" className="primary" disabled={busy || !loaded || !recoveryEnd || recoveryProblem === 'after' || recoveryProblem === 'invalid'}>Zapisz zakończenie</button>
+          {recoveryProblem && <p id="recovery-end-problem" className="field-problem" role="status">{recoveryHints[recoveryProblem]}</p>}
         </form></div>}
       {notice && <div role="status" className="alert success">{notice}</div>}
       <SleepPending loaded={loaded} onResolved={async () => {
