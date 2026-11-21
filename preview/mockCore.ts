@@ -107,7 +107,7 @@ const handlers: Record<string, (a: any) => unknown> = {
 // Harmless window and preference calls made while screens load. Everything else that
 // the preview does not model is rejected, so the UI never shows a fake success.
 const noOps = new Set(['set_entry_editor_guard', 'resolve_entry_editor_close', 'widget_shortcut_ready', 'set_shortcut_task',
-  'set_report_scope', 'set_report_filter', 'set_draft_sort', 'set_report_timezone', 'widget_drag', 'close_widget', 'show_main', 'open_widget']);
+  'set_report_scope', 'set_report_filter', 'set_draft_sort', 'widget_drag', 'close_widget', 'show_main', 'open_widget']);
 export const UNAVAILABLE = 'Ta akcja nie jest dostępna w podglądzie interfejsu (brak prawdziwego backendu).';
 
 export async function invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
