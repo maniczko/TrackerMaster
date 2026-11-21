@@ -19,6 +19,7 @@ Skalę DPI 125% i 150% przybliża powiększenie przeglądarki (Ctrl +).
 ## Ograniczenia
 
 - Backend jest udawany (`preview/mockCore.ts`): fikcyjne dane w pamięci, znikają po odświeżeniu.
+- Akcje, których podgląd nie modeluje (archiwizacja, kopie, przywracanie, korekty, szkice itd.), kończą się komunikatem „Ta akcja nie jest dostępna w podglądzie interfejsu” zamiast fałszywego sukcesu.
 - **Nie sprawdza** bazy SQLite, migracji, uśpienia i wybudzenia, skrótu globalnego, traya, okien Windows, WebView2 ani MSIX. Nie zastępuje odbioru na Windows 11 (UIQ-09, DEV-15, QA-01).
 - Wygląd odpowiada Chromium/Edge, którego silnik ma też WebView2, ale fonty systemowe, skalowanie DPI i krawędzie okien mogą się różnić.
 
