@@ -321,6 +321,8 @@ td small { color: var(--color-text-muted); font-size: var(--text-xs); }
 .app-shell .alert form label, .app-shell .pending-card td form label { flex: 0 1 280px; max-width: 100%; gap: var(--space-2); color: inherit; }
 .alert form input, .pending-card td form input { max-width: 280px; }
 .alert form button, .pending-card td form button { min-height: var(--control-h); padding: 0 var(--space-4); }
+/* Inline range hint under a date field (UI only; the backend still decides). */
+.field-problem { flex-basis: 100%; margin: 0; color: var(--color-error-text); font-size: var(--text-xs); font-weight: 600; }
 .pending-card td:last-child { min-width: 300px; }
 .pending-card td:last-child > button + button { margin-left: var(--space-2); }
 .alert .actions { margin-top: var(--space-2); }

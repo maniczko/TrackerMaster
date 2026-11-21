@@ -1,9 +1,17 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatDuration } from './App';
-import { parseLocalDate } from './localDateTime';
+import { localInputRange, localRangeProblem, parseLocalDate } from './localDateTime';
+import type { LocalRangeProblem } from './localDateTime';
 
 type PendingSleep = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean };
+
+// UI hints only; the backend checks the wake-up time against the sleep period and the clock.
+const resumeHints: Record<LocalRangeProblem, string> = {
+  invalid: 'Podaj jednoznaczną datę i godzinę wybudzenia.',
+  before: 'Ta godzina jest wcześniejsza niż początek uśpienia. Wybierz późniejszą.',
+  after: 'Ta godzina jest w przyszłości. Wybierz czas nie późniejszy niż teraz.',
+};
 
 function dateTime(ms: number) {
   return new Intl.DateTimeFormat('pl-PL', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(ms));
@@ -16,6 +24,7 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [resumeInput, setResumeInput] = useState<Record<number, string>>({});
+  const [now, setNow] = useState(Date.now());
   const started = useRef(false);
   const previousIds = useRef(new Set<number>());
   const requestId = useRef(0);
@@ -75,6 +84,8 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
     if (busyRef.current || item.endedMs !== null) return;
     const end = parseLocalDate(resumeInput[item.id] ?? '');
     if (!end) { setError('Podaj jednoznaczną datę i godzinę wybudzenia.'); return; }
+    const problem = localRangeProblem(resumeInput[item.id] ?? '', item.startedMs, Date.now());
+    if (problem) { setError(resumeHints[problem]); return; }
     busyRef.current = true; setBusy(true); setError('');
     let saved = false;
     try {
@@ -92,6 +103,12 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
     setOpen(true); setShowBanner(false);
     window.setTimeout(() => listRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0);
   }
+  const waitingForResume = items.some(item => item.endedMs === null);
+  useEffect(() => {
+    if (!waitingForResume) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, [waitingForResume]);
   if (!loaded) return null;
   const closedMs = items.reduce((sum, item) => sum + (item.endedMs === null ? 0 : Math.max(0, item.endedMs - item.startedMs)), 0);
   const hasOpen = items.some(item => item.endedMs === null);
@@ -101,12 +118,12 @@ export default function SleepPending({ loaded, onResolved }: { loaded: boolean; 
     {showBanner && items.length > 0 && <div role="status" className="alert"><strong>Uśpienie do rozstrzygnięcia: {summary}.</strong> <button type="button" onClick={showList}>Przejdź do listy</button></div>}
     {items.length > 0 && <section ref={listRef} className="card pending-card" aria-label="Okresy uśpienia do rozstrzygnięcia">
       <div className="section-top"><div><h2>Uśpienie do rozstrzygnięcia</h2><p className="muted">{summary}. Te okresy nie są zaliczane do pracy przed decyzją.</p></div><button type="button" className="secondary" aria-expanded={open} onClick={() => setOpen(value => !value)}>{open ? 'Ukryj listę' : 'Pokaż listę'}</button></div>
-      {open && <div className="table-wrap"><table><thead><tr><th>Okres</th><th>Klient / projekt / zadanie</th><th>Czas</th><th>Decyzja</th></tr></thead><tbody>{items.map(item => <tr key={item.id}>
+      {open && <div className="table-wrap"><table><thead><tr><th>Okres</th><th>Klient / projekt / zadanie</th><th>Czas</th><th>Decyzja</th></tr></thead><tbody>{items.map(item => { const resumeValue = resumeInput[item.id] ?? ''; const limits = localInputRange(item.startedMs, now); const problem = item.endedMs === null ? localRangeProblem(resumeValue, item.startedMs, now) : null; return <tr key={item.id}>
         <td>{dateTime(item.startedMs)} – {item.endedMs === null ? 'brak czasu wybudzenia' : dateTime(item.endedMs)}</td>
         <td>{item.client} / {item.project} / {item.task || 'Bez zadania'} <small>· wpis #{item.entryId}</small></td>
         <td>{item.endedMs === null ? 'Nieznany' : <>{formatDuration((item.endedMs - item.startedMs) / 1000)}{item.manualResume && <small> · wybudzenie wskazane ręcznie</small>}</>}</td>
-        <td>{item.endedMs === null ? <form onSubmit={event => { event.preventDefault(); void supplyResume(item); }}><label>Faktyczna lub szacowana godzina wybudzenia <input type="datetime-local" step="1" required disabled={busy} value={resumeInput[item.id] ?? ''} onChange={event => setResumeInput(current => ({ ...current, [item.id]: event.target.value }))} /></label> <button type="submit" className="primary" disabled={busy || !resumeInput[item.id]}>Zapisz godzinę</button></form> : <><button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, true)}>Dolicz</button>{' '}<button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, false)}>Odrzuć</button></>}</td>
-      </tr>)}</tbody></table><button type="button" className="secondary" onClick={() => setOpen(false)}>Później</button></div>}
+        <td>{item.endedMs === null ? <form onSubmit={event => { event.preventDefault(); void supplyResume(item); }}><label>Faktyczna lub szacowana godzina wybudzenia <input type="datetime-local" step="1" required disabled={busy} min={limits.min} max={limits.max} aria-invalid={problem !== null} aria-describedby={problem ? `resume-problem-${item.id}` : undefined} value={resumeValue} onFocus={() => setNow(Date.now())} onChange={event => { setNow(Date.now()); setResumeInput(current => ({ ...current, [item.id]: event.target.value })); }} /></label> <button type="submit" className="primary" disabled={busy || !resumeValue || problem !== null}>Zapisz godzinę</button>{problem && <p id={`resume-problem-${item.id}`} className="field-problem" role="status">{resumeHints[problem]}</p>}</form> : <><button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, true)}>Dolicz</button>{' '}<button type="button" className="secondary" disabled={busy} onClick={() => void decide(item, false)}>Odrzuć</button></>}</td>
+      </tr>; })}</tbody></table><button type="button" className="secondary" onClick={() => setOpen(false)}>Później</button></div>}
     </section>}
   </>;
 }
