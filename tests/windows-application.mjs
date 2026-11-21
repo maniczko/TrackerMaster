@@ -78,6 +78,37 @@ async function captureReportDetail(cdp, sessionId, state) {
     }
   }
 }
+// Mini timer bar: 48×48 Start/Stop in a fixed place, title/clock/action not overlapping or covered, no page overflow.
+const inspectCompactLayout = `(() => {
+  const box = selector => {
+    const rect = document.querySelector(selector)?.getBoundingClientRect();
+    return rect ? { left: Math.round(rect.left), right: Math.round(rect.right), top: Math.round(rect.top),
+      bottom: Math.round(rect.bottom), width: Math.round(rect.width), height: Math.round(rect.height) } : null;
+  };
+  const uncovered = selector => {
+    const element = document.querySelector(selector);
+    const rect = element?.getBoundingClientRect();
+    const hit = rect && document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return Boolean(hit && (hit === element || element.contains(hit)));
+  };
+  const title = document.querySelector('.qp-context strong');
+  return { scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth,
+    context: box('.qp-context'), clock: box('.qp-clock'), action: box('.qp-toggle'),
+    clockUncovered: uncovered('.qp-clock'), actionUncovered: uncovered('.qp-toggle'),
+    title: title?.textContent ?? null, titleTruncated: title ? title.scrollWidth > title.clientWidth : null };
+})()`;
+function assertCompactLayout(layout, label, reference) {
+  console.log(`UI_LAYOUT widget-${label.replace(' ', '-')} ${JSON.stringify(layout)}`);
+  assert.ok(layout.scrollWidth <= layout.clientWidth, `${label}: the mini timer scrolls horizontally`);
+  assert.ok(layout.action && layout.action.width === 48 && layout.action.height === 48, `${label}: Start/Stop is not 48×48`);
+  assert.ok(layout.context && layout.clock && layout.context.right <= layout.clock.left && layout.clock.right <= layout.action.left,
+    `${label}: the title overlaps the clock or the clock overlaps Start/Stop`);
+  assert.ok(layout.clockUncovered && layout.actionUncovered, `${label}: the clock or Start/Stop is covered`);
+  if (reference) {
+    assert.equal(layout.action.left, reference.action.left, `${label}: Start/Stop moved horizontally`);
+    assert.equal(layout.action.top, reference.action.top, `${label}: Start/Stop moved vertically`);
+  }
+}
 async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = true } = {}) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
@@ -474,6 +505,8 @@ async function verifyMiniTimer(cdp, mainSession) {
   assert.ok(idleBar.actionWidth >= 44 && idleBar.actionHeight >= 44, 'Timer action should have a 44px target');
   assert.ok(idleBar.clockRight <= idleBar.actionLeft && idleBar.actionRight <= idleBar.barRight,
     'Timer action should follow the clock and fit inside the bar');
+  const compactIdle = await evaluate(widget, inspectCompactLayout);
+  assertCompactLayout(compactIdle, 'compact idle');
   await saveScreenshot(cdp, widget, 'widget-compact-idle');
   await evaluate(widget, `document.querySelector('[aria-label="Rozwiń panel"]').click()`);
   await waitFor('mini timer opens the focused project search', () => evaluate(widget,
@@ -558,6 +591,10 @@ async function verifyMiniTimer(cdp, mainSession) {
     && document.querySelector('.qp-mini')?.dataset.mode === 'running'
   )`));
   assert.deepEqual(readInterruptedTimer(), started);
+  const compactRunning = await evaluate(reopened, inspectCompactLayout);
+  assertCompactLayout(compactRunning, 'compact running', compactIdle);
+  assert.equal(compactRunning.title, interruptedDescription, 'The bar title should show the measurement description');
+  await saveScreenshot(cdp, reopened, 'widget-compact-running');
   await close(reopened);
   await waitFor('reopened mini timer closes', async () => !(await findOtherWindow()));
   console.log('PASS: repeated key-downs in another focused window started exactly one timer; keyboard project search and restored pin also passed');

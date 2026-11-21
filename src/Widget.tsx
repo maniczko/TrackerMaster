@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Snapshot } from './App';
 import { MiniTimerTaskPicker, TimerIcon } from './MiniTimerPanel';
-import { activeContext, choicesFor, clockState, createRequestGate, descriptionCommand, projectPath, readLegacyPin, recentChoices, taskName, toggleCommand } from './miniTimerModel';
+import { activeContext, barContext, choicesFor, clockState, createRequestGate, descriptionCommand, projectPath, readLegacyPin, recentChoices, taskName, toggleCommand } from './miniTimerModel';
 import type { DescriptionDraft } from './miniTimerModel';
 import { defaultShortcut, matchesShortcut, shortcutLabel } from './shortcut';
 import './miniTimer.css';
@@ -81,6 +81,7 @@ export default function Widget() {
   const choice = selected ? choices.find(item => item.key === selected) : recent[0];
   const active = data?.active ?? null;
   const context = data && active ? activeContext(data, active) : { title: choice ? taskName(choice) : 'Wybierz projekt lub zadanie', path: choice ? projectPath(choice) : data ? 'Gotowy do nowego pomiaru' : 'Mini timer' };
+  const bar = barContext(data, active, choice);
   const clock = clockState(data, now);
   const retainedEdit = edit !== null && edit.entryId !== String(active?.id);
   const dirtyEdit = edit !== null && edit.value !== edit.expected && !retainedEdit;
@@ -224,11 +225,11 @@ export default function Widget() {
   return <main className="qp-mini" data-mode={clock.mode} aria-label="TrackerMaster – mini timer">
     <header className="qp-bar">
       <span className="qp-grip" title="Przeciągnij okno" aria-hidden="true" onMouseDown={event => { if (event.button === 0) void invoke('widget_drag').catch(() => setWindowError('Nie przesunięto mini timera.')); }}><TimerIcon name="grip" /></span>
-      <button type="button" ref={contextButton} className="qp-context" title={`${context.title} — ${context.path}`} aria-label={`${context.title} — ${context.path}. Pokaż pełne informacje`} aria-expanded={open && details} aria-controls={open ? 'qp-panel' : undefined} onClick={() => void setPanel(true, 'context')}>
-        <strong>{context.title}</strong><small>{context.path}</small>
+      <button type="button" ref={contextButton} className="qp-context" title={bar.full} aria-label={`${bar.full}. Pokaż pełne informacje`} aria-expanded={open && details} aria-controls={open ? 'qp-panel' : undefined} onClick={() => void setPanel(true, 'context')}>
+        <strong>{bar.title}</strong><small>{bar.colour !== null && <span className="qp-dot" data-project-colour={bar.colour} aria-hidden="true" />}<span>{bar.subtitle}</span></small>
       </button>
       <span className="qp-clock" title={clock.mode === 'running' ? 'Orientacyjny czas pomiaru' : 'Czas pomiaru'} aria-live="off">{clock.text}</span>
-      <button type="button" className={`qp-toggle${clock.mode === 'running' ? ' qp-running' : ''}`} aria-label={toggleLabel} title={`${toggleLabel} · ${shortcutLabel(shortcut?.shortcut || defaultShortcut)}${shortcut?.registered ? ' (globalnie)' : ' (w tym oknie)'}`} aria-disabled={controlsLocked || dirtyEdit} onClick={() => toggleRef.current()}><TimerIcon name={active ? 'stop' : 'play'} /></button>
+      <button type="button" className={`qp-toggle${clock.mode === 'running' ? ' qp-running' : ''}`} aria-label={toggleLabel} title={`${toggleLabel} · ${shortcutLabel(shortcut?.shortcut || defaultShortcut)}${shortcut?.registered ? ' (globalnie)' : ' (w tym oknie)'}`} aria-disabled={controlsLocked || dirtyEdit} onClick={() => toggleRef.current()}><TimerIcon key={active ? 'stop' : 'play'} name={active ? 'stop' : 'play'} /></button>
       <div className="qp-tools">
         <button type="button" className="qp-icon" aria-label="Przypięcie na wierzchu" aria-pressed={onTop} title={pinLabel} aria-disabled={pinPending} onClick={() => void changePin()}><TimerIcon name="pin" /></button>
         <button type="button" className="qp-icon" ref={disclosure} aria-label={expandLabel} title={expandLabel} aria-expanded={open} aria-controls={open ? 'qp-panel' : undefined} aria-disabled={panelPending} onClick={() => void setPanel(!open)}><TimerIcon name={open ? 'collapse' : 'expand'} /></button>
@@ -242,8 +243,8 @@ export default function Widget() {
     {open && <section id="qp-panel" className="qp-panel" aria-label="Panel mini timera">
       <div className="qp-panel-header"><strong>{active ? 'Bieżący pomiar' : 'Nowy pomiar'}</strong><button type="button" className="qp-text-button" onClick={showApp}>Otwórz aplikację</button></div>
       <div className="qp-full" ref={fullContext} tabIndex={-1} aria-label="Pełny kontekst pomiaru">
-        {details && <><strong>{context.title}</strong><span>{context.path}</span></>}
-        {active && <p className="qp-hint">Klient, projekt i zadanie pozostają bez zmian podczas pomiaru.</p>}
+        {(details || !!active) && <><strong>{context.title}</strong><span>{context.path}</span></>}
+        {active && <p className="qp-hint">Przypisanie zostaje bez zmian do końca pomiaru.</p>}
         {clock.mode === 'recovered' && <p className="qp-hint">Mini timer nie wylicza czasu z nierozstrzygniętej przerwy. Sprawdź zakończenie pomiaru w aplikacji.</p>}
         {!data && <p className="qp-hint">Dane pojawią się po połączeniu z aplikacją. Szkic nie został usunięty.</p>}
         {verify && !!data && clock.mode !== 'recovered' && <p className="qp-hint">Przed kolejną zmianą sprawdź aktualny stan. Nie ponawiamy zapisu automatycznie.</p>}
@@ -253,7 +254,7 @@ export default function Widget() {
       {!active && <MiniTimerTaskPicker input={search} choices={choices} recent={recent} selected={choice?.key} disabled={controlsLocked} onSelect={selectedChoice} />}
       <div className="qp-fields">
         <label className="qp-field-label" htmlFor="qp-description">{active ? 'Opis pomiaru' : 'Opis nowego pomiaru (opcjonalnie)'}</label>
-        <textarea id="qp-description" ref={description} rows={2} maxLength={2000} value={active ? (!retainedEdit && edit ? edit.value : active.description) : draft} readOnly={controlsLocked || (!!active && retainedEdit)} placeholder="Nad czym pracujesz?" onChange={event => {
+        <textarea id="qp-description" className="qp-autosize" ref={description} rows={2} maxLength={2000} value={active ? (!retainedEdit && edit ? edit.value : active.description) : draft} readOnly={controlsLocked || (!!active && retainedEdit)} placeholder="Nad czym pracujesz?" onChange={event => {
           const value = event.target.value;
           if (active) setEdit(current => {
             const entryId = String(active.id);
@@ -268,10 +269,10 @@ export default function Widget() {
           {conflict && <button type="button" className="qp-save" disabled={controlsLocked} onClick={() => setEdit(edit!.value === active!.description ? null : { ...edit!, expected: active!.description })}>Użyj aktualnego opisu jako podstawy</button>}
           <button type="button" className="qp-text-button" disabled={busy} onClick={cancelEdit}>Odrzuć szkic</button>
         </div>}
-        {active && <label className="qp-billing"><input type="checkbox" checked={active.billable} disabled={controlsLocked} onChange={event => {
+        {active && <label className="qp-billing"><input type="checkbox" role="switch" className="qp-switch" checked={active.billable} disabled={controlsLocked} onChange={event => {
           if (!controlsLocked) void write('set_entry_billable', { entryId: Number(active.id), expected: active.billable, billable: event.target.checked }, false);
         }} /> Rozliczalny</label>}
-        {!active && choice && <p className="qp-hint">Nowy pomiar będzie {choice.project.billable ? 'rozliczalny' : 'nierozliczalny'} (ustawienie projektu).</p>}
+        {!active && choice && <p className="qp-hint qp-billing-note">{choice.project.billable ? 'Rozliczalny' : 'Nierozliczalny'} · według ustawień projektu</p>}
       </div>
     </section>}
   </main>;
