@@ -275,6 +275,15 @@ fn get_snapshot(state: State<'_, Shared>) -> Cmd<Snapshot> {
 
 // Apply stored sleep decisions only to the entry that owns them. Any corrupt
 // or unfinished boundaries fail closed rather than silently adding work.
+fn has_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<bool> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(false); }
+    db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods WHERE entry_id=?1)", [entry_id], |r| r.get(0)).map_err(db_err)
+}
+fn ensure_no_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<()> {
+    if has_sleep_periods(db,entry_id)? { return Err("Wpis zawiera okresy uśpienia. Jego zmiana wymaga pełnej obsługi tych okresów.".into()); }
+    Ok(())
+}
 fn completed_sleep(db: &Connection, id: i64, start: &str, end: &str) -> Cmd<Option<(i64, Vec<sleep_periods::SleepPeriod>)>> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     if version < 12 { return Ok(None); }
@@ -470,12 +479,17 @@ fn apply_backup_restore(app: tauri::AppHandle, state: State<'_, Shared>, restore
     if !confirmed { return Err("Potwierdź przywrócenie kopii.".into()); }
     let data_dir = app.path().app_data_dir().map_err(|_| "Nie można ustalić katalogu danych aplikacji.".to_string())?;
     let mut restore = restore.lock().map_err(|_| "Nie można odczytać przygotowanej kopii.".to_string())?;
-    if restore.sequence.to_string() != token || restore.pending.is_none() { return Err("Przygotowana kopia jest nieaktualna. Sprawdź ją ponownie.".into()); }
     let mut tracker = locked(&state)?;
-    if snapshot(&tracker)?.active.is_some() { return Err("Najpierw zakończ lub rozlicz aktywny pomiar.".into()); }
-    let prepared = restore.pending.take().ok_or("Nie znaleziono przygotowanej kopii.")?;
-    let safety = storage_safety::restore_prepared(&mut tracker.db, &prepared, &data_dir)
+    apply_prepared_restore(&mut tracker, &mut restore, &token, &data_dir)
+}
+
+fn apply_prepared_restore(tracker: &mut Tracker, restore: &mut RestoreState, token: &str, data_dir: &std::path::Path) -> Cmd<String> {
+    if restore.sequence.to_string() != token || restore.pending.is_none() { return Err("Przygotowana kopia jest nieaktualna. Sprawdź ją ponownie.".into()); }
+    if snapshot(tracker)?.active.is_some() { return Err("Najpierw zakończ lub rozlicz aktywny pomiar.".into()); }
+    let prepared = restore.pending.as_ref().ok_or("Nie znaleziono przygotowanej kopii.")?;
+    let safety = storage_safety::restore_prepared(&mut tracker.db, prepared, data_dir)
         .map_err(|_| "Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.".to_string())?;
+    restore.pending = None;
     tracker.running_since = None;
     tracker.restored = true;
     Ok(safety.to_string_lossy().into_owned())
@@ -571,21 +585,27 @@ async fn show_main(app: tauri::AppHandle) -> Cmd<()> {
     }
 }
 
+fn add_client(db: &Connection, name: &str) -> Cmd<i64> {
+    db.execute("INSERT INTO clients(name) VALUES(?1)", [valid_name(name)?]).map_err(db_err)?;
+    Ok(db.last_insert_rowid())
+}
 #[tauri::command]
 fn create_client(state: State<'_, Shared>, name: String) -> Cmd<i64> {
     let tracker = locked(&state)?;
-    tracker.db.execute("INSERT INTO clients(name) VALUES(?1)", [valid_name(&name)?]).map_err(db_err)?;
-    Ok(tracker.db.last_insert_rowid())
+    add_client(&tracker.db, &name)
+}
+fn add_project(db: &Connection, client_id: i64, name: &str) -> Cmd<i64> {
+    let name = valid_name(name)?;
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=clients.id))", [client_id], |r| r.get::<_, bool>(0)).map_err(db_err)? {
+        return Err("Wybierz istniejącego klienta.".into());
+    }
+    db.execute("INSERT INTO projects(client_id,name) VALUES(?1,?2)", params![client_id,name]).map_err(db_err)?;
+    Ok(db.last_insert_rowid())
 }
 #[tauri::command]
 fn create_project(state: State<'_, Shared>, client_id: i64, name: String) -> Cmd<i64> {
     let tracker = locked(&state)?;
-    let name = valid_name(&name)?;
-    if !tracker.db.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=clients.id))", [client_id], |r| r.get::<_, bool>(0)).map_err(db_err)? {
-        return Err("Wybierz istniejącego klienta.".into());
-    }
-    tracker.db.execute("INSERT INTO projects(client_id,name) VALUES(?1,?2)", params![client_id,name]).map_err(db_err)?;
-    Ok(tracker.db.last_insert_rowid())
+    add_project(&tracker.db, client_id, &name)
 }
 #[tauri::command]
 fn create_task(state: State<'_, Shared>, project_id: i64, name: String) -> Cmd<i64> {
@@ -1000,18 +1020,6 @@ fn widget_stop(state: State<'_, Shared>, entry_id: i64) -> Cmd<Snapshot> {
     snapshot(&tracker)
 }
 
-// Sleep periods belong to one entry and are validated against its boundaries.
-// Until the full sleep workflow is available, refuse edits that could leave
-// recorded periods outside the entry or silently count them as work.
-fn has_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<bool> {
-    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
-    if version < 12 { return Ok(false); }
-    db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods WHERE entry_id=?1)", [entry_id], |r| r.get(0)).map_err(db_err)
-}
-fn ensure_no_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<()> {
-    if has_sleep_periods(db,entry_id)? { return Err("Wpis zawiera okresy uśpienia. Jego zmiana wymaga pełnej obsługi tych okresów.".into()); }
-    Ok(())
-}
 
 fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -> Cmd<()> {
     if tracker.running_since.is_some() { return Err("Ten pomiar nadal działa. Użyj przycisku Zatrzymaj.".into()); }
@@ -1510,7 +1518,7 @@ fn main() {
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
                 err
             })?;
-            let tracker: Shared = Arc::new(Mutex::new(Tracker { db, running_since: None, restored: false }));
+            let tracker = Arc::new(Mutex::new(Tracker { db, running_since: None, restored: false }));
             app.manage(tracker.clone());
             #[cfg(windows)]
             if power_events::register(tracker).is_err() {
@@ -1518,10 +1526,10 @@ fn main() {
             }
             app.manage(Mutex::new(HotkeyState::default()));
             app.manage(HotkeyChange(Mutex::new(())));
-            app.manage(Mutex::new(RestoreState::default()));
-            app.manage(editor_close::EditorClose::default());
             #[cfg(windows)]
             app.manage(quit_dialog::QuitDialog::default());
+            app.manage(Mutex::new(RestoreState::default()));
+            app.manage(editor_close::EditorClose::default());
             let saved = std::fs::read_to_string(dir.join("shortcut.txt")).ok().filter(|value| valid_shortcut(value)).unwrap_or_else(|| DEFAULT_SHORTCUT.into());
             let registered = app.global_shortcut().register(saved.as_str());
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
@@ -1648,6 +1656,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_backup_restore_can_be_retried_with_the_same_preview() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tracker-restore-retry-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let source_path = dir.join("source.sqlite3");
+        let mut source = Connection::open(&source_path).unwrap();
+        initialise(&mut source).unwrap();
+        source.execute("INSERT INTO clients(name) VALUES('Copied')", []).unwrap();
+        drop(source);
+
+        let prepared = storage_safety::prepare_restore(&source_path).unwrap();
+        let mut restore = RestoreState { sequence: 1, pending: Some(prepared) };
+        let mut tracker = seeded();
+        let obstacle = dir.join("backups");
+        std::fs::write(&obstacle, b"test").unwrap();
+        assert!(apply_prepared_restore(&mut tracker, &mut restore, "1", &dir).is_err());
+        assert!(restore.pending.is_some());
+        assert!(!tracker.restored);
+        assert_eq!(tracker.db.query_row("SELECT name FROM clients WHERE id=1", [], |row| row.get::<_, String>(0)).unwrap(), "A");
+        std::fs::remove_file(&obstacle).unwrap();
+
+        let safety = apply_prepared_restore(&mut tracker, &mut restore, "1", &dir).unwrap();
+        assert!(std::path::Path::new(&safety).is_file());
+        assert!(restore.pending.is_none());
+        assert!(tracker.restored);
+        assert_eq!(tracker.db.query_row("SELECT name FROM clients WHERE id=1", [], |row| row.get::<_, String>(0)).unwrap(), "Copied");
+        drop(tracker);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn instance_guard_rejects_second_open_and_releases_on_drop() {
@@ -1671,6 +1711,49 @@ mod tests {
             INSERT INTO projects(id,client_id,name) VALUES (1,1,'P');
             INSERT INTO tasks(id,project_id,name) VALUES (1,1,'T1'),(2,1,'T2');").unwrap();
         Tracker { db, running_since: None, restored: false }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_project_timer_and_export_survive_restart_on_isolated_file() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let suffix=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir=std::env::temp_dir().join(format!("trackermaster-journey-{}-{suffix}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path=dir.join("journey.sqlite3");
+        {
+            let mut db=Connection::open(&path).unwrap();
+            initialise(&mut db).unwrap();
+            assert!(add_client(&db,"   ").is_err());
+            let client=add_client(&db,"Klient testowy").unwrap();
+            assert!(add_project(&db,client+1000,"Brak klienta").is_err());
+            let project=add_project(&db,client,"Projekt testowy").unwrap();
+            let other_client=add_client(&db,"Drugi klient").unwrap();
+            let mut tracker=Tracker { db,running_since:None,restored:false };
+            optional_task_migration::transition(&mut tracker,None,&now(),optional_task_migration::TimerAction::Start { project_id:project,task_id:None,description:"Fikcyjna praca" }).unwrap();
+            let active=snapshot(&tracker).unwrap().active.unwrap();
+            assert_eq!((active.project_id,active.task_id,active.description.as_str()),(project,None,"Fikcyjna praca"));
+            std::thread::sleep(Duration::from_millis(1200));
+            optional_task_migration::transition(&mut tracker,Some(active.id),&now(),optional_task_migration::TimerAction::Stop).unwrap();
+            let entry=snapshot(&tracker).unwrap().entries.remove(0);
+            assert_eq!(entry.id,active.id);
+            assert!(entry.duration_seconds>=1);
+            let exported=client_export_data(&tracker.db,client).unwrap();
+            assert_eq!(exported.entries.len(),1);
+            assert_eq!((exported.entries[0].id,exported.entries[0].description.as_str()),(entry.id,"Fikcyjna praca"));
+            assert!(client_export_data(&tracker.db,other_client).unwrap().entries.is_empty());
+        }
+        {
+            let mut db=Connection::open(&path).unwrap();
+            initialise(&mut db).unwrap();
+            let tracker=Tracker { db,running_since:None,restored:false };
+            let state=snapshot(&tracker).unwrap();
+            assert_eq!((state.clients.len(),state.projects.len(),state.entries.len()),(2,1,1));
+            assert_eq!(state.entries[0].description,"Fikcyjna praca");
+            assert!(state.active.is_none());
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[cfg(windows)]
@@ -2387,6 +2470,141 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn sqlite_full_during_switch_rolls_back_and_retry_keeps_boundary() {
+        use optional_task_migration::{transition, TimerAction};
+        use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        struct ResetCapture;
+        impl Drop for ResetCapture { fn drop(&mut self) { DB_ERROR_CAPTURE.with(|capture| drop(capture.take())); } }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = PathBuf::from("target").join(format!("tracker-full-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let cleanup = Cleanup(dir);
+        let path = cleanup.0.join("tracker.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "page_size", 512).unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Original'),(2,1,'Next');").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let started = now();
+        transition(&mut tracker, None, &started, TimerAction::Start {
+            project_id: 1, task_id: None, description: "Original",
+        }).unwrap();
+        let id = snapshot(&tracker).unwrap().active.unwrap().id;
+        let pages: i64 = tracker.db.pragma_query_value(None, "page_count", |row| row.get(0)).unwrap();
+        let free: i64 = tracker.db.pragma_query_value(None, "freelist_count", |row| row.get(0)).unwrap();
+        assert_eq!(free, 0);
+        tracker.db.pragma_update(None, "max_page_count", pages).unwrap();
+        let limit: i64 = tracker.db.pragma_query_value(None, "max_page_count", |row| row.get(0)).unwrap();
+        assert_eq!(limit, pages);
+        let description = "X".repeat(2000);
+        DB_ERROR_CAPTURE.with(|capture| {
+            assert!(capture.borrow().is_none());
+            *capture.borrow_mut() = Some(Vec::new());
+        });
+        let _reset = ResetCapture;
+        let result = transition(&mut tracker, Some(id), &now(), TimerAction::Start {
+            project_id: 2, task_id: None, description: &description,
+        });
+        let errors = DB_ERROR_CAPTURE.with(|capture| capture.take().unwrap());
+        assert_eq!(result.unwrap_err(), "Nie udało się zapisać lub odczytać danych lokalnych.");
+        assert!(errors.iter().any(|error| error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)),
+            "expected SQLITE_FULL, got {errors:?}");
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, id);
+        let persisted: (String, Option<String>, Option<i64>) = tracker.db.query_row(
+            "SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1", [id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(persisted, (started, None, None));
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM entry_descriptions", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+
+        tracker.db.pragma_update(None, "max_page_count", pages + 100).unwrap();
+        let switched = now();
+        transition(&mut tracker, Some(id), &switched, TimerAction::Start {
+            project_id: 2, task_id: None, description: &description,
+        }).unwrap();
+        let active = snapshot(&tracker).unwrap().active.unwrap();
+        assert_ne!(active.id, id);
+        assert_eq!(active.started_at, switched);
+        assert_eq!(active.description, description);
+        let old_end: String = tracker.db.query_row("SELECT ended_at FROM time_entries WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        assert_eq!(old_end, switched);
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_database_keeps_timer_open_and_allows_stop_after_reopen() {
+        use optional_task_migration::{transition, TimerAction};
+        use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        struct ResetCapture;
+        impl Drop for ResetCapture { fn drop(&mut self) { DB_ERROR_CAPTURE.with(|capture| drop(capture.take())); } }
+
+        fs::create_dir_all("target").unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = PathBuf::from("target").join(format!("tracker-read-only-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let cleanup = Cleanup(dir);
+        let path = cleanup.0.join("tracker.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Synthetic client');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Synthetic project');").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let started = now();
+        transition(&mut tracker, None, &started, TimerAction::Start {
+            project_id: 1, task_id: None, description: "Read-only test",
+        }).unwrap();
+        let id = snapshot(&tracker).unwrap().active.unwrap().id;
+        let clock = tracker.running_since.take();
+        drop(tracker);
+
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(db.is_readonly(rusqlite::DatabaseName::Main).unwrap());
+        let mut tracker = Tracker { db, running_since: clock, restored: false };
+        DB_ERROR_CAPTURE.with(|capture| {
+            assert!(capture.borrow().is_none());
+            *capture.borrow_mut() = Some(Vec::new());
+        });
+        let _reset = ResetCapture;
+        let result = transition(&mut tracker, Some(id), &now(), TimerAction::Stop);
+        let errors = DB_ERROR_CAPTURE.with(|capture| capture.take().unwrap());
+        assert_eq!(result.unwrap_err(), "Nie udało się zapisać lub odczytać danych lokalnych.");
+        assert!(errors.iter().any(|error| error.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)),
+            "expected SQLite read-only error, got {errors:?}");
+        assert!(tracker.db.is_autocommit());
+        assert_eq!(snapshot(&tracker).unwrap().active.unwrap().id, id);
+        let persisted: (String, Option<String>, Option<i64>) = tracker.db.query_row(
+            "SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1", [id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(persisted, (started, None, None));
+        let clock = tracker.running_since.take();
+        drop(tracker);
+
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        assert!(!db.is_readonly(rusqlite::DatabaseName::Main).unwrap());
+        let mut tracker = Tracker { db, running_since: clock, restored: false };
+        transition(&mut tracker, Some(id), &now(), TimerAction::Stop).unwrap();
+        assert!(snapshot(&tracker).unwrap().active.is_none());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let saved: (Option<String>, Option<i64>) = tracker.db.query_row(
+            "SELECT ended_at,duration_seconds FROM time_entries WHERE id=?1", [id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert!(saved.0.is_some() && saved.1.is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn project_timer_write_failures_roll_back_on_disk_and_allow_retry() {
         use optional_task_migration::{transition, TimerAction};
         use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
@@ -2838,7 +3056,6 @@ mod tests {
         assert_eq!(version, 0);
         assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'projects')", [], |r| r.get::<_, bool>(0)).unwrap());
     }
-
     #[test]
     fn completed_sleep_is_separate_in_report_and_client_export() {
         let mut db = Connection::open_in_memory().unwrap();
@@ -2915,6 +3132,7 @@ mod tests {
         assert!(period.manual_resume);
         assert_eq!(period.decision,"pending");
     }
+
 
     #[test]
     fn fresh_and_v11_databases_reach_v12_with_valid_sleep_schema() {
