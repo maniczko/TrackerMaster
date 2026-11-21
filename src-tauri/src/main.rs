@@ -287,7 +287,7 @@ fn ensure_no_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<()> {
 fn completed_sleep(db: &Connection, id: i64, start: &str, end: &str) -> Cmd<Option<(i64, Vec<sleep_periods::SleepPeriod>)>> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     if version < 12 { return Ok(None); }
-    sleep_periods::completed_periods(db, id, start, end)
+    sleep_periods::periods_within_entry(db, id, start, end)
         .map_err(|_| "Nie można bezpiecznie rozliczyć zapisanych okresów uśpienia. Sprawdź dane i kopię.".into())
 }
 fn enrich_entries_with_sleep(db: &Connection, entries: &mut [Entry]) -> Cmd<()> {
@@ -351,9 +351,21 @@ fn report_data_for_scope(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<P
 fn pending_sleep(db: &Connection) -> Cmd<Vec<PendingSleep>> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     if version < 12 { return Ok(Vec::new()); }
-    let mut stmt = db.prepare("SELECT s.id,s.entry_id,s.started_ms,s.ended_ms,c.name,p.name,t.name,s.manual_resume FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id WHERE s.decision='pending' AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id) ORDER BY s.started_ms,s.id").map_err(db_err)?;
-    let rows = stmt.query_map([], |r| Ok(PendingSleep { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, client:r.get(4)?, project:r.get(5)?, task:r.get(6)?, manual_resume:r.get(7)? })).map_err(db_err)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    let mut stmt = db.prepare("SELECT s.id,s.entry_id,s.started_ms,s.ended_ms,c.name,p.name,t.name,s.manual_resume,e.ended_at FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id WHERE s.decision='pending' AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id) ORDER BY s.started_ms,s.id").map_err(db_err)?;
+    let rows = stmt.query_map([], |r| Ok((PendingSleep { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, client:r.get(4)?, project:r.get(5)?, task:r.get(6)?, manual_resume:r.get(7)? }, r.get::<_, Option<String>>(8)?))).map_err(db_err)?;
+    let mut pending = Vec::new();
+    for row in rows {
+        let (mut item, entry_end) = row.map_err(db_err)?;
+        // For a completed entry only the fragment before its end is offered for
+        // a decision, matching periods_within_entry; later sleep is not shown.
+        if let Some(entry_end) = entry_end {
+            let end = DateTime::parse_from_rfc3339(&entry_end).map_err(|_| "Niepoprawny zapis czasu w bazie.".to_string())?.timestamp_millis();
+            if item.started_ms >= end { continue; }
+            item.ended_ms = Some(item.ended_ms.map_or(end, |value| value.min(end)));
+        }
+        pending.push(item);
+    }
+    Ok(pending)
 }
 
 #[tauri::command]
@@ -1032,10 +1044,16 @@ fn resolve_recovered(tracker: &mut Tracker, end: &str, current: DateTime<Utc>) -
     if end < start { return Err("Zakończenie nie może być przed rozpoczęciem pomiaru.".into()); }
     if end > start { ensure_no_overlap(&tx, start, end, Some(id))?; }
     let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
-    // Pending and excluded sleep is never stored as work; an unfinished or
-    // out-of-range period blocks recovery instead of being guessed.
+    // The end may lie before recorded sleep (the user stopped earlier). Sleep
+    // starting at or after the end is not part of the entry; sleep that began
+    // earlier is clipped to the end and stays pending. Pending and excluded
+    // sleep is never stored as work, so the result can only be smaller.
     let seconds = if has_sleep_periods(&tx,id)? {
-        sleep_periods::completed_periods(&tx,id,&start_text,&end_text).map_err(|_| "Najpierw ustal prawidłowy koniec każdego okresu uśpienia; nie może on wypadać po końcu pomiaru.")?.ok_or("Brakuje danych okresu uśpienia.")?.0
+        sleep_periods::close_open_at_entry_end(&tx,id,end.timestamp_millis()).map_err(db_err)?;
+        match sleep_periods::periods_within_entry(&tx,id,&start_text,&end_text).map_err(|_| "Nie można bezpiecznie rozliczyć zapisanych okresów uśpienia. Sprawdź dane i kopię.")? {
+            Some((work, _)) => work,
+            None => (end - start).num_seconds(),
+        }
     } else { (end - start).num_seconds() };
     tx.execute("UPDATE time_entries SET ended_at=?1,duration_seconds=?2,manually_resolved=1 WHERE id=?3 AND ended_at IS NULL", params![end_text,seconds,id]).map_err(db_err)?;
     tx.commit().map_err(db_err)
@@ -3121,9 +3139,9 @@ mod tests {
         let id=sleep_periods::record_suspend(&mut db,1,suspend).unwrap();
         let mut tracker=Tracker { db,running_since:None,restored:false };
         let now=DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
-        assert!(resolve_recovered(&mut tracker,"2026-01-01T13:00:00Z",now).is_err());
+        // Ending before or during sleep is allowed since 21.11.2026 (PO); see
+        // recovery_end_before_sleep_* tests. Here the wake time is supplied first.
         sleep_periods::record_resume_manual(&mut tracker.db,1,id,suspend+7_200_000,now.timestamp_millis()).unwrap();
-        assert!(resolve_recovered(&mut tracker,"2026-01-01T12:00:00Z",now).is_err());
         resolve_recovered(&mut tracker,"2026-01-01T13:00:00Z",now).unwrap();
         let snapshot=snapshot(&tracker).unwrap();
         assert!(snapshot.active.is_none());
@@ -3175,6 +3193,119 @@ mod tests {
         mark_entry_deleted(&mut tracker, 2, "2026-01-02T10:00:00.000Z", "2026-01-02T10:30:00.000Z", "2026-01-03T10:00:00Z").unwrap();
     }
 
+    // Owner's Windows 11 case (21.11.2026): entry 7 started 19.11 18:48 with five
+    // sleep periods, the last one still open. Times are UTC for clarity.
+    fn ms(value: &str) -> i64 { DateTime::parse_from_rfc3339(value).unwrap().timestamp_millis() }
+    fn owner_recovery_fixture() -> (Tracker, Vec<i64>) {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'); INSERT INTO time_entries(id,project_id,started_at) VALUES(7,1,'2026-11-19T18:48:00Z');").unwrap();
+        let mut ids = Vec::new();
+        for (from, to) in [("2026-11-19T19:30:00Z", "2026-11-19T19:45:00Z"), ("2026-11-19T20:10:00Z", "2026-11-19T20:40:00Z"),
+                           ("2026-11-19T21:00:00Z", "2026-11-19T21:20:00Z"), ("2026-11-19T22:15:00Z", "2026-11-19T23:00:00Z")] {
+            let id = sleep_periods::record_suspend(&mut db, 7, ms(from)).unwrap();
+            sleep_periods::record_resume(&mut db, 7, id, ms(to)).unwrap();
+            ids.push(id);
+        }
+        ids.push(sleep_periods::record_suspend(&mut db, 7, ms("2026-11-20T00:04:00Z")).unwrap());
+        (Tracker { db, running_since: None, restored: false }, ids)
+    }
+    fn owner_now() -> DateTime<Utc> { DateTime::parse_from_rfc3339("2026-11-21T10:00:00Z").unwrap().with_timezone(&Utc) }
+    fn stored_seconds(tracker: &Tracker) -> i64 {
+        tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=7", [], |r| r.get(0)).unwrap()
+    }
+    // Report (history and report data) and CSV must count the same seconds.
+    fn assert_consistent(tracker: &Tracker, seconds: i64) {
+        assert_eq!(snapshot(tracker).unwrap().entries[0].duration_seconds, seconds);
+        assert_eq!(report_data(tracker, owner_now(), Err("unused".into())).unwrap().entries[0].duration_seconds, seconds);
+        assert_eq!(client_export_data(&tracker.db, 1).unwrap().entries[0].duration_seconds, seconds);
+    }
+
+    #[test]
+    fn recovery_end_before_sleep_rejects_future_and_pre_start_end() {
+        let (mut tracker, _) = owner_recovery_fixture();
+        assert!(resolve_recovered(&mut tracker, "2026-11-21T10:00:01Z", owner_now()).is_err());
+        assert!(resolve_recovered(&mut tracker, "2026-11-19T18:47:59Z", owner_now()).is_err());
+        assert!(snapshot(&tracker).unwrap().active.is_some());
+        assert!(sleep_periods::list_for_entry(&tracker.db, 7).unwrap()[4].ended_ms.is_none());
+    }
+
+    #[test]
+    fn recovery_end_before_first_sleep_ignores_all_later_sleep() {
+        let (mut tracker, ids) = owner_recovery_fixture();
+        resolve_recovered(&mut tracker, "2026-11-19T19:15:00Z", owner_now()).unwrap();
+        assert_eq!(stored_seconds(&tracker), 27 * 60);
+        assert_consistent(&tracker, 27 * 60);
+        let entry = snapshot(&tracker).unwrap().entries.remove(0);
+        assert!(entry.sleep_periods.is_none());
+        assert!(pending_sleep(&tracker.db).unwrap().is_empty());
+        // Periods after the end stay stored unchanged, open one included, and cannot be decided.
+        let stored = sleep_periods::list_for_entry(&tracker.db, 7).unwrap();
+        assert_eq!(stored.len(), 5);
+        assert!(stored[4].ended_ms.is_none());
+        assert!(sleep_periods::resolve(&mut tracker.db, 7, ids[0], true, ms("2026-11-21T10:00:00Z")).is_err());
+        assert_consistent(&tracker, 27 * 60);
+    }
+
+    #[test]
+    fn recovery_end_between_sleep_periods_counts_only_earlier_sleep() {
+        let (mut tracker, ids) = owner_recovery_fixture();
+        resolve_recovered(&mut tracker, "2026-11-19T20:50:00Z", owner_now()).unwrap();
+        // 2 h 02 min minus pending 15 + 30 min.
+        assert_eq!(stored_seconds(&tracker), 7_320 - 2_700);
+        assert_consistent(&tracker, 4_620);
+        let pending = pending_sleep(&tracker.db).unwrap();
+        assert_eq!(pending.iter().map(|p| p.id).collect::<Vec<_>>(), vec![ids[0], ids[1]]);
+        assert!(sleep_periods::resolve(&mut tracker.db, 7, ids[2], true, ms("2026-11-21T10:00:00Z")).is_err());
+        assert!(sleep_periods::list_for_entry(&tracker.db, 7).unwrap()[4].ended_ms.is_none());
+        sleep_periods::resolve(&mut tracker.db, 7, ids[1], true, ms("2026-11-21T10:00:00Z")).unwrap();
+        assert_consistent(&tracker, 4_620 + 1_800);
+        sleep_periods::resolve(&mut tracker.db, 7, ids[0], false, ms("2026-11-21T10:00:01Z")).unwrap();
+        assert_consistent(&tracker, 4_620 + 1_800);
+        assert!(pending_sleep(&tracker.db).unwrap().is_empty());
+        assert_eq!(stored_seconds(&tracker), 4_620); // Raw value is immutable; decisions apply on read.
+    }
+
+    #[test]
+    fn recovery_end_during_sleep_clips_that_period_for_decision() {
+        let (mut tracker, ids) = owner_recovery_fixture();
+        resolve_recovered(&mut tracker, "2026-11-19T22:30:00Z", owner_now()).unwrap();
+        // 3 h 42 min minus pending 15 + 30 + 20 + 15 (clipped) min.
+        assert_eq!(stored_seconds(&tracker), 13_320 - 4_800);
+        assert_consistent(&tracker, 8_520);
+        let pending = pending_sleep(&tracker.db).unwrap();
+        assert_eq!(pending.len(), 4);
+        assert_eq!((pending[3].id, pending[3].ended_ms), (ids[3], Some(ms("2026-11-19T22:30:00Z"))));
+        let entry = snapshot(&tracker).unwrap().entries.remove(0);
+        assert_eq!(entry.sleep_periods.as_ref().unwrap()[3].ended_ms, Some(ms("2026-11-19T22:30:00Z")));
+        // The stored boundary is unchanged; only the calculation is clipped.
+        assert_eq!(sleep_periods::list_for_entry(&tracker.db, 7).unwrap()[3].ended_ms, Some(ms("2026-11-19T23:00:00Z")));
+        // Including the clipped fragment adds only its 15 minutes, never the full period.
+        sleep_periods::resolve(&mut tracker.db, 7, ids[3], true, ms("2026-11-21T10:00:00Z")).unwrap();
+        assert_consistent(&tracker, 8_520 + 900);
+        assert!(sleep_periods::resolve(&mut tracker.db, 7, ids[4], true, ms("2026-11-21T10:00:01Z")).is_err());
+        assert!(correct_entry(&mut tracker, 7, "2026-11-19T18:48:00Z", "2026-11-19T22:30:00.000Z", "2026-11-19T18:48:00Z", "2026-11-19T22:00:00Z", owner_now()).is_err());
+    }
+
+    #[test]
+    fn recovery_end_after_open_sleep_closes_it_at_the_end_and_keeps_it_pending() {
+        let (mut tracker, ids) = owner_recovery_fixture();
+        resolve_recovered(&mut tracker, "2026-11-20T01:00:00Z", owner_now()).unwrap();
+        // 6 h 12 min minus pending 15 + 30 + 20 + 45 + 56 (open, until the end) min.
+        assert_eq!(stored_seconds(&tracker), 22_320 - 9_960);
+        assert_consistent(&tracker, 12_360);
+        let open = &sleep_periods::list_for_entry(&tracker.db, 7).unwrap()[4];
+        assert_eq!((open.id, open.ended_ms, open.manual_resume, open.decision.as_str()), (ids[4], Some(ms("2026-11-20T01:00:00Z")), true, "pending"));
+        assert_eq!(pending_sleep(&tracker.db).unwrap().len(), 5);
+        for (index, id) in ids.iter().enumerate() {
+            sleep_periods::resolve(&mut tracker.db, 7, *id, index % 2 == 0, ms("2026-11-21T10:00:00Z") + index as i64).unwrap();
+        }
+        // Included: 15 + 20 + 56 min. Never more than the wall time between start and end.
+        assert_consistent(&tracker, 12_360 + 5_460);
+        assert!(12_360 + 5_460 <= 22_320);
+        assert!(pending_sleep(&tracker.db).unwrap().is_empty());
+    }
+
     #[test]
     fn recovered_timer_with_sleep_stores_only_work_and_keeps_decision_pending() {
         let mut db = Connection::open_in_memory().unwrap();
@@ -3184,12 +3315,11 @@ mod tests {
         let id = sleep_periods::record_suspend(&mut db, 1, suspend).unwrap();
         let mut tracker = Tracker { db, running_since: None, restored: false };
         let now = DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
-        // An unfinished sleep period blocks recovery instead of guessing.
-        assert!(resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).is_err());
+        // An end in the future or before the start is still refused.
+        assert!(resolve_recovered(&mut tracker, "2026-01-01T14:00:01Z", now).is_err());
+        assert!(resolve_recovered(&mut tracker, "2026-01-01T09:59:59Z", now).is_err());
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE id=1 AND ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         sleep_periods::record_resume_manual(&mut tracker.db, 1, id, suspend + 7_200_000, now.timestamp_millis()).unwrap();
-        // The end may not cut through a recorded sleep period.
-        assert!(resolve_recovered(&mut tracker, "2026-01-01T12:00:00Z", now).is_err());
         resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).unwrap();
         let seconds: i64 = tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=1", [], |r| r.get(0)).unwrap();
         assert_eq!(seconds, 3600); // 3 h wall time minus 2 h pending sleep.
