@@ -36,7 +36,7 @@ jobs:
       - name: Check mini timer model and keyboard transitions
         run: node --test tests/miniTimer.test.ts
       - name: Check UI design tokens, contrast and font sizes
-        run: node --test tests/designTokens.test.mjs
+        run: node --test tests/designTokens.test.mjs tests/previewIsolation.test.mjs
       - name: Run Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build isolated Windows test executable

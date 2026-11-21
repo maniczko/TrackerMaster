@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "preview:ui": "vite --config vite.preview.config.ts"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5.1",
