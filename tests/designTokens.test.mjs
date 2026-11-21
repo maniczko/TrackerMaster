@@ -99,6 +99,28 @@ test('report of measured pairs', () => {
   }
 });
 
+function hue(value) {
+  const [r, g, b] = [1, 3, 5].map(index => parseInt(value.slice(index, index + 2), 16) / 255);
+  const max = Math.max(r, g, b), delta = max - Math.min(r, g, b);
+  if (!delta) return 0;
+  const sector = max === r ? ((g - b) / delta) % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
+  return (sector * 60 + 360) % 360;
+}
+const hueDistance = (a, b) => { const d = Math.abs(hue(a) - hue(b)) % 360; return Math.min(d, 360 - d); };
+
+test('Stop is a warm coral, distinct from the irreversible danger action (PO decision)', () => {
+  for (const stop of ['--color-stop', '--color-stop-strong']) {
+    const ratio = contrast(hex('--color-on-stop'), hex(stop));
+    const distance = hueDistance(hex(stop), hex('--color-danger'));
+    console.log(`${stop} ${hex(stop)}: hue ${hue(hex(stop)).toFixed(1)}°, white ${ratio.toFixed(2)}:1, ` +
+      `danger ${hex('--color-danger')} hue ${hue(hex('--color-danger')).toFixed(1)}°, distance ${distance.toFixed(1)}°`);
+    assert.equal(hex('--color-on-stop'), '#ffffff');
+    assert.ok(ratio >= 4.5, `${stop}: white icon/text contrast ${ratio.toFixed(2)} < 4.5`);
+    assert.ok(distance >= 8, `${stop}: hue distance to danger ${distance.toFixed(1)}° < 8°`);
+    assert.ok(hue(hex(stop)) >= 12 && hue(hex(stop)) <= 20, `${stop}: hue is outside the coral/terracotta range`);
+  }
+});
+
 test('Teal Glint is decoration only, never text', () => {
   assert.ok(contrast(hex('--tm-teal-glint'), hex('--color-surface')) < 4.5, 'Glint is not a text colour on light surfaces');
   for (const css of [appOutsideRoot, withoutComments(miniCss)]) {
@@ -110,6 +132,9 @@ test('raw colours exist only in the :root token block; the mini timer has no pal
   assert.deepEqual(appOutsideRoot.match(/#[0-9a-fA-F]{3,8}\b/g) ?? [], []);
   const mini = withoutComments(miniCss);
   assert.deepEqual(mini.match(/#[0-9a-fA-F]{3,8}\b/g) ?? [], []);
+  const functionalColour = /\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(/gi;
+  assert.deepEqual(appOutsideRoot.match(functionalColour) ?? [], [], 'rgba()/hsl() colours belong in :root tokens');
+  assert.deepEqual(mini.match(functionalColour) ?? [], [], 'the mini timer uses shadow and colour tokens only');
   assert.deepEqual(mini.match(/--[\w-]+\s*:/g) ?? [], [], 'miniTimer.css must not define its own custom properties');
   assert.deepEqual(appOutsideRoot.match(/--[\w-]+\s*:/g) ?? [], [], 'tokens are defined only in :root');
 });

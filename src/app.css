@@ -47,9 +47,10 @@
   --color-pending-bg: #fff6e3;
   --color-pending-text: #6b4706;
   --color-pending-border: #a87720;
-  /* Warm "stop" action for the running timer: distinct from error banners (PO, mini timer). */
-  --color-stop: #b34a3a;
-  --color-stop-strong: #9a3f31;
+  /* Warm coral/terracotta "stop" for the running timer (PO decision, PR #42): hue ~15°,
+     clearly apart from --color-danger (~3°) so Stop does not read as an irreversible action. */
+  --color-stop: #b85636;
+  --color-stop-strong: #9c492d;
   --color-on-stop: var(--tm-white);
 
   /* Typography: one offline system family (Windows 11 Segoe UI Variable / Segoe UI). */
@@ -77,6 +78,8 @@
   --control-h-lg: 48px;
   --control-h-sm: 32px;
   --shadow-card: 0 1px 2px rgba(16, 43, 52, .06);
+  --shadow-control: 0 1px 2px rgba(16, 43, 52, .18);
+  --color-backdrop: rgba(16, 43, 52, .4);
 
   color: var(--color-text);
   background: var(--color-bg);
@@ -238,6 +241,8 @@ main { max-width: 1200px; margin: 0 auto; padding: var(--space-6) var(--space-6)
 .timer-setup { display: grid; gap: var(--space-3); min-width: 0; padding-left: var(--space-8); border-left: 1px solid var(--color-border); }
 .clock { margin: var(--space-2) 0 0; font-size: var(--text-clock); font-weight: 650; line-height: 1.05; letter-spacing: -.02em; color: var(--color-text); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .timer:has(.status.pending) .clock, .timer:has(.status:not(.running):not(.pending)) .clock { color: var(--color-text-muted); }
+/* Unknown time ("—:—:—") must not read as a slider: spaced, lighter and muted. */
+.clock.clock-unknown { color: var(--color-text-muted); font-weight: 400; letter-spacing: .12em; }
 .clock-caption { margin: 0; color: var(--color-text-muted); font-size: var(--text-sm); }
 .timer .actions { margin-top: 0; }
 .timer-stop button, .timer-start button { flex: 1 1 auto; min-height: var(--control-h-lg); font-size: var(--text-md); }
@@ -333,7 +338,7 @@ footer { margin: var(--space-6) 0; text-align: center; color: var(--color-text-m
 .entry-draft-list .actions { margin: 0; }
 .entry-draft-review td { white-space: pre-wrap; }
 .entry-draft-dialog { max-width: min(480px, calc(100vw - 32px)); padding: var(--space-6); color: var(--color-text); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); }
-.entry-draft-dialog::backdrop { background: rgba(16, 43, 52, .4); }
+.entry-draft-dialog::backdrop { background: var(--color-backdrop); }
 
 @media (max-width: 960px) {
   .report-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
