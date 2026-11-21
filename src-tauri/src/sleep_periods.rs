@@ -97,10 +97,31 @@ pub fn record_resume_manual(db: &mut Connection, entry_id: i64, period_id: i64, 
     tx.commit()
 }
 
+/// When a recovered entry is ended manually at `end_ms`, an open period that
+/// began before that end is completed at `end_ms` inside the caller's
+/// transaction, so the remaining fragment can still be decided. It is marked
+/// as user-provided and stays pending. An open period starting at or after the
+/// end is outside the entry and is left untouched. Returns the number of rows.
+pub fn close_open_at_entry_end(db: &Connection, entry_id: i64, end_ms: i64) -> Result<usize> {
+    if entry_id <= 0 || !valid_ms(end_ms) { return Err(Error::InvalidQuery); }
+    db.execute(
+        "UPDATE sleep_periods SET ended_ms=?1,manual_resume=1 WHERE entry_id=?2 AND ended_ms IS NULL AND decision='pending' AND started_ms<?1",
+        params![end_ms, entry_id],
+    )
+}
+
 /// Decide only one identified, complete pending period. Retry cannot double count.
+/// A period that starts at or after the end of its completed entry is outside
+/// the entry's time and cannot be decided.
 pub fn resolve(db: &mut Connection, entry_id: i64, period_id: i64, include: bool, decided_ms: i64) -> Result<()> {
     if entry_id <= 0 || period_id <= 0 || !valid_ms(decided_ms) { return Err(Error::InvalidQuery); }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(i64, Option<String>)> = tx.query_row("SELECT s.started_ms,e.ended_at FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id WHERE s.id=?1 AND s.entry_id=?2", params![period_id, entry_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let (started_ms, entry_end) = row.ok_or(Error::InvalidQuery)?;
+    if let Some(entry_end) = entry_end {
+        let entry_end = DateTime::parse_from_rfc3339(&entry_end).map_err(|_| Error::InvalidQuery)?.timestamp_millis();
+        if started_ms >= entry_end { return Err(Error::InvalidQuery); }
+    }
     let decision = if include { "included" } else { "excluded" };
     let count = tx.execute(
         "UPDATE sleep_periods SET decision=?1, decided_ms=?2 WHERE id=?3 AND entry_id=?4 AND decision='pending' AND ended_ms IS NOT NULL",
@@ -117,8 +138,49 @@ pub fn list_for_entry(db: &Connection, entry_id: i64) -> Result<Vec<SleepPeriod>
     rows.collect()
 }
 
-/// Prepare a completed entry for reports. All boundaries are validated before
-/// returning data; an open or inconsistent interval makes the entry unsafe.
+/// Sleep periods counted within a completed entry `[started_at, ended_at)`.
+/// The end E may lie before recorded sleep (the user stopped working earlier):
+/// a period starting at or after E is outside the entry and ignored; a period
+/// starting before E is clipped to `[start, min(end, E))`, an open one to E.
+/// The returned periods carry the clipped end, so every consumer (report,
+/// history, CSV, frontend split) counts the same fragment. Time is never added:
+/// pending and excluded fragments are subtracted, included ones stay work.
+/// Stored rows are validated as recorded; inconsistent data fails closed.
+pub fn periods_within_entry(db: &Connection, entry_id: i64, started_at: &str, ended_at: &str) -> Result<Option<(i64, Vec<SleepPeriod>)>> {
+    let periods = list_for_entry(db, entry_id)?;
+    if periods.is_empty() { return Ok(None); }
+    let start = DateTime::parse_from_rfc3339(started_at).map_err(|_| Error::InvalidQuery)?.timestamp_millis();
+    let end = DateTime::parse_from_rfc3339(ended_at).map_err(|_| Error::InvalidQuery)?.timestamp_millis();
+    if !valid_ms(start) || !valid_ms(end) || end < start { return Err(Error::InvalidQuery); }
+    let mut cursor = start;
+    let mut seen_open = false;
+    let mut omitted = 0i64;
+    let mut within = Vec::new();
+    for mut period in periods {
+        if period.entry_id != entry_id || seen_open || period.started_ms < cursor || period.started_ms < start { return Err(Error::InvalidQuery); }
+        match period.ended_ms {
+            Some(raw_end) if raw_end <= period.started_ms => return Err(Error::InvalidQuery),
+            Some(raw_end) => cursor = raw_end,
+            None => seen_open = true,
+        }
+        if !matches!(period.decision.as_str(), "pending" | "excluded" | "included") { return Err(Error::InvalidQuery); }
+        if period.started_ms >= end { continue; }
+        let clipped = period.ended_ms.map_or(end, |raw_end| raw_end.min(end));
+        if period.decision != "included" {
+            omitted = omitted.checked_add(clipped - period.started_ms).ok_or(Error::InvalidQuery)?;
+        }
+        period.ended_ms = Some(clipped);
+        within.push(period);
+    }
+    if within.is_empty() { return Ok(None); }
+    let elapsed = end.checked_sub(start).ok_or(Error::InvalidQuery)?;
+    let work = elapsed.checked_sub(omitted).ok_or(Error::InvalidQuery)?;
+    if work < 0 { return Err(Error::InvalidQuery); }
+    Ok(Some((work / 1000, within)))
+}
+
+/// Strict variant for a running entry projected to `ended_at`: every period
+/// must be closed and lie within the interval; anything else is unsafe.
 pub fn completed_periods(db: &Connection, entry_id: i64, started_at: &str, ended_at: &str) -> Result<Option<(i64, Vec<SleepPeriod>)>> {
     let periods = list_for_entry(db, entry_id)?;
     if periods.is_empty() { return Ok(None); }

@@ -64,3 +64,20 @@ test('does not export entries with pending sleep and preserves one row after a d
   assert.equal(rows[0].contribution, 3000);
   assert.equal(rows[0].source.id, entry.id);
 });
+
+test('a sleep fragment clipped at an early manual end counts the same in report and CSV', () => {
+  // Rust periods_within_entry: entry 18:48–22:30, period 22:15–23:00 clipped to
+  // 22:15–22:30, a later period omitted. Pending until decided, then CSV-ready.
+  const ms = (value: string) => Date.parse(value);
+  const base = { ...entry, id: 70, started_at: '2026-11-19T18:48:00Z', ended_at: '2026-11-19T22:30:00Z' };
+  const clipped = { id: 4, entryId: 70, startedMs: ms('2026-11-19T22:15:00Z'), endedMs: ms('2026-11-19T22:30:00Z') };
+  const pending = { ...base, duration_seconds: 13_320 - 900, sleep_periods: [{ ...clipped, decision: 'pending' as const }] };
+  assert.deepEqual(makeExportRows([pending], '2026-11-19', '2026-11-19', 'UTC'), []);
+  const included = { ...base, duration_seconds: 13_320, sleep_periods: [{ ...clipped, decision: 'included' as const }] };
+  assert.equal(makeExportRows([included], '2026-11-19', '2026-11-19', 'UTC')[0].contribution, 13_320);
+  const excluded = { ...base, duration_seconds: 13_320 - 900, sleep_periods: [{ ...clipped, decision: 'excluded' as const }] };
+  assert.equal(makeExportRows([excluded], '2026-11-19', '2026-11-19', 'UTC')[0].contribution, 12_420);
+  // An unclipped period reaching past the entry end is rejected, not counted.
+  const unclipped = { ...pending, sleep_periods: [{ ...clipped, endedMs: ms('2026-11-19T23:00:00Z'), decision: 'excluded' as const }] };
+  assert.throws(() => makeExportRows([unclipped], '2026-11-19', '2026-11-19', 'UTC'));
+});
