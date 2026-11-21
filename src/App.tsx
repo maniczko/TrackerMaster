@@ -168,7 +168,16 @@ export default function App() {
     try {
       const safetyPath = await invoke<string>('apply_backup_restore', { token: restorePreview.token, confirmed: true });
       setRestoreDone(safetyPath); setRestorePreview(null); setRestoreConfirmed(false);
-    } catch (e) { setRestorePreview(null); setRestoreConfirmed(false); setError(`${String(e)} Sprawdź kopię ponownie przed kolejną próbą.`); }
+    } catch (e) {
+      const message = String(e);
+      setRestoreConfirmed(false);
+      if (message === 'Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.') {
+        setError(message);
+      } else {
+        setRestorePreview(null);
+        setError(`${message} Sprawdź kopię ponownie przed kolejną próbą.`);
+      }
+    }
     finally { setBusy(false); }
   }
   const create = (kind: 'client' | 'project' | 'task') => async (event: FormEvent) => {
@@ -198,7 +207,7 @@ export default function App() {
       {loaded && data.active?.uncertain && !data.active.recovered && <div role="alert" className="alert pending"><strong>Nie można wiarygodnie wyświetlić czasu pomiaru.</strong> Przyczyną mogło być uśpienie komputera, pominięte zdarzenie zasilania lub zmiana zegara. {data.active.has_sleep ? 'Jeśli na liście okresów uśpienia brakuje czasu wybudzenia, najpierw go uzupełnij. ' : ''}Następnie zatrzymaj pomiar: jeśli czasu nie da się potwierdzić, aplikacja nie zapisze końca i poprosi o faktyczny czas zakończenia.{' '}
         <button type="button" disabled={busy} onClick={() => void execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.')}>Zatrzymaj i rozlicz</button></div>}
       {loaded && data.active?.recovered && <div role="alert" className="alert pending"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto: {formatDate(data.active.started_at)}. Podaj faktyczny czas zakończenia. {data.active.has_sleep ? 'Zapisane okresy uśpienia pozostają osobno do Twojej decyzji. Jeśli nie mają czasu wybudzenia, uzupełnij go na liście poniżej przed zapisaniem końca pomiaru. Pozostały czas między początkiem a wskazanym końcem, także niezarejestrowane przerwy, zostanie zaliczony jako praca.' : 'Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.'}
-        <form onSubmit={e => { e.preventDefault(); const end = new Date(recoveryEnd); if (!recoveryEnd || Number.isNaN(end.getTime())) { setError('Podaj poprawną datę zakończenia.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
+        <form onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
           <label>Data i godzina zakończenia <input type="datetime-local" step="1" required value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
           <button type="submit" className="primary" disabled={busy || !loaded || !recoveryEnd}>Zapisz zakończenie</button>
         </form></div>}
@@ -257,7 +266,6 @@ export default function App() {
         <EntryDraftEditor ref={entryEditor} clients={data.clients} projects={data.projects} tasks={data.tasks}
           enabled={loaded && !busy} onCommitted={async entryId => {
             setNotice('Zmiany wpisu zostały zapisane.');
-            // Backend potwierdził commit; odśwież raport nawet, gdy odczyt historii się nie powiedzie.
             setReportRevision(version => version + 1);
             try {
               await refresh();
