@@ -1,0 +1,124 @@
+// PREVIEW ONLY: in-memory stand-in for the Tauri backend. Fictional data; nothing is persisted.
+type Id = number;
+type Entry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null;
+  recovered?: boolean; uncertain?: boolean; has_sleep?: boolean; excluded_sleep_ms?: number; manually_resolved?: boolean; billable: boolean; description: string };
+
+const params = new URLSearchParams(location.search);
+const scenario = params.get('scenario') ?? 'running';
+const now = () => Date.now();
+const iso = (ms: number) => new Date(ms).toISOString();
+const H = 3_600_000, M = 60_000;
+const dayStart = (() => { const d = new Date(); d.setHours(8, 30, 0, 0); return d.getTime(); })();
+
+const clients = [
+  { id: 1, name: 'Klient Alfa', archived: false },
+  { id: 2, name: 'Fundacja Źródło Zieleni — oddział Łódź Północ', archived: false },
+  { id: 3, name: 'Archiwalny Klient Beta', archived: true },
+];
+const projects = [
+  { id: 11, client_id: 1, name: 'Strona internetowa', archived: false, billable: true },
+  { id: 12, client_id: 1, name: 'Wsparcie techniczne', archived: false, billable: false },
+  { id: 21, client_id: 2, name: 'Kampania zimowa 2026 — materiały dla wolontariuszy', archived: false, billable: true },
+  { id: 31, client_id: 3, name: 'Stary projekt', archived: true, billable: false },
+];
+const tasks = [
+  { id: 111, project_id: 11, name: 'Projekt graficzny', archived: false },
+  { id: 112, project_id: 11, name: 'Wdrożenie', archived: false },
+  { id: 211, project_id: 21, name: 'Przygotowanie ulotek', archived: false },
+];
+let nextId = 100;
+const entries: Entry[] = [
+  { id: 1, task_id: 111, project_id: 11, started_at: iso(dayStart), ended_at: iso(dayStart + 1.5 * H), duration_seconds: 5400, billable: true, description: 'Makiety strony głównej' },
+  { id: 2, task_id: null, project_id: 12, started_at: iso(dayStart + 1.75 * H), ended_at: iso(dayStart + 2.25 * H), duration_seconds: 1800, billable: false, description: 'Odpowiedź na zgłoszenie' },
+  { id: 3, task_id: 211, project_id: 21, started_at: iso(dayStart - 22 * H), ended_at: iso(dayStart - 19 * H), duration_seconds: 10800, billable: true, description: 'Teksty ulotek — wersja z długim opisem, żeby sprawdzić zawijanie w tabeli' },
+];
+let active: Entry | null = null;
+type Pending = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean };
+let pending: Pending[] = [];
+
+if (scenario === 'running') active = { id: 50, task_id: 112, project_id: 11, started_at: iso(now() - 25 * M), ended_at: null, billable: true, description: 'Poprawki po przeglądzie' };
+if (scenario === 'recovered' || scenario === 'sleep') {
+  active = { id: 51, task_id: null, project_id: 21, started_at: iso(now() - 5 * H), ended_at: null, billable: true, description: 'Pomiar przerwany przez zakończenie procesu',
+    recovered: scenario === 'recovered', uncertain: scenario === 'sleep', has_sleep: true };
+  pending = [
+    { id: 1, entryId: 51, startedMs: now() - 4 * H, endedMs: now() - 3.5 * H, client: clients[1].name, project: projects[2].name, task: null, manualResume: false },
+    { id: 2, entryId: 51, startedMs: now() - 2 * H, endedMs: null, client: clients[1].name, project: projects[2].name, task: null, manualResume: false },
+  ];
+}
+
+const snapshot = () => ({ clients, projects, tasks, active: active && { ...active }, entries: [...entries].reverse() });
+const health = () => ({ schema_version: 13, clients: clients.length, projects: projects.length, tasks: tasks.length, completed_entries: entries.length, open_entries: active ? 1 : 0 });
+const close = (end: number) => {
+  if (!active) throw 'Brak aktywnego pomiaru.';
+  const start = Date.parse(active.started_at);
+  entries.push({ ...active, recovered: undefined, uncertain: undefined, ended_at: iso(end), duration_seconds: Math.max(0, Math.round((end - start) / 1000)) });
+  active = null;
+};
+const start = (projectId: number, taskId: number | null, description = '') => {
+  if (active) close(now());
+  const project = projects.find(p => p.id === projectId);
+  if (!project) throw 'Wybierz projekt.';
+  active = { id: nextId++, task_id: taskId, project_id: projectId, started_at: iso(now()), ended_at: null, billable: project.billable, description };
+};
+const reportData = () => ({
+  entries: entries.map(e => ({ ...e, project_id: Number(e.project_id) })),
+  active: active && !active.recovered && !active.uncertain ? { ...active, ended_at: iso(now()), duration_seconds: Math.round((now() - Date.parse(active.started_at)) / 1000), unresolved: false } : null,
+  time_zone: 'Europe/Warsaw',
+});
+const exportData = (scope: { clientId?: number | null; projectId?: number | null; taskId?: number | null }) => {
+  const clientId = Number(scope?.clientId);
+  const client = clients.find(c => c.id === clientId);
+  if (!client) throw 'Wybierz klienta do eksportu.';
+  const rows = entries.filter(e => projects.find(p => p.id === e.project_id)?.client_id === clientId)
+    .filter(e => scope.projectId == null || e.project_id === scope.projectId).filter(e => scope.taskId == null || e.task_id === scope.taskId)
+    .map(e => ({ id: e.id, client: client.name, project: projects.find(p => p.id === e.project_id)!.name, task: tasks.find(t => t.id === e.task_id)?.name ?? '',
+      description: e.description, started_at: e.started_at, ended_at: e.ended_at!, duration_seconds: e.duration_seconds ?? 0, billable: e.billable }));
+  return { client_id: clientId, client: client.name, time_zone: 'Europe/Warsaw', entries: rows };
+};
+const resize = (expanded: boolean) => { try { window.parent?.postMessage({ type: 'tm-preview-widget', expanded }, '*'); } catch { /* standalone */ } };
+
+const handlers: Record<string, (a: any) => unknown> = {
+  get_snapshot: snapshot,
+  get_report_data: reportData,
+  get_client_export_data: a => exportData(a?.scope ?? {}),
+  get_pending_sleep: () => pending.map(p => ({ ...p })),
+  set_sleep_resume: a => { const p = pending.find(x => x.id === a.periodId); if (p) { p.endedMs = Date.parse(a.endedAt); p.manualResume = true; } },
+  resolve_sleep_period: a => { pending = pending.filter(x => x.id !== a.periodId); if (active && !pending.length) active.has_sleep = false; },
+  start_project_timer: a => { start(a.projectId, a.taskId ?? null, a.description ?? ''); return snapshot(); },
+  widget_project_start: a => { start(a.projectId, a.taskId ?? null, a.description ?? ''); return snapshot(); },
+  stop_timer: () => { if (active?.recovered) throw 'Pomiar wymaga ręcznego zakończenia.'; close(now()); return snapshot(); },
+  widget_stop: () => { if (active?.recovered || active?.uncertain) throw 'Pomiar wymaga weryfikacji w aplikacji.'; close(now()); return snapshot(); },
+  recover_timer: a => {
+    if (pending.some(p => p.endedMs === null)) throw 'Najpierw ustal koniec każdego okresu uśpienia.';
+    close(Date.parse(a.endedAt)); return snapshot();
+  },
+  set_entry_description: a => { const e = entries.find(x => x.id === a.entryId) ?? (active?.id === a.entryId ? active : null); if (e) e.description = a.description; return snapshot(); },
+  set_entry_billable: a => { const e = entries.find(x => x.id === a.entryId) ?? (active?.id === a.entryId ? active : null); if (e) e.billable = a.billable; return snapshot(); },
+  shortcut_status: () => ({ registered: true, message: '', shortcut: 'Ctrl+Shift+Space' }),
+  set_global_shortcut: a => ({ registered: true, message: '', shortcut: a.shortcut }),
+  get_report_filter: () => null, get_report_scope: () => null, get_draft_sort: () => 'newest',
+  get_entry_drafts: () => ({ drafts: [], unreadable: 0 }),
+  restore_widget_on_top: () => false, set_widget_on_top: () => null,
+  diagnose_database: health, create_backup: () => 'C:\\Users\\(podgląd)\\backups\\tracker-podglad.sqlite3',
+  entry_revisions: () => [], billing_revisions: () => [], description_revisions: () => [], deleted_entries: () => [],
+  widget_panel: a => resize(!!a?.expanded),
+};
+
+// Harmless window and preference calls made while screens load. Everything else that
+// the preview does not model is rejected, so the UI never shows a fake success.
+const noOps = new Set(['set_entry_editor_guard', 'resolve_entry_editor_close', 'widget_shortcut_ready', 'set_shortcut_task',
+  'set_report_scope', 'set_report_filter', 'set_draft_sort', 'widget_drag', 'close_widget', 'show_main', 'open_widget']);
+export const UNAVAILABLE = 'Ta akcja nie jest dostępna w podglądzie interfejsu (brak prawdziwego backendu).';
+
+export async function invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  await new Promise(r => setTimeout(r, 60));
+  const handler = handlers[cmd];
+  if (!handler) {
+    if (noOps.has(cmd)) return null as T;
+    console.info('[podgląd] akcja niedostępna:', cmd, args);
+    return Promise.reject(UNAVAILABLE);
+  }
+  try { return handler(args ?? {}) as T; }
+  catch (error) { return Promise.reject(typeof error === 'string' ? error : String(error)); }
+}
+export const isTauri = () => false;
