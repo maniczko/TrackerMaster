@@ -880,6 +880,62 @@ async function chooseFromEntryMenu(cdp, sessionId, evaluate, description, labelP
   return true;
 }
 
+// "⋯" menu of a History entry as a person uses it: keyboard opening, arrows, Home/End, Escape returning
+// focus to the button, and a mouse click outside. Also captures History with the menu open.
+async function verifyEntryMenu(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const press = async (key, keyCode) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code: key, windowsVirtualKeyCode: keyCode }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code: key, windowsVirtualKeyCode: keyCode }, sessionId);
+  };
+  const row = `[...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)}) && row.querySelector('.entry-menu-trigger'))`;
+  const trigger = `${row}?.querySelector('.entry-menu-trigger')`;
+  const state = `(() => {
+    const trigger = ${trigger};
+    const menu = trigger && document.getElementById(trigger.getAttribute('aria-controls'));
+    const items = menu ? [...menu.querySelectorAll('[role="menuitem"]')] : [];
+    const enabled = items.filter(item => !item.disabled);
+    const focused = items.indexOf(document.activeElement);
+    return { expanded: trigger?.getAttribute('aria-expanded'), hidden: menu ? menu.hidden : null,
+      visible: Boolean(menu && !menu.hidden && menu.getClientRects().length), focused, first: items.indexOf(enabled[0]),
+      last: items.indexOf(enabled[enabled.length - 1]), focusedVisible: focused >= 0 && items[focused].getClientRects().length > 0,
+      triggerFocused: document.activeElement === trigger, labels: items.map(item => item.getAttribute('aria-label')) };
+  })()`;
+  await waitFor('History entry menu button', () => evaluate(`Boolean(${trigger} && !${trigger}.disabled)`));
+  assert.equal((await evaluate(state)).expanded, 'false');
+  // Keyboard: ArrowDown on the button opens the menu with focus on the first enabled item.
+  await evaluate(`${trigger}.focus()`);
+  await press('ArrowDown', 40);
+  let menu = await waitFor('entry menu opened from the keyboard', async () => { const s = await evaluate(state); return s.expanded === 'true' && s.visible && s.focused >= 0 ? s : null; });
+  assert.equal(menu.focused, menu.first, 'focus starts on the first enabled item');
+  assert.ok(menu.focusedVisible);
+  assert.ok(menu.labels.every(label => label && label.includes(':')), 'every item names the entry it acts on');
+  await press('ArrowDown', 40);
+  menu = await evaluate(state);
+  assert.ok(menu.focused > menu.first && menu.focusedVisible, 'ArrowDown moves to the next enabled item');
+  await press('End', 35);
+  assert.equal((await evaluate(state)).focused, menu.last);
+  await press('Home', 36);
+  assert.equal((await evaluate(state)).focused, menu.first);
+  await captureSection(cdp, sessionId, 'section.history', `(${state}).visible`, 'history-entry-menu');
+  // Escape closes the menu and returns focus to its button (the screenshot keeps the menu state).
+  await evaluate(`[...${trigger}.closest('.entry-menu').querySelectorAll('[role="menuitem"]')].find(item => !item.disabled).focus()`);
+  await press('Escape', 27);
+  menu = await waitFor('Escape closes the entry menu', async () => { const s = await evaluate(state); return s.expanded === 'false' ? s : null; });
+  assert.equal(menu.hidden, true);
+  assert.equal(menu.triggerFocused, true, 'focus returns to the menu button');
+  // Mouse: opening by click and closing by a pointer press outside the menu.
+  await evaluate(`${trigger}.click()`);
+  await waitFor('entry menu opened by click', async () => (await evaluate(state)).visible);
+  await evaluate(`document.querySelector('section.history h2').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))`);
+  await waitFor('click outside closes the entry menu', async () => (await evaluate(state)).expanded === 'false');
+  console.log('PASS: History entry menu opens from the keyboard and by click, moves with arrows/Home/End, and closes with Escape (focus back) or a click outside');
+}
+
 async function verifyDraft(cdp, sessionId, phase, primary) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
@@ -902,6 +958,8 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
       const alerts = await evaluate(`[...document.querySelectorAll('[role="alert"]')].map(node => node.textContent.trim())`);
       throw new Error(`${error.message}; application alerts: ${JSON.stringify(alerts)}`);
     });
+    // The entry card (editor) as opened from the History menu (UIQ evidence).
+    await captureSection(cdp, sessionId, '.entry-draft-panel[aria-label="Edycja wpisu"]', `Boolean(document.querySelector('.entry-draft-panel #entry-draft-description'))`, 'entry-editor');
     await evaluate(`(() => {
       const field = document.querySelector('#entry-draft-description');
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, ${JSON.stringify(text)});
@@ -1315,6 +1373,7 @@ async function runWindow(port, phase, recovery) {
       // History by day and the closed-report card fed by the shared all-clients read (package 2).
       await captureSection(cdp, sessionId, 'section.history', historyByDayReady, 'history-by-day');
       await captureSection(cdp, sessionId, '[aria-label="Raport czasu"]', reportCardReady, 'report-card');
+      await verifyEntryMenu(cdp, sessionId);
     }
     if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase, child);
     if (phase === 'draft-reopen') await verifyRestoreRetry(cdp, sessionId);

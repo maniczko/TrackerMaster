@@ -25,9 +25,11 @@ type PickerProps = {
   selected: string | undefined;
   onSelect: (key: string) => void;
   disabled: boolean;
+  /** Shown when there is nothing to choose yet; the widget points to the full application. */
+  emptyHint?: string;
 };
 
-export function MiniTimerTaskPicker({ input, choices, recent, selected, onSelect, disabled }: PickerProps) {
+export function MiniTimerTaskPicker({ input, choices, recent, selected, onSelect, disabled, emptyHint = 'Dodaj klienta i projekt w pełnej aplikacji.' }: PickerProps) {
   const [query, setQuery] = useState('');
   const [showAll, setShowAll] = useState(false);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -57,7 +59,7 @@ export function MiniTimerTaskPicker({ input, choices, recent, selected, onSelect
         </div>)}
       </div>)}
     </div>
-    {!keys.length && <p className="qp-hint" role="status">{choices.length ? 'Brak pasujących wyników.' : 'Dodaj klienta i projekt w pełnej aplikacji.'}</p>}
+    {!keys.length && <p className="qp-hint" role="status">{choices.length ? 'Brak pasujących wyników.' : emptyHint}</p>}
     {!!recent.length && !query.trim() && <button type="button" className="qp-text-button" onClick={() => { setShowAll(!showAll); setCursor(null); input.current?.focus(); }} disabled={disabled}>{showAll ? 'Pokaż ostatnio używane' : 'Pokaż wszystkie projekty i zadania'}</button>}
   </div>;
 }

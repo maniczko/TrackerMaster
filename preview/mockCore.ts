@@ -35,6 +35,8 @@ const entries: Entry[] = [
 // Crosses local midnight: History shows it in both days (TECH-09 day pieces).
 const midnight = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); })();
 entries.push({ id: 4, task_id: 112, project_id: 11, started_at: iso(midnight - 0.5 * H), ended_at: iso(midnight + 0.75 * H), duration_seconds: 4500, billable: true, description: 'Nocne wdrożenie poprawek' });
+// ?scenario=empty: first run without clients, projects or entries.
+if (scenario === 'empty') { clients.length = 0; projects.length = 0; tasks.length = 0; entries.length = 0; }
 let active: Entry | null = null;
 type Pending = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean };
 let pending: Pending[] = [];

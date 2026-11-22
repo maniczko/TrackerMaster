@@ -3,6 +3,7 @@
 // so every number shown here equals the report for all clients. Pure, no I/O.
 import { Temporal } from '@js-temporal/polyfill';
 import { reportGlance } from './reportGlanceModel.ts';
+import { reportPresetRange } from './reportPresets.ts';
 import { addDaySeconds, dateInZone, validTimeZone } from './reportTime.ts';
 import { makeReportView } from './reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from './reportView.ts';
@@ -29,6 +30,48 @@ export function timerTotals(data: ReportData, catalog: ReportCatalog, now: numbe
 }
 
 type Id = number | string;
+
+/** What the clock knows about the running timer (the main window snapshot, refreshed every 2.5 s). */
+export type ClockActive = { id: Id; recovered?: boolean; uncertain?: boolean } | null;
+
+/**
+ * Report data for the totals base. A timer that the clock already shows as "do weryfikacji" or with
+ * uncertain time after sleep is never counted, even if the last report read (up to 60 s old) still
+ * had a resolved projection for it.
+ */
+export function totalsBaseData(data: ReportData, clock: ClockActive): ReportData {
+  const awaiting = !!data.active && !!clock && String(clock.id) === String(data.active.id) && (!!clock.recovered || !!clock.uncertain);
+  return awaiting ? { ...data, active: null } : data;
+}
+
+const overlapSeconds = (from: number, to: number, start: number, end: number) => Math.max(0, Math.min(to, end) - Math.max(from, start)) / 1000;
+
+/**
+ * "Dziś … · Tydzień …" that runs with the clock. The base is the report (totalsBaseData + timerTotals at
+ * `now`), which already counts the active timer up to the end of its projection. Only the time after
+ * that end is added, and only while the fresh snapshot shows the same timer as running and resolved,
+ * so the active timer is counted exactly once and never through a sleep the report has not checked.
+ * The added time is split by day in the reporting zone (midnight and week boundaries).
+ */
+export function liveTimerTotals(base: TimerTotals, data: ReportData, now: number, clock: ClockActive, clockFresh: boolean): TimerTotals {
+  const active = data.active;
+  const zone = data.time_zone;
+  let today = base.todaySeconds;
+  let week = base.weekSeconds;
+  if (active && !active.unresolved && active.ended_at && clock && clockFresh && String(clock.id) === String(active.id) &&
+      !clock.recovered && !clock.uncertain && validTimeZone(zone)) {
+    const from = Date.parse(active.ended_at);
+    if (Number.isFinite(from) && now > from) {
+      const day = reportPresetRange('today', now, zone);
+      const span = reportPresetRange('week', now, zone);
+      const next = (date: string) => dayStartMs(Temporal.PlainDate.from(date).add({ days: 1 }).toString(), zone);
+      today += overlapSeconds(from, now, dayStartMs(day.from, zone), next(day.through));
+      week += overlapSeconds(from, now, dayStartMs(span.from, zone), next(span.through));
+    }
+  }
+  today = Math.floor(today); week = Math.floor(week);
+  return { ...base, todaySeconds: today, weekSeconds: week, text: `Dziś ${shortDuration(today)} · Tydzień ${shortDuration(week)}` };
+}
 export type HistoryEntry = { id: Id; started_at: string; ended_at: string | null };
 /** Part of an entry inside one day: the whole entry, or a piece of an entry that crosses midnight. */
 export type HistoryPart = 'whole' | 'first' | 'middle' | 'last';

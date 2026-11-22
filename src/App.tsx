@@ -16,7 +16,8 @@ import { defaultShortcut, shortcutLabel } from './shortcut';
 import { MiniTimerTaskPicker } from './MiniTimerPanel';
 import { choicesFor, createRequestGate, recentChoices } from './miniTimerModel';
 import { selectionFor, selectionKey, startBlocked } from './timerChoice';
-import { historyDays, timerTotals } from './reportDayModel';
+import { historyDays, liveTimerTotals, timerTotals, totalsBaseData } from './reportDayModel';
+import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
 import { useAllClientsReport } from './useAllClientsReport';
 import './miniTimer.css';
@@ -60,6 +61,7 @@ const recoveryHints: Record<LocalRangeProblem, string> = {
 
 export default function App() {
   const [data, setData] = useState<Snapshot>(EMPTY);
+  const [snapshotAt, setSnapshotAt] = useState(0);
   const [clientId, setClientId] = useState('');
   const [projectId, setProjectId] = useState('');
   const [showArchived, setShowArchived] = useState(false);
@@ -110,6 +112,7 @@ export default function App() {
     try {
       const next = await invoke<Snapshot>('get_snapshot');
       setData(next);
+      setSnapshotAt(Date.now());
       setLoaded(true);
     } catch (e) {
       setLoaded(false);
@@ -144,10 +147,17 @@ export default function App() {
   const catalog = useMemo(() => ({ clients: data.clients, projects: data.projects, tasks: data.tasks }), [data.clients, data.projects, data.tasks]);
   // Day/week totals and History day groups come from the report's own calculation (all clients).
   const allClients = useAllClientsReport(loaded, reportRevision);
-  const totals = useMemo(() => {
-    if (!allClients.read) return null;
-    try { return timerTotals(allClients.read.data, catalog, allClients.read.at); } catch { return null; }
-  }, [allClients.read, catalog]);
+  // Totals run with the clock: the report base (re-read on changes, focus and every 60 s) plus the
+  // running timer after its report projection, only while the fresh snapshot shows it resolved.
+  const clockActive = data.active ? { id: data.active.id, recovered: data.active.recovered, uncertain: data.active.uncertain } : null;
+  const baseData = useMemo(() => allClients.read ? totalsBaseData(allClients.read.data, clockActive) : null,
+    [allClients.read, clockActive?.id, clockActive?.recovered, clockActive?.uncertain]);
+  const totalsDay = baseData ? (() => { try { return dateInZone(now, baseData.time_zone); } catch { return ''; } })() : '';
+  const totalsBase = useMemo(() => {
+    if (!baseData) return null;
+    try { return timerTotals(baseData, catalog, now); } catch { return null; }
+  }, [baseData, catalog, totalsDay]);
+  const totals = totalsBase && baseData ? liveTimerTotals(totalsBase, baseData, now, clockActive, now - snapshotAt <= 5000) : null;
   const historyGroups = useMemo(() => {
     if (!allClients.read) return null;
     try { return historyDays(entries, allClients.read.data, catalog, allClients.read.at); } catch { return null; }
@@ -327,7 +337,7 @@ export default function App() {
           </div>
           <p className="timer-target" aria-live="polite">{selectedProject ? <>Wybrano: <strong>{selectedTask ? selectedTask.name : 'Bez zadania'}</strong> · {selectedClient ? clientLabelById.get(String(selectedClient.id)) : '—'} / {selectedProject.name}</> : 'Wybierz projekt lub zadanie poniżej.'}</p>
           {!data.active && shortcutHint}
-          <div className="timer-picker"><MiniTimerTaskPicker input={pickerInput} choices={choices} recent={recent} selected={selectionKey(projectId, taskId)}
+          <div className="timer-picker"><MiniTimerTaskPicker emptyHint="Najpierw dodaj klienta i projekt w sekcji „Dane i ustawienia” poniżej, w tym oknie." input={pickerInput} choices={choices} recent={recent} selected={selectionKey(projectId, taskId)}
             disabled={busy || !loaded || !!data.active?.recovered} onSelect={chooseTimerTarget} /></div>
           <details className="timer-lists"><summary>Wybierz z list: klient, projekt, zadanie</summary>
           <div className="selectors">
@@ -373,8 +383,8 @@ export default function App() {
           }} />
         {deleting && <div className="alert error" role="alert"><strong>Usunąć wpis #{deleting.id}?</strong> {formatPreciseDate(deleting.started_at)} – {deleting.ended_at && formatPreciseDate(deleting.ended_at)}. Nie będzie uwzględniany w zestawieniach; informacja o usunięciu pozostanie w historii. <button type="button" className="danger" disabled={busy || !loaded} onClick={() => void execute(async () => { await invoke('delete_time_entry', { entryId: Number(deleting.id), expectedStart: deleting.started_at, expectedEnd: deleting.ended_at }); setDeleting(null); if (deleted) await loadDeleted(); }, 'Wpis został usunięty z zestawień.')}>Potwierdź usunięcie</button>{' '}<button type="button" disabled={busy} onClick={() => setDeleting(null)}>Anuluj</button></div>}
         {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : historyGroups && historyGroups.length > 0
-          ? <div className="table-wrap history-table"><p className="helper history-zone">Dni w strefie raportu ({allClients.read?.data.time_zone}). Suma dnia jak w raporcie: wszyscy klienci, z aktywnym pomiarem; wpis przez północ jest w obu dniach.</p><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead>
-            {historyGroups.map(day => <tbody key={day.date} aria-label={`${day.label}: ${formatDuration(day.seconds)}`}><tr className="history-day"><th scope="rowgroup" colSpan={5}><span>{day.label}</span><span className="history-day-total">{formatDuration(day.seconds)}</span></th></tr>{day.rows.map(row => historyEntryRow(row.entry, row))}</tbody>)}</table></div>
+          ? <><p className="helper history-zone">Dni w strefie raportu ({allClients.read?.data.time_zone}). Suma dnia jak w raporcie: wszyscy klienci, z aktywnym pomiarem; wpis przez północ jest w obu dniach.</p><div className="table-wrap history-table"><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead>
+            {historyGroups.map(day => <tbody key={day.date} aria-label={`${day.label}: ${formatDuration(day.seconds)}`}><tr className="history-day"><th scope="rowgroup" colSpan={5}><span>{day.label}</span><span className="history-day-total">{formatDuration(day.seconds)}</span></th></tr>{day.rows.map(row => historyEntryRow(row.entry, row))}</tbody>)}</table></div></>
           : <div className="table-wrap history-table"><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead><tbody>{entries.map(e => historyEntryRow(e))}</tbody></table></div>}
         <details onToggle={e => { if (e.currentTarget.open) void loadDeleted(); }}><summary>Usunięte wpisy</summary><p className="muted">Te wpisy nie są uwzględniane w aktywnej historii. Zachowano je wraz z historią zmian.</p><button type="button" className="secondary" onClick={() => void loadDeleted()}>Odśwież listę</button>{deleted === null ? <p className="muted">Odczytywanie lub brak dostępu do listy.</p> : deleted.length === 0 ? <p className="muted">Brak usuniętych wpisów.</p> : <ul>{deleted.map(entry => <li key={entry.id}><strong>{entry.task_id === null ? 'Bez zadania' : data.tasks.find(task => same(task.id, entry.task_id))?.name || 'Nieznane zadanie'}</strong> · {formatPreciseDate(entry.started_at)} – {formatPreciseDate(entry.ended_at)} · {formatDuration(entry.duration_seconds)} · usunięto {formatPreciseDate(entry.deleted_at)}{' '}<button type="button" className="secondary" onClick={() => void showRevisions(entry.id)}>Historia zmian</button></li>)}</ul>}{deleted?.length === 500 && <p className="muted">Wyświetlono ostatnie 500 usuniętych wpisów.</p>}</details>
         {revisions && <section ref={revisionSection} aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.origin && <p>Wpis powstał z odzyskanego szkicu wpisu #{revisions.origin.sourceEntryId} · {formatPreciseDate(revisions.origin.createdAt)}</p>}{!revisions.origin && revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
