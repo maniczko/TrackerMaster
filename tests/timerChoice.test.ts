@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Snapshot } from '../src/App.tsx';
 import { choicesFor, createRequestGate, recentChoices } from '../src/miniTimerModel.ts';
-import { selectionFor, selectionKey, startBlocked } from '../src/timerChoice.ts';
+import { MAIN_ACTION_SETTLE_MS, mainAction, mainActionSettled, selectionFor, selectionKey, startBlocked } from '../src/timerChoice.ts';
 
 // Synthetic data only. The main window uses the mini timer's own choice model.
 const snapshot: Snapshot = {
@@ -59,13 +59,47 @@ test('the request gate lets only one write through until it ends (fast double cl
   assert.equal(gate.beginWrite(), true);
 });
 
-test('UIQ-01: description and Start/Switch come before the picker results in the setup column', async () => {
+test('UIQ-01: the main action sits under the clock; description and Switch come before the picker results', async () => {
   const { readFileSync } = await import('node:fs');
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../src/app.css', import.meta.url), 'utf8');
+  const clock = app.indexOf('<div className="clock" aria-live="off">');
+  const main = app.indexOf('className={`actions timer-main ');
+  const setup = app.indexOf('<div className="timer-setup">');
+  assert.ok(clock > 0 && clock < main && main < setup, 'Start/Stop must be one control under the clock, outside the setup column');
+  assert.equal(app.match(/actions timer-main /g)?.length, 1, 'one main action');
   const bar = app.indexOf('<div className="timer-bar">');
-  assert.ok(bar > 0);
-  assert.ok(bar < app.indexOf('className="actions timer-start"') && app.indexOf('className="actions timer-start"') < app.indexOf('<div className="timer-picker">'),
-    'Start must not sit under the results list');
-  assert.match(css, /\.timer-picker \.qp-results \{ max-height: 176px; \}/);
+  const switcher = app.indexOf('className="actions timer-start timer-switch"');
+  assert.ok(setup < bar && bar < switcher && switcher < app.indexOf('<div className="timer-picker">'),
+    'Switch must not sit under the results list');
+  assert.match(app, /\{data\.active && <div className="actions timer-start timer-switch"><button type="button" className="secondary"/,
+    'next to the description there is only the secondary Switch, while a timer runs');
+  // Package 3: five or six choices visible at 1280×720 (rows of 49 px), clear of the scrollbar.
+  assert.match(css, /\.timer-picker \.qp-results \{ max-height: 288px; padding-right: var\(--space-1\); \}/);
+});
+
+test('main action: Stop while running, Start with a project, otherwise it leads to the project search', () => {
+  const base = { busy: false, loaded: true, projectId: '', taskId: '', active: null };
+  assert.deepEqual(mainAction(base), { kind: 'choose', disabled: false }, 'no disabled Start without an explanation');
+  assert.deepEqual(mainAction({ ...base, busy: true }), { kind: 'choose', disabled: true });
+  assert.deepEqual(mainAction({ ...base, loaded: false }), { kind: 'choose', disabled: true });
+  assert.deepEqual(mainAction({ ...base, projectId: '10' }), { kind: 'start', disabled: false });
+  assert.deepEqual(mainAction({ ...base, projectId: '10', project: { id: 10, archived: true } }), { kind: 'start', disabled: true }, 'startBlocked still applies');
+  const running = { project_id: 10, task_id: null };
+  assert.deepEqual(mainAction({ ...base, projectId: '10', active: running }), { kind: 'stop', disabled: false });
+  assert.deepEqual(mainAction({ ...base, active: running }), { kind: 'stop', disabled: false });
+  assert.deepEqual(mainAction({ ...base, active: { ...running, recovered: true } }), { kind: 'stop', disabled: true }, 'a recovered timer needs its end time');
+  assert.deepEqual(mainAction({ ...base, busy: true, active: running }), { kind: 'stop', disabled: true });
+});
+
+test('a Stop right after Start from the same button is ignored (double click), a later one is not', () => {
+  const start = 1_000_000;
+  assert.equal(mainActionSettled(start, start + 120), false);
+  assert.equal(mainActionSettled(start, start + MAIN_ACTION_SETTLE_MS - 1), false);
+  assert.equal(mainActionSettled(start, start + MAIN_ACTION_SETTLE_MS), true);
+  assert.equal(mainActionSettled(0, start), true, 'no Start click in this window');
+  // The start itself is still guarded by the write gate: the second click of a double click sends nothing.
+  const gate = createRequestGate();
+  assert.equal(gate.beginWrite(), true);
+  assert.equal(gate.beginWrite(), false);
 });

@@ -467,4 +467,19 @@ footer { margin: var(--space-6) 0; text-align: center; color: var(--color-text-m
 .timer-bar .timer-start { flex: 0 0 auto; margin: 0; }
 .timer-target { margin: 0; color: var(--color-text-muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
 .timer-target strong { color: var(--color-text); }
-.timer-picker .qp-results { max-height: 176px; }
+/* Package 3: at 1280×720 five or six choices are visible below the description; the main action is in the
+   other column. The gutter keeps names and the check mark clear of the scrollbar. */
+.timer-picker .qp-results { max-height: 288px; padding-right: var(--space-1); }
+
+/* Package 3: one compact review banner (recovered / uncertain timer, sleep periods) above the timer card. */
+.timer-review { display: grid; gap: var(--space-2); }
+.timer-review > p, .timer-review .sleep-note { margin: 0; }
+.alert.timer-review form { margin-top: 0; }
+/* Label, field and button in one row, so the banner stays short. */
+.app-shell .alert .timer-review-form label { display: flex; align-items: center; flex: 0 1 auto; }
+.app-shell .alert .timer-review-form input { flex: 0 1 240px; width: auto; min-width: 0; }
+.alert form.timer-review-form { align-items: center; }
+.timer-review-why summary { width: fit-content; cursor: pointer; font-weight: 600; }
+.timer-review-why p { margin: var(--space-2) 0 0; }
+/* Main action under the clock: the same place and size for Start and Stop. */
+.timer-main-hint { margin: 0; text-align: left; }

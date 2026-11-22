@@ -51,8 +51,8 @@ test('every confirmed operation outside the draft editor invalidates the report'
 });
 
 test('sleep decisions and manual re-read invalidate the report, the periodic refresh does not', () => {
-  const sleep = app.match(/<SleepPending loaded=\{loaded\} onResolved=\{async \(\) => \{([\s\S]*?)\}\} \/>/);
-  assert.ok(sleep, 'SleepPending must have an onResolved handler');
+  const sleep = app.match(/usePendingSleep\(loaded, async \(\) => \{([\s\S]*?)\}\);/);
+  assert.ok(sleep, 'usePendingSleep must have an onResolved handler');
   assert.ok(sleep[1].indexOf('setReportRevision(version => version + 1)') >= 0);
   assert.ok(sleep[1].indexOf('setReportRevision(') < sleep[1].indexOf('await refresh()'));
   assert.match(app, /async function retryRefresh\(\)[\s\S]*?await refresh\(\); setReportRevision\(version => version \+ 1\)/);
@@ -76,6 +76,7 @@ test('the closed-report card shares the main window read: revision, focus and a 
 });
 
 test('the shortcut hint is hidden while the timer awaits verification (Stop disabled or recovery)', () => {
-  assert.match(app, /\{loaded && data\.active && !data\.active\.recovered && !data\.active\.uncertain && shortcutHint\}/);
-  assert.equal(app.match(/&& shortcutHint\}/g)?.length, 2);
+  // Package 3: one hint under the main action for both states; still never for a timer under review.
+  assert.match(app, /\{\(!data\.active \|\| \(loaded && !data\.active\.recovered && !data\.active\.uncertain\)\) && shortcutHint\}/);
+  assert.equal(app.match(/&& shortcutHint\}/g)?.length, 1);
 });
