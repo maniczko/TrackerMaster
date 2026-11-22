@@ -302,8 +302,15 @@ async function exercisePage(data, phase) {
     });
   }
   const testProfileVisible = () => document.querySelector('[role="note"]')?.textContent.includes('Wersja testowa.');
+  // Current data: the lists are enabled and the quick-start picker exists. The picker is disabled on
+  // purpose only while a recovered timer awaits its end time (Start is blocked then), so it must be
+  // enabled exactly when the "Pomiar wymaga weryfikacji." alert is absent.
+  const pickerReady = () => {
+    const search = pick(`${timer} .timer-picker [role="combobox"]`);
+    return Boolean(search) && search.disabled === Boolean(recoveryMessage());
+  };
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
-    !pick(`${timer} .timer-picker [role="combobox"]`)?.disabled && pick('#new-client'));
+    pickerReady() && pick('#new-client'));
 
   if (phase === 'hotkey-restart') return null;
 
