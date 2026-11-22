@@ -106,3 +106,52 @@ test('History groups by day in the reporting zone; an entry over midnight is in 
   assert.deepEqual(historyDays(entries, { ...d, time_zone: 'Mars/Base' }, catalog, now), null);
   assert.deepEqual(historyDays([], d, catalog, now), []);
 });
+
+// Review of #53: one local date can have several report pieces (local and UTC midnight, DST, sleep).
+// For every day: sum of the rows' "w tym dniu" == day header == report for that single date.
+function daysMatchReport(entries: CompletedReportEntry[], now: number) {
+  const d = data(entries);
+  const days = historyDays(entries, d, catalog, now)!;
+  for (const day of days) {
+    const rows = day.rows.reduce((sum, row) => sum + (row.seconds ?? 0), 0);
+    const single = makeReportView(d, catalog, allReportClients, day.date, day.date).liveSeconds;
+    assert.equal(rows, day.seconds, `${day.date}: rows vs day total`);
+    assert.equal(day.seconds, single, `${day.date}: day total vs report`);
+  }
+  return days;
+}
+const piece = (days: ReturnType<typeof daysMatchReport>, date: string, id = 1) => {
+  const row = days.find(day => day.date === date)!.rows.find(item => item.entry.id === id)!;
+  return [row.part, row.start, row.end, row.seconds];
+};
+
+test('owner case: Thu 23:00 → Fri 02:00 in Warsaw crosses local and UTC midnight', () => {
+  const days = daysMatchReport([entry(1, '2026-11-19T22:00:00Z', '2026-11-20T01:00:00Z')], Date.parse('2026-11-20T09:00:00Z'));
+  assert.deepEqual(piece(days, '2026-11-19'), ['first', '23:00', '24:00', 3600]);
+  assert.deepEqual(piece(days, '2026-11-20'), ['last', '00:00', '02:00', 7200]);
+});
+
+test('an entry over two midnights is in three days with full report amounts', () => {
+  const days = daysMatchReport([entry(1, '2026-11-19T21:00:00Z', '2026-11-21T00:00:00Z')], Date.parse('2026-11-21T09:00:00Z')); // Thu 22:00 → Sat 01:00
+  assert.deepEqual(piece(days, '2026-11-19'), ['first', '22:00', '24:00', 7200]);
+  assert.deepEqual(piece(days, '2026-11-20'), ['middle', '00:00', '24:00', 86400]);
+  assert.deepEqual(piece(days, '2026-11-21'), ['last', '00:00', '01:00', 3600]);
+});
+
+test('daylight saving: March (23-hour day) and October (25-hour day) across midnight', () => {
+  const march = daysMatchReport([entry(1, '2026-03-28T22:00:00Z', '2026-03-29T02:00:00Z')], Date.parse('2026-03-29T10:00:00Z')); // Sat 23:00 → Sun 04:00
+  assert.deepEqual(piece(march, '2026-03-28'), ['first', '23:00', '24:00', 3600]);
+  assert.deepEqual(piece(march, '2026-03-29'), ['last', '00:00', '04:00', 10800]);
+  const october = daysMatchReport([entry(1, '2026-10-24T21:00:00Z', '2026-10-25T02:00:00Z')], Date.parse('2026-10-25T10:00:00Z')); // Sat 23:00 → Sun 03:00
+  assert.deepEqual(piece(october, '2026-10-24'), ['first', '23:00', '24:00', 3600]);
+  assert.deepEqual(piece(october, '2026-10-25'), ['last', '00:00', '03:00', 14400]);
+});
+
+test('sleep at the day boundary: each day counts only its work', () => {
+  // Thu 23:00 → Fri 02:00 Warsaw, excluded sleep Thu 23:30 → Fri 00:30 (also across UTC midnight).
+  const sleepy = entry(1, '2026-11-19T22:00:00Z', '2026-11-20T01:00:00Z', { duration_seconds: 7200,
+    sleep_periods: [{ id: 1, entryId: 1, startedMs: Date.parse('2026-11-19T22:30:00Z'), endedMs: Date.parse('2026-11-19T23:30:00Z'), decision: 'excluded' }] });
+  const days = daysMatchReport([sleepy], Date.parse('2026-11-20T09:00:00Z'));
+  assert.deepEqual(piece(days, '2026-11-19'), ['first', '23:00', '24:00', 1800]);
+  assert.deepEqual(piece(days, '2026-11-20'), ['last', '00:00', '02:00', 5400]);
+});

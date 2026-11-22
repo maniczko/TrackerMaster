@@ -3,7 +3,7 @@
 // so every number shown here equals the report for all clients. Pure, no I/O.
 import { Temporal } from '@js-temporal/polyfill';
 import { reportGlance } from './reportGlanceModel.ts';
-import { dateInZone, validTimeZone } from './reportTime.ts';
+import { addDaySeconds, dateInZone, validTimeZone } from './reportTime.ts';
 import { makeReportView } from './reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from './reportView.ts';
 import { allReportClients } from './reportScope.ts';
@@ -76,6 +76,8 @@ export function historyDays<E extends HistoryEntry>(entries: readonly E[], data:
   const days = new Map<string, HistoryRow<E>[]>();
   for (const { entry, start, end } of spans) {
     const contribution = contributions.get(String(entry.id));
+    // All pieces of one local date are summed with the report's own function (several pieces per date are possible).
+    const entryDays = contribution ? addDaySeconds(new Map(), contribution.days) : null;
     const lastDate = dateInZone(end > start ? end - 1 : start, zone);
     const dates: string[] = [];
     for (let date = dateInZone(start, zone); date <= lastDate; date = Temporal.PlainDate.from(date).add({ days: 1 }).toString()) dates.push(date);
@@ -84,7 +86,7 @@ export function historyDays<E extends HistoryEntry>(entries: readonly E[], data:
       const pieceStart = Math.max(start, dayStartMs(date, zone));
       const pieceEnd = Math.min(end, next);
       const part: HistoryPart = dates.length === 1 ? 'whole' : index === 0 ? 'first' : index === dates.length - 1 ? 'last' : 'middle';
-      const seconds = contribution ? contribution.days.find(day => day.date === date)?.seconds ?? 0 : null;
+      const seconds = entryDays ? entryDays.get(date) ?? 0 : null;
       const row = { entry, date, part, start: clockIn(pieceStart, zone), end: pieceEnd === next && part !== 'whole' ? '24:00' : clockIn(pieceEnd, zone), seconds };
       days.set(date, [...(days.get(date) ?? []), row]);
     });
