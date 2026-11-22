@@ -37,19 +37,37 @@ function Get-RuleSid($Rule) {
     catch { [string] $Rule.IdentityReference }
 }
 
-# Only the current user, SYSTEM and Administrators may hold access. A packaged
-# app's own AppContainer SID is reported and allowed only when -AllowPackageSid.
-function Test-PrivateAcl([string] $Path, [string] $Label, [string] $PackageSid = '') {
-    $acl = Get-Acl -LiteralPath $Path
+# Only the current user, SYSTEM and Administrators may hold access. Specific
+# AppContainer package (S-1-15-2-*) and capability (S-1-15-3-*) SIDs, which MSIX
+# and the WebView2 sandbox add, are reported but allowed: Windows grants an
+# AppContainer token access only if its user SID passes the same DACL too, so
+# they give no other account access. The broad ALL APPLICATION PACKAGES SIDs fail.
+$script:containerSids = [Collections.Generic.HashSet[string]]::new()
+$script:vanished = 0
+function Test-PrivateAcl([string] $Path, [string] $Label) {
+    try { $acl = Get-Acl -LiteralPath $Path }
+    catch [Management.Automation.ItemNotFoundException] { $script:vanished++; Write-Host "ACL $Label vanished before check: $Path"; return }
     $entries = foreach ($rule in $acl.Access) {
         $sid = Get-RuleSid $rule
         "$($rule.AccessControlType):$sid=$($rule.FileSystemRights)$(if ($rule.IsInherited) { '(inherited)' })"
         if ($rule.AccessControlType -ne 'Allow') { continue }
         if ($sid -eq 'S-1-3-0' -and $rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
         if ($broadSids.ContainsKey($sid)) { Fail "$Label grants $($broadSids[$sid]) ($sid) $($rule.FileSystemRights): $Path" }
-        elseif ($allowedSids -notcontains $sid -and $sid -ne $PackageSid) { Fail "$Label grants an unexpected identity $sid ($($rule.IdentityReference)): $Path" }
+        elseif ($sid -match '^S-1-15-[23]-\d+(-\d+){6,}$') { [void] $script:containerSids.Add($sid) }
+        elseif ($allowedSids -notcontains $sid) { Fail "$Label grants an unexpected identity $sid ($($rule.IdentityReference)): $Path" }
     }
     Write-Host "ACL $Label $Path :: $($entries -join '; ')"
+}
+
+# A stopped app can leave WebView2 helper processes cleaning up its profile for a moment.
+function Wait-WebViewExit {
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $left = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object { $_.CommandLine -like "*$identifier*" })
+        if (!$left.Count) { return }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    Write-Host "WebView2 processes still running for the test profile: $($left.Count)"
 }
 
 function Get-Inventory([string] $Root) {
@@ -95,7 +113,8 @@ $appPattern = 'etilqs|\.sqlite3|testonly|window-diagnostic|instance\.lock|entry-
 
 # 1. Inventory of everything the application wrote for this user.
 $webDirs = @(Join-Path $env:LOCALAPPDATA $identifier)
-$packageSid = ''
+$osPackagePaths = @()
+$osPackageFiles = @()
 if ($Mode -eq 'Packaged') {
     $package = Get-AppxPackage -Name 'TrackerMaster.TestOnly'
     if (!$package) { throw 'The test package is not installed.' }
@@ -104,10 +123,18 @@ if ($Mode -eq 'Packaged') {
     if (Test-Path -LiteralPath (Join-Path $packageRoot "LocalCache\Roaming\$identifier")) {
         Fail "Packaged data was virtualized into the package cache instead of $dataDir."
     }
-    $packageSid = (Get-Acl -LiteralPath $packageRoot).Access | ForEach-Object { Get-RuleSid $_ } |
-        Where-Object { $_ -like 'S-1-15-2-*' -and $_ -ne 'S-1-15-2-1' -and $_ -ne 'S-1-15-2-2' } | Select-Object -First 1
-    Write-Host "Package $($package.PackageFullName) AppContainer SID: $packageSid"
+    Write-Host "Package $($package.PackageFullName)"
+    # Package registration that Windows itself keeps in ProgramData (manifest copy, per-user
+    # package state). Listed and scanned for user data, not treated as application files.
+    $osPackageItems = @(
+        Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'Microsoft\Windows\AppRepository') -Force -ErrorAction SilentlyContinue | Where-Object Name -like "$($package.Name)_*"
+        Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'Packages') -Force -ErrorAction SilentlyContinue | Where-Object Name -eq $package.PackageFamilyName
+    )
+    $osPackagePaths = @($osPackageItems | ForEach-Object FullName)
+    $osPackageFiles = @($osPackageItems | ForEach-Object { $_; if ($_.PSIsContainer) { Get-ChildItem -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } })
+    Write-Host "INVENTORY OS package registration in ProgramData: $($osPackagePaths -join ', ') ($($osPackageFiles.Count) items)"
 }
+Wait-WebViewExit
 
 if ($Mode -eq 'Unpackaged') {
     # 2. Unique synthetic marker: written to the database, then rendered by the app.
@@ -147,6 +174,7 @@ try {
         while ((Get-Date) -lt $deadline -and !(Select-String -LiteralPath $trace -SimpleMatch 'main-hide-ok' -Quiet)) { Start-Sleep -Milliseconds 250 }
     } finally {
         if (!$app.HasExited) { Stop-Process -Id $app.Id -Force; $app.WaitForExit(10000) | Out-Null }
+        Wait-WebViewExit
     }
     $traceText = Get-Content -LiteralPath $trace -Raw
     foreach ($expected in 'setup-complete', 'main-close-requested', 'main-hide-ok') {
@@ -187,7 +215,8 @@ if ($Mode -eq 'Unpackaged') {
 }
 foreach ($shared in @($env:ProgramData, (Join-Path $env:SystemDrive 'Users\Public'), (Join-Path $env:SystemRoot 'Temp'), $env:TEMP)) {
     $hits = @(Get-ChildItem -LiteralPath $shared -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.CreationTime -ge $since -and ($_.Name -match $appPattern) })
+        Where-Object { $_.CreationTime -ge $since -and ($_.Name -match $appPattern) } |
+        Where-Object { $path = $_.FullName; !($osPackagePaths | Where-Object { $path -eq $_ -or $path.StartsWith("$_\") }) })
     if ($shared -eq $env:TEMP) {
         # Per-user TEMP is private to the account; SQLite temp files (etilqs_*) must still be gone.
         if ($hits.Count) { Fail "Leftover files in the user's TEMP: $($hits.FullName -join ', ')" }
@@ -198,11 +227,13 @@ foreach ($shared in @($env:ProgramData, (Join-Path $env:SystemDrive 'Users\Publi
 
 # 4. ACL of every file and folder in the profile.
 foreach ($item in $dataItems) { Test-PrivateAcl $item.FullName 'data' }
-foreach ($item in $webItems) { Test-PrivateAcl $item.FullName 'webview' $packageSid }
-Write-Host "ACL checked $(@($dataItems).Count) data items and $(@($webItems).Count) webview items"
+foreach ($item in $webItems) { Test-PrivateAcl $item.FullName 'webview' }
+Write-Host "ACL checked $(@($dataItems).Count) data items and $(@($webItems).Count) webview items ($script:vanished vanished during the check)"
+Write-Host "ACL AppContainer package/capability SIDs seen (dual access check, no other account): $(@($script:containerSids) -join ', ')"
 
 # 5. Logs and diagnostics contain no client, project, task names or descriptions.
 Test-NoSecret ($dataItems + @($webItems)) $secrets 'profile'
+if ($osPackageFiles) { Test-NoSecret $osPackageFiles $secrets 'os-package-registration' }
 $tempItems = @(Get-ChildItem -LiteralPath $env:TEMP -Recurse -Depth 4 -Force -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -ge $since)
 Test-NoSecret $tempItems $secrets 'user-temp'
 
