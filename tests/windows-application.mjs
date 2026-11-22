@@ -312,7 +312,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -1204,6 +1204,269 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   console.log('PASS: validation and SQLite failures preserved the edit; retry saved exactly one revision');
 }
 
+// PTT-36 (T20/T26): write failures in the running app, on the synthetic CI test profile only.
+// A second SQLite connection holds a RESERVED lock (BEGIN IMMEDIATE), so every write of the
+// app fails with SQLITE_BUSY after its busy timeout while reads still work, which is the
+// application-level form of a database that cannot be written. A trigger variant fails the
+// switch inside its transaction, after the previous entry was already updated.
+const writeFailure = {
+  firstDescription: 'PTT-36 pomiar przy awarii zapisu',
+  secondDescription: 'PTT-36 przełączenie po awarii',
+  editDescription: 'PTT-36 korekta przy awarii zapisu',
+  editEntryDescription: 'Korekta zapisana przy zamknięciu',
+};
+
+function writeFailureState() {
+  const db = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    return {
+      entries: db.prepare(`SELECT e.id, e.project_id, e.task_id, e.started_at, e.ended_at, e.duration_seconds, e.manually_resolved,
+        COALESCE(d.description, '') AS description FROM time_entries e LEFT JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all().map(row => ({ ...row })),
+      revisions: db.prepare('SELECT COUNT(*) AS count FROM entry_revisions').get().count,
+      descriptionRevisions: db.prepare('SELECT COUNT(*) AS count FROM description_revisions').get().count,
+      billable: db.prepare('SELECT COUNT(*) AS count FROM billable_entries').get().count,
+    };
+  } finally { db.close(); }
+}
+
+function holdWriteLock() {
+  const lock = new DatabaseSync(testDb);
+  lock.exec('BEGIN IMMEDIATE');
+  return { release() { try { lock.exec('ROLLBACK'); } finally { lock.close(); } } };
+}
+
+async function verifyWriteFailure(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const timer = '[aria-label="Pomiar czasu"]';
+  // Only alerts rendered after a click count: alerts already on screen are marked first.
+  const markStale = `document.querySelectorAll('[role="alert"]').forEach(node => { node.dataset.ptt36Stale = '1'; })`;
+  const failureShown = `[...document.querySelectorAll('[role="alert"]')].some(node => !node.dataset.ptt36Stale && node.textContent.includes('Nie udało się potwierdzić operacji') && node.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych'))`;
+  const successShown = message => `[...document.querySelectorAll('[role="status"]')].some(node => node.textContent.includes(${JSON.stringify(message)}))`;
+  const activeId = () => evaluate(`window.__TAURI_INTERNALS__.invoke('get_snapshot').then(s => s.active ? { id: s.active.id, recovered: s.active.recovered, uncertain: s.active.uncertain, description: s.active.description } : null)`);
+  const running = `Boolean(document.querySelector(${JSON.stringify(`${timer} .status.running`)}))`;
+  const idle = `!document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}) && !document.querySelector(${JSON.stringify(`${timer} .status.running`)})`;
+  const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
+  const projects = (() => {
+    const db = new DatabaseSync(testDb, { readOnly: true });
+    try {
+      return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row }));
+    } finally { db.close(); }
+  })();
+  const first = projects.find(item => item.client === primaryClient);
+  const second = projects.find(item => item.client === secondClient);
+  assert.ok(first && second && first.id !== second.id);
+
+  // A synthetic running entry for this scenario; the operations under test go through the UI.
+  const before = writeFailureState();
+  assert.ok(before.entries.every(entry => entry.ended_at), 'no timer may run before the write-failure scenario');
+  await evaluate(`window.__TAURI_INTERNALS__.invoke('start_project_timer', { projectId: ${first.id}, taskId: null, expectedActiveId: null, description: ${JSON.stringify(writeFailure.firstDescription)} })`);
+  await waitFor('write-failure timer is running', () => evaluate(running));
+  const started = await activeId();
+  assert.ok(started && !started.recovered && !started.uncertain && started.description === writeFailure.firstDescription);
+  await delay(3_000);
+  const runningState = writeFailureState();
+
+  // Stop while the database cannot be written.
+  let lock = holdWriteLock();
+  try {
+    await waitFor('Stop is enabled', () => evaluate(enabledButton(`${timer} .timer-stop button`)));
+    await evaluate(markStale);
+    await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}).click()`);
+    await waitFor('Stop failure is reported', () => evaluate(failureShown));
+    assert.equal(await evaluate(successShown('Pomiar zatrzymany.')), false, 'Stop reported success although nothing was saved');
+    await waitFor('timer still running after failed Stop', () => evaluate(running));
+    assert.deepEqual(await activeId(), started);
+    assert.deepEqual(writeFailureState(), runningState, 'failed Stop changed the database');
+    console.log('PASS: T20 Stop with an unwritable database reported the error, kept the same timer and changed nothing');
+
+    // Switch to another client's project while the database cannot be written.
+    await evaluate(`(() => {
+      document.querySelector(${JSON.stringify(`${timer} details.timer-lists`)}).open = true;
+      const [client, project] = document.querySelectorAll(${JSON.stringify(`${timer} .timer-lists select`)});
+      const set = (select, value) => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, value); select.dispatchEvent(new Event('change', { bubbles: true })); };
+      set(client, ${JSON.stringify(String(second.clientId))});
+    })()`);
+    await waitFor('second client projects listed', () => evaluate(`[...document.querySelectorAll(${JSON.stringify(`${timer} .timer-lists select`)})[1].options].some(option => option.value === ${JSON.stringify(String(second.id))})`));
+    await evaluate(`(() => {
+      const project = document.querySelectorAll(${JSON.stringify(`${timer} .timer-lists select`)})[1];
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(project, ${JSON.stringify(String(second.id))});
+      project.dispatchEvent(new Event('change', { bubbles: true }));
+      const description = document.querySelector(${JSON.stringify(`${timer} .timer-description input`)});
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(description, ${JSON.stringify(writeFailure.secondDescription)});
+      description.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`);
+    await waitFor('Switch is enabled', () => evaluate(enabledButton(`${timer} .timer-start button`)));
+    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-start button`)}).textContent.includes('Przełącz zadanie')`), true);
+    await evaluate(markStale);
+    await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-start button`)}).click()`);
+    await waitFor('Switch failure is reported', () => evaluate(failureShown));
+    assert.equal(await evaluate(successShown('Przełączono zadanie.')), false, 'Switch reported success although nothing was saved');
+    await waitFor('timer still running after failed Switch', () => evaluate(running));
+    assert.deepEqual(await activeId(), started);
+    assert.deepEqual(writeFailureState(), runningState, 'failed Switch changed the database');
+    console.log('PASS: T20 Switch with an unwritable database reported the error, kept the same timer and changed nothing');
+  } finally { lock.release(); }
+
+  // Switch failing inside its transaction: the previous entry is updated first, then the
+  // insert of the new entry fails. The update must be rolled back with it.
+  const trigger = new DatabaseSync(testDb);
+  try { trigger.exec("CREATE TRIGGER test_reject_switch BEFORE INSERT ON time_entries BEGIN SELECT RAISE(FAIL, 'test write failure'); END"); }
+  finally { trigger.close(); }
+  try {
+    await waitFor('Switch is enabled for the in-transaction failure', () => evaluate(enabledButton(`${timer} .timer-start button`)));
+    await evaluate(markStale);
+    await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-start button`)}).click()`);
+    await waitFor('in-transaction Switch failure is reported', () => evaluate(failureShown));
+    assert.equal(await evaluate(successShown('Przełączono zadanie.')), false);
+    await waitFor('timer still running after in-transaction failure', () => evaluate(running));
+    assert.deepEqual(await activeId(), started);
+    assert.deepEqual(writeFailureState(), runningState, 'a failed insert left the previous entry closed (partial switch)');
+    console.log('PASS: T20 Switch failing after the previous entry was closed rolled back completely');
+  } finally {
+    const cleanup = new DatabaseSync(testDb);
+    try { cleanup.exec('DROP TRIGGER test_reject_switch'); } finally { cleanup.close(); }
+  }
+
+  // Retry once with writes possible again: one switch, then one stop.
+  await waitFor('Switch enabled for retry', () => evaluate(enabledButton(`${timer} .timer-start button`)));
+  const retryAt = Date.now();
+  await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-start button`)}).click()`);
+  await waitFor('Switch retry succeeded', () => evaluate(successShown('Przełączono zadanie.')));
+  const switched = await activeId();
+  assert.ok(switched && switched.id !== started.id && switched.description === writeFailure.secondDescription);
+  await delay(2_000);
+  await waitFor('Stop enabled for retry', () => evaluate(enabledButton(`${timer} .timer-stop button`)));
+  await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}).click()`);
+  await waitFor('Stop retry succeeded', () => evaluate(successShown('Pomiar zatrzymany.')));
+  await waitFor('timer stopped after retry', () => evaluate(idle));
+  assert.equal(await activeId(), null);
+  const after = writeFailureState();
+  assert.equal(after.entries.length, before.entries.length + 2, 'retry created a duplicate or lost an entry');
+  assert.deepEqual(after.entries.slice(0, before.entries.length), before.entries, 'retry changed earlier entries');
+  const [firstEntry, secondEntry] = after.entries.slice(before.entries.length);
+  assert.equal(firstEntry.id, started.id);
+  assert.equal(secondEntry.id, switched.id);
+  assert.equal(after.entries.filter(entry => entry.description === writeFailure.firstDescription).length, 1);
+  assert.equal(after.entries.filter(entry => entry.description === writeFailure.secondDescription).length, 1);
+  assert.equal(firstEntry.started_at, runningState.entries.at(-1).started_at);
+  assert.equal(firstEntry.project_id, first.id);
+  assert.equal(secondEntry.project_id, second.id);
+  // The switch boundary is shared, so time is neither lost nor counted twice.
+  assert.equal(secondEntry.started_at, firstEntry.ended_at);
+  for (const entry of [firstEntry, secondEntry]) {
+    const wall = Math.floor((Date.parse(entry.ended_at) - Date.parse(entry.started_at)) / 1000);
+    assert.ok(entry.ended_at && entry.manually_resolved === 0 && Math.abs(wall - entry.duration_seconds) <= 2, `entry #${entry.id} duration matches its interval`);
+  }
+  // The time spent on the failed attempts stays working time of the first entry (none is lost).
+  const untilRetry = Math.floor((retryAt - Date.parse(firstEntry.started_at)) / 1000);
+  assert.ok(untilRetry >= 10 && firstEntry.duration_seconds >= untilRetry - 2, `first entry kept the time of the failed attempts (${firstEntry.duration_seconds} s, ${untilRetry} s until retry)`);
+  assert.equal(after.revisions, before.revisions);
+  console.log(`PASS: T20 retry after restoring writes saved one switch and one stop (#${firstEntry.id} ${firstEntry.duration_seconds} s, #${secondEntry.id} ${secondEntry.duration_seconds} s) without duplicates`);
+
+  // Entry correction while the database cannot be written; the app is then closed with the
+  // edit unsaved, and the next phase restarts it (T26).
+  await waitFor('entry editor opens for the write-failure correction', async () => {
+    if (await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`)) return true;
+    await chooseFromEntryMenu(cdp, sessionId, evaluate, writeFailure.editEntryDescription, 'Popraw wpis:', 'mouse');
+    return false;
+  });
+  const editId = after.entries.find(entry => entry.description === writeFailure.editEntryDescription)?.id;
+  assert.ok(editId);
+  const original = after.entries.find(entry => entry.id === editId);
+  const targetEnd = await evaluate(`(() => {
+    const field = document.querySelectorAll('[aria-label="Edycja wpisu"] input[type="datetime-local"]')[1];
+    const date = new Date(field.value);
+    date.setSeconds(date.getSeconds() - 1);
+    const pad = value => String(value).padStart(2, '0');
+    const value = [date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join('-') + 'T' + [date.getHours(), date.getMinutes(), date.getSeconds()].map(pad).join(':');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, value);
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    const description = document.querySelector('#entry-draft-description');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(description, ${JSON.stringify(writeFailure.editDescription)});
+    description.dispatchEvent(new Event('input', { bubbles: true }));
+    return date.toISOString();
+  })()`);
+  const draftPath = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'entry-drafts', `entry-${editId}.json`);
+  await waitFor('correction draft saved locally', async () => {
+    try { return JSON.parse(await readFile(draftPath, 'utf8')).fields.description === writeFailure.editDescription; }
+    catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return false; throw error; }
+  });
+  lock = holdWriteLock();
+  try {
+    await evaluate(markStale);
+    await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
+    await waitFor('correction failure is reported in the editor', () => evaluate(`[...document.querySelectorAll('[role="alert"]')].some(node => !node.dataset.ptt36Stale && node.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych'))`));
+    assert.equal(await evaluate(successShown('Zmiany wpisu zostały zapisane.')), false, 'correction reported success although nothing was saved');
+    assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), writeFailure.editDescription);
+    assert.deepEqual(writeFailureState(), after, 'failed correction changed the database');
+    assert.equal(JSON.parse(await readFile(draftPath, 'utf8')).fields.description, writeFailure.editDescription);
+    console.log('PASS: T20 correction with an unwritable database reported the error, kept the editor and the local draft, and changed nothing');
+  } finally { lock.release(); }
+  return { editId, original, targetEnd, after };
+}
+
+async function verifyDraftAfterWriteFailure(cdp, sessionId, pending) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const profileDir = join(process.env.APPDATA, 'pl.tracker.personal.testonly');
+  const draftPath = join(profileDir, 'entry-drafts', `entry-${pending.editId}.json`);
+  // The original entry is unchanged after the failed write and the restart.
+  assert.deepEqual(writeFailureState(), pending.after, 'restart after the failed correction changed the database');
+  const button = `[...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Przejdź do szkiców')`;
+  await waitFor('draft reminder after restart following a failed write', () => evaluate(`Boolean(${button})`));
+  await evaluate(`${button}.click()`);
+  const drafts = '[aria-label="Szkice wpisów"]';
+  await waitFor('draft list after restart', () => evaluate(`Boolean([...document.querySelectorAll(${JSON.stringify(`${drafts} button`)})].find(item => item.textContent.trim() === 'Przywróć szkic' && !item.disabled))`));
+  // The sort preference saved earlier survived both the failure and the restart.
+  assert.equal(await readFile(join(profileDir, 'draft-sort.txt'), 'utf8'), 'oldest');
+  assert.equal(await evaluate(`document.querySelector(${JSON.stringify(`${drafts} select`)}).value`), 'oldest');
+  assert.equal(await evaluate(`document.querySelector(${JSON.stringify(`${drafts} h3`)})?.textContent.trim()`), 'Szkice (1)');
+  await evaluate(`[...document.querySelectorAll(${JSON.stringify(`${drafts} button`)})].find(item => item.textContent.trim() === 'Przywróć szkic').click()`);
+  await waitFor('draft restored after restart', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(writeFailure.editDescription)}`));
+  assert.equal(writeFailureState().entries.find(entry => entry.id === pending.editId).description, writeFailure.editEntryDescription, 'the draft silently overwrote the original');
+  console.log('PASS: T26 the local draft survived the failed write and the restart, the original stayed unchanged, and the draft sort preference persisted');
+
+  // Retry once with writes possible: exactly one correction is saved. The restored editor
+  // renders before the restore operation finishes; Save is disabled until then, and a click
+  // on a disabled button is ignored, so wait until Save can actually be pressed.
+  const submit = `document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]')`;
+  const editorState = `(() => ({
+    editor: Boolean(document.querySelector('[aria-label="Edycja wpisu"]')),
+    submitDisabled: ${submit}?.disabled ?? null,
+    description: document.querySelector('#entry-draft-description')?.value ?? null,
+    alerts: [...document.querySelectorAll('[role="alert"]')].map(node => node.textContent.trim()),
+    status: [...document.querySelectorAll('[role="status"]')].map(node => node.textContent.trim()),
+    historyHasCorrection: [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(writeFailure.editDescription)})),
+  }))()`;
+  const diagnose = async error => {
+    const draft = await readFile(draftPath, 'utf8').then(() => 'present', problem => problem.code ?? problem.message);
+    const state = writeFailureState();
+    const edited = state.entries.find(item => item.id === pending.editId);
+    throw new Error(`${error.message}; editor: ${JSON.stringify(await evaluate(editorState))}; draft file: ${draft}; entry: ${JSON.stringify(edited)}; revisions: ${state.revisions}/${state.descriptionRevisions}`);
+  };
+  await waitFor('restored correction can be saved', () => evaluate(`(el => Boolean(el && !el.disabled))(${submit})`)).catch(diagnose);
+  await evaluate(`${submit}.click()`);
+  await waitFor('correction retry saved', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]') && [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(writeFailure.editDescription)}))`)).catch(diagnose);
+  const saved = writeFailureState();
+  const entry = saved.entries.find(item => item.id === pending.editId);
+  assert.equal(saved.entries.length, pending.after.entries.length);
+  assert.equal(entry.description, writeFailure.editDescription);
+  assert.equal(Date.parse(entry.ended_at), Date.parse(pending.targetEnd));
+  assert.equal(entry.started_at.slice(0, 19), pending.original.started_at.slice(0, 19));
+  assert.equal(entry.duration_seconds, Math.floor((Date.parse(entry.ended_at) - Date.parse(entry.started_at)) / 1000));
+  assert.equal(saved.revisions, pending.after.revisions + 1, 'retry saved the time correction more than once');
+  assert.equal(saved.descriptionRevisions, pending.after.descriptionRevisions + 1, 'retry saved the description more than once');
+  await assert.rejects(stat(draftPath), { code: 'ENOENT' });
+  console.log(`PASS: T26 retry saved exactly one correction of entry #${pending.editId} and removed its draft`);
+}
+
 async function verifyDuplicateClientChoices(cdp, sessionId) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
@@ -1328,7 +1591,7 @@ async function runWindow(port, phase, recovery) {
       await captureReportDetail(cdp, sessionId, phase === 'initial' ? 'selected-client' : 'restored-scope');
     } else {
       assert.equal(seconds, null);
-      if (phase !== 'hotkey-restart') console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -1381,6 +1644,8 @@ async function runWindow(port, phase, recovery) {
       await verifyShortcutAfterRestart(cdp, sessionId);
       await verifyDuplicateClientChoices(cdp, sessionId);
     }
+    if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
+    if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -1443,7 +1708,31 @@ assert.equal(existingPolicy, false, 'Expected a fresh runner without a TrackerMa
 const port = await availablePort();
 // Elevated WebView2 hosts ignore the environment variable for additional browser arguments.
 registry('add', ['/t', 'REG_SZ', '/d', `--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`, '/f']);
-let seconds, interrupted, recovery;
+let seconds, interrupted, recovery, pendingWriteFailure;
+// The history built by the phases above, checked before PTT-36 adds its own synthetic entries.
+function assertBaselineHistory() {
+  const db = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
+      t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id
+      JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id`).all();
+    assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient, secondClient, secondClient, primaryClient]);
+    assert.deepEqual(rows.map(row => row.task), [task, null, null, null, null]);
+    assert.ok(rows.every(row => row.project === project));
+    assert.ok(rows.slice(0, 2).every(row => row.duration >= 5 && row.manually_resolved === 0));
+    assert.equal(rows[0].duration, seconds);
+    assert.equal(rows[2].id, interrupted.id);
+    assert.equal(rows[2].started_at, interrupted.started_at);
+    assert.equal(rows[2].ended_at, recovery.end);
+    assert.equal(rows[2].duration, recovery.duration);
+    assert.equal(rows[2].manually_resolved, 1);
+    assert.ok(rows[3].ended_at && rows[3].duration >= 5 && rows[3].manually_resolved === 0);
+    assert.ok(rows[4].ended_at && rows[4].duration >= 5 && rows[4].manually_resolved === 0);
+  } finally {
+    db.close();
+  }
+  console.log('PASS: two clients, project timers, History, isolated report and CSV, and explicit recovery of the original entry after a forced exit');
+}
 try {
   seconds = await runWindow(port, 'initial');
   await waitForWindowClosed(port);
@@ -1467,28 +1756,15 @@ try {
   await runWindow(port, 'draft-reopen', recovery);
   await waitForWindowClosed(port);
   await runWindow(port, 'hotkey-restart', recovery);
+  assertBaselineHistory();
+  // PTT-36: T20 (Stop, Switch, correction with an unwritable database, then one retry) and
+  // T26 (the unsaved correction survives a restart and is saved exactly once).
+  await waitForWindowClosed(port);
+  await runWindow(port, 'write-failure', recovery);
+  await waitForWindowClosed(port);
+  await runWindow(port, 'write-failure-reopen', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);
 }
-const db = new DatabaseSync(testDb, { readOnly: true });
-try {
-  const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
-    t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id
-    JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id`).all();
-  assert.deepEqual(rows.map(row => row.client), [primaryClient, secondClient, secondClient, secondClient, primaryClient]);
-  assert.deepEqual(rows.map(row => row.task), [task, null, null, null, null]);
-  assert.ok(rows.every(row => row.project === project));
-  assert.ok(rows.slice(0, 2).every(row => row.duration >= 5 && row.manually_resolved === 0));
-  assert.equal(rows[0].duration, seconds);
-  assert.equal(rows[2].id, interrupted.id);
-  assert.equal(rows[2].started_at, interrupted.started_at);
-  assert.equal(rows[2].ended_at, recovery.end);
-  assert.equal(rows[2].duration, recovery.duration);
-  assert.equal(rows[2].manually_resolved, 1);
-  assert.ok(rows[3].ended_at && rows[3].duration >= 5 && rows[3].manually_resolved === 0);
-  assert.ok(rows[4].ended_at && rows[4].duration >= 5 && rows[4].manually_resolved === 0);
-} finally {
-  db.close();
-}
-console.log('PASS: two clients, project timers, History, isolated report and CSV, and explicit recovery of the original entry after a forced exit');
+console.log('PASS: PTT-36 write failures in the running app kept the timer and data intact, and one retry saved each change once');
