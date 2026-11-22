@@ -390,6 +390,14 @@ param([string] $Root)
 $ErrorActionPreference = 'Stop'
 trap { Set-Content -LiteralPath (Join-Path $Root 'error.txt') -Value ($_ | Out-String) -Encoding utf8; exit 1 }
 $root = $Root
+# Start-Process -Credential passes the parent environment; use this token's own known folders.
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$env:USERNAME = $identity.Name.Split('\')[-1]
+$env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
+$env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+$env:TEMP = $env:TMP = Join-Path $env:LOCALAPPDATA 'Temp'
+[void] (New-Item -ItemType Directory -Force -Path $env:TEMP)
 $reads = foreach ($target in Get-Content -LiteralPath (Join-Path $root 'targets.txt')) {
     $result = try {
         if ([IO.Directory]::Exists($target)) { [void] [IO.Directory]::GetFileSystemEntries($target) } else { [void] [IO.File]::ReadAllBytes($target) }
@@ -411,9 +419,9 @@ while ((Get-Date) -lt $deadline) {
 }
 $exitCode = if ($app.HasExited) { $app.ExitCode } else { 'running' }
 if (!$app.HasExited) { Stop-Process -Id $app.Id -Force; [void] $app.WaitForExit(10000) }
-$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $admin = $principal.IsInRole([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
-[pscustomobject] @{ user = $env:USERNAME; admin = $admin; appData = $env:APPDATA; ownDataExistedBefore = $existedBefore; ready = $ready; exit = "$exitCode"; reads = @($reads) } |
+[pscustomobject] @{ user = $identity.Name.Split('\')[-1]; sid = $identity.User.Value; admin = $admin; appData = $env:APPDATA; ownDataExistedBefore = $existedBefore; ready = $ready; exit = "$exitCode"; reads = @($reads) } |
     ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root 'result.json') -Encoding utf8
 '@
         & icacls.exe $shared /grant "${userName}:(OI)(CI)M" | Out-Null
@@ -429,7 +437,7 @@ $admin = $principal.IsInRole([Security.Principal.SecurityIdentifier]::new('S-1-5
         if ($helper.ExitCode -ne 0) { throw "The second account helper exited with $($helper.ExitCode)." }
         $result = Get-Content -LiteralPath (Join-Path $shared 'result.json') -Raw | ConvertFrom-Json
         Write-Host "SECOND_ACCOUNT user=$($result.user) admin=$($result.admin) appData=$($result.appData) ownDataExistedBefore=$($result.ownDataExistedBefore) ready=$($result.ready) exit=$($result.exit)"
-        if ($result.user -ne $userName) { Fail "The helper ran as '$($result.user)', not the test account." }
+        if ($result.user -ne $userName -or $result.sid -ne $userSid) { Fail "The helper ran as '$($result.user)' ($($result.sid)), not the test account." }
         if ($result.admin -ne $false) { Fail 'The second account has administrator rights.' }
         foreach ($read in $result.reads) {
             if ($read.result -ne 'denied') { Fail "Second account could access ($($read.result)): $($read.path)" }
