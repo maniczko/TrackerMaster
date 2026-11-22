@@ -228,7 +228,9 @@ export default function Widget() {
       <button type="button" ref={contextButton} className="qp-context" title={bar.full} aria-label={`${bar.full}. Pokaż pełne informacje`} aria-expanded={open && details} aria-controls={open ? 'qp-panel' : undefined} onClick={() => void setPanel(true, 'context')}>
         <strong>{bar.title}</strong><small>{bar.colour !== null && <span className="qp-dot" data-project-colour={bar.colour} aria-hidden="true" />}<span>{bar.subtitle}</span></small>
       </button>
-      <span className="qp-clock" title={clock.mode === 'running' ? 'Orientacyjny czas pomiaru' : 'Czas pomiaru'} aria-live="off">{clock.text}</span>
+      {clock.mode === 'recovered' || clock.mode === 'unavailable'
+        ? <span className="qp-clock qp-clock-unknown" role="img" title={clock.mode === 'recovered' ? 'Czas do weryfikacji' : 'Czas niedostępny'} aria-label={clock.mode === 'recovered' ? 'Czas do weryfikacji' : 'Czas niedostępny'} aria-live="off">{clock.text.split(':').map((part, index) => <span key={index}>{index > 0 && <span className="qp-clock-sep">:</span>}{part}</span>)}</span>
+        : <span className="qp-clock" title={clock.mode === 'running' ? 'Czas pomiaru · zapisze się przy zatrzymaniu' : 'Czas pomiaru'} aria-live="off">{clock.text}</span>}
       <button type="button" className={`qp-toggle${clock.mode === 'running' ? ' qp-running' : ''}`} aria-label={toggleLabel} title={`${toggleLabel} · ${shortcutLabel(shortcut?.shortcut || defaultShortcut)}${shortcut?.registered ? ' (globalnie)' : ' (w tym oknie)'}`} aria-disabled={controlsLocked || dirtyEdit} onClick={() => toggleRef.current()}><TimerIcon key={active ? 'stop' : 'play'} name={active ? 'stop' : 'play'} /></button>
       <div className="qp-tools">
         <button type="button" className="qp-icon" aria-label="Przypięcie na wierzchu" aria-pressed={onTop} title={pinLabel} aria-disabled={pinPending} onClick={() => void changePin()}><TimerIcon name="pin" /></button>

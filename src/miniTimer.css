@@ -46,6 +46,9 @@
 .qp-clock { min-width: 7.1ch; color: var(--color-text); white-space: nowrap; font-size: 1.375rem; line-height: 1; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: -.02em; }
 .qp-mini[data-mode='idle'] .qp-clock { color: var(--color-text-muted); font-weight: 600; }
 .qp-mini[data-mode='recovered'] .qp-clock, .qp-mini[data-mode='unavailable'] .qp-clock { color: var(--color-pending-text); }
+/* Unknown time: short dash pairs with clear gaps, so "––:––:––" does not read as a slider. */
+.qp-clock.qp-clock-unknown { display: inline-flex; align-items: center; font-weight: 500; letter-spacing: 0; }
+.qp-clock-sep { margin: 0 .28em; }
 
 /* Context: title (description → task → project) and "client · project" with a decorative project dot. */
 .qp-mini .qp-context { min-width: 0; min-height: 44px; display: grid; align-content: center; gap: 2px; text-align: left; padding: 2px 6px; background: transparent; color: inherit; border: 1px solid transparent; border-radius: var(--radius-md); transition: background-color var(--motion-fast) ease; }
@@ -72,11 +75,12 @@
 .qp-mini .qp-context:hover, .qp-icon:hover:not([aria-disabled='true']) { background: var(--color-accent-soft); color: var(--color-text); }
 
 /* Safety status line: always visible when present (uncertain time, conflicts, errors). */
-.qp-status { display: flex; flex: 0 0 auto; justify-content: space-between; gap: 6px; align-items: center; min-height: 24px; margin: 0 var(--space-2) 3px; border: 1px solid transparent; border-radius: var(--radius-md); padding: 0 6px; font-size: var(--text-xs); }
+.qp-status { display: flex; flex: 0 0 auto; justify-content: space-between; gap: var(--space-2); align-items: center; min-height: 26px; margin: 0 1px 1px; border: 0; border-top: 1px solid var(--color-border); border-radius: 0; padding: 0 var(--space-2) 0 var(--space-3); font-size: var(--text-xs); line-height: 1.2; }
 .qp-status > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qp-status[data-tone='quiet'] { background: var(--color-accent-soft); color: var(--color-text); }
-.qp-status[data-tone='warn'] { background: var(--color-pending-bg); color: var(--color-pending-text); border: 1px dashed var(--color-pending-border); }
-.qp-status[data-tone='error'] { background: var(--color-error-bg); color: var(--color-error-text); border-color: var(--color-error-border); }
+.qp-status[data-tone='warn'] { background: var(--color-pending-bg); color: var(--color-pending-text); border-top: 1px dashed var(--color-pending-border); }
+.qp-status[data-tone='error'] { background: var(--color-error-bg); color: var(--color-error-text); border-top-color: var(--color-error-border); }
+.qp-mini:has(.qp-status):not(:has(.qp-panel)) .qp-bar { min-height: calc(100% - 27px); }
 .qp-mini .qp-text-button { border: 1px solid transparent; border-radius: var(--radius-sm); color: var(--color-accent-strong); background: transparent; min-height: 32px; padding: 2px 6px; font-size: var(--text-xs); font-weight: 650; text-align: left; transition: background-color var(--motion-fast) ease; }
 .qp-mini .qp-status .qp-text-button { min-height: 22px; padding: 0 4px; color: inherit; text-decoration: underline; white-space: nowrap; }
 .qp-mini .qp-text-button:hover:not(:disabled) { background: var(--color-accent-soft); }
