@@ -37,14 +37,34 @@ function Get-RuleSid($Rule) {
     catch { [string] $Rule.IdentityReference }
 }
 
-# Only the current user, SYSTEM and Administrators may hold access. The only other
-# SIDs allowed are computed below for this run: the test package's own capability SID
-# and the capabilities held by the WebView2 network-service sandbox our app started.
-# AppContainer tokens pass an access check only if their user SID passes the same
-# DACL too, so these grant no other account access. Any other SID fails.
-$script:allowedContainerSids = @{}
-$script:seenContainerSids = [Collections.Generic.HashSet[string]]::new()
+# Only the current user, SYSTEM and Administrators may hold access. Two further SIDs are
+# allowed, each only inside its own subtree and only as computed in this run:
+# - the test package capability SID (S-1-15-3- + sub-authorities of
+#   DeriveAppContainerSidFromAppContainerName(PackageFamilyName)), inside the package LocalCache
+#   that Windows creates for the package;
+# - the WebView2 network-service LPAC capability, DeriveCapabilitySidsFromName("lpacEdgeStableNetworkSandbox"),
+#   inside EBWebView<profile>{Network,Cache,Shared Dictionary}. Chromium grants exactly these
+#   directories in content/browser/network_sandbox.cc (MaybeGrantAccessToDataPath, via
+#   Sid::FromNamedCapabilityVector of ContentBrowserClient::GetLPACCapabilityNameForNetworkService);
+#   Chrome names it lpacChrome<Channel>NetworkSandbox, Edge/WebView2 Stable lpacEdgeStableNetworkSandbox.
+# Windows grants an AppContainer/LPAC token access only if its user SID also passes the DACL,
+# so neither SID gives another account access. Any other SID, or these SIDs elsewhere, fails.
+$script:scopedSids = [Collections.Generic.List[object]]::new()
+$script:seenScoped = [Collections.Generic.HashSet[string]]::new()
 $script:vanished = 0
+function Add-ScopedSid([string] $Sid, [string[]] $Roots, [string] $Reason) {
+    $script:scopedSids.Add([pscustomobject] @{ Sid = $Sid; Roots = $Roots; Reason = $Reason })
+    Write-Host "ACL scoped allowance $Sid ($Reason) under: $($Roots -join ' | ')"
+}
+function Test-ScopedSid([string] $Sid, [string] $Path) {
+    foreach ($entry in $script:scopedSids) {
+        if ($entry.Sid -ne $Sid) { continue }
+        foreach ($root in $entry.Roots) {
+            if ($Path -eq $root -or $Path.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) { [void] $script:seenScoped.Add($Sid); return $true }
+        }
+    }
+    $false
+}
 
 Add-Type -TypeDefinition @'
 using System;
@@ -98,6 +118,18 @@ public static class Dev14Token {
             } finally { CloseHandle(token); }
         } finally { CloseHandle(process); }
     }
+    [DllImport("kernelbase.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool DeriveCapabilitySidsFromName(string name, out IntPtr groupSids, out uint groupCount, out IntPtr capabilitySids, out uint capabilityCount);
+    public static string CapabilitySid(string name) {
+        IntPtr groups, capabilities; uint groupCount, capabilityCount;
+        if (!DeriveCapabilitySidsFromName(name, out groups, out groupCount, out capabilities, out capabilityCount) || capabilityCount < 1)
+            throw new InvalidOperationException("DeriveCapabilitySidsFromName failed: " + Marshal.GetLastWin32Error());
+        try { return Text(Marshal.ReadIntPtr(capabilities)); }
+        finally {
+            for (uint i = 0; i < groupCount; i++) LocalFree(Marshal.ReadIntPtr(groups, (int) i * IntPtr.Size));
+            for (uint i = 0; i < capabilityCount; i++) LocalFree(Marshal.ReadIntPtr(capabilities, (int) i * IntPtr.Size));
+            LocalFree(groups); LocalFree(capabilities);
+        }
+    }
     public static string AppContainerSid(string name) {
         IntPtr sid;
         int hr = DeriveAppContainerSidFromAppContainerName(name, out sid);
@@ -107,26 +139,6 @@ public static class Dev14Token {
 }
 '@
 
-# Record the WebView2 network-service sandbox started for this profile by the given app process.
-function Register-WebViewSandbox([int] $AppPid) {
-    $deadline = (Get-Date).AddSeconds(30)
-    do {
-        $network = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object {
-            $_.CommandLine -like "*$identifier*" -and $_.CommandLine -like '*--utility-sub-type=network.mojom.NetworkService*' })
-        if ($network.Count) { break }
-        Start-Sleep -Milliseconds 500
-    } while ((Get-Date) -lt $deadline)
-    if (!$network.Count) { Write-Host "SANDBOX no WebView2 network service process for app pid $AppPid"; return }
-    foreach ($process in $network) {
-        $token = [Dev14Token]::Describe([int] $process.ProcessId)
-        if (!$token) { Fail "Could not read the token of WebView2 network process $($process.ProcessId)."; continue }
-        Write-Host "SANDBOX WebView2 network pid=$($process.ProcessId) parent=$($process.ParentProcessId) user=$($token[0]) appContainer=$($token[1]) capabilities=$(($token | Select-Object -Skip 2) -join ',')"
-        if ($token[0] -ne $currentSid) { Fail "The WebView2 network process runs as $($token[0]), not the current user."; continue }
-        foreach ($capability in ($token | Select-Object -Skip 2 | Where-Object { $_ -like 'S-1-15-3-1024-*' })) {
-            $script:allowedContainerSids[$capability] = "WebView2 network-service sandbox capability (pid $($process.ProcessId))"
-        }
-    }
-}
 function Test-PrivateAcl([string] $Path, [string] $Label) {
     try { $acl = Get-Acl -LiteralPath $Path }
     catch [Management.Automation.ItemNotFoundException] { $script:vanished++; Write-Host "ACL $Label vanished before check: $Path"; return }
@@ -136,7 +148,7 @@ function Test-PrivateAcl([string] $Path, [string] $Label) {
         if ($rule.AccessControlType -ne 'Allow') { continue }
         if ($sid -eq 'S-1-3-0' -and $rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
         if ($broadSids.ContainsKey($sid)) { Fail "$Label grants $($broadSids[$sid]) ($sid) $($rule.FileSystemRights): $Path" }
-        elseif ($script:allowedContainerSids.ContainsKey($sid)) { [void] $script:seenContainerSids.Add($sid) }
+        elseif (Test-ScopedSid $sid $Path) { }
         elseif ($allowedSids -notcontains $sid) { Fail "$Label grants an unexpected identity $sid ($($rule.IdentityReference)): $Path" }
     }
     Write-Host "ACL $Label $Path :: $($entries -join '; ')"
@@ -212,7 +224,7 @@ if ($Mode -eq 'Packaged') {
     $packageContainerSid = [Dev14Token]::AppContainerSid($package.PackageFamilyName)
     if ($packageContainerSid -notlike 'S-1-15-2-*') { throw "Unexpected package SID $packageContainerSid." }
     $packageCapabilitySid = 'S-1-15-3-' + $packageContainerSid.Substring('S-1-15-2-'.Length)
-    $script:allowedContainerSids[$packageCapabilitySid] = "capability form of the test package SID $packageContainerSid ($($package.PackageFamilyName))"
+    Add-ScopedSid $packageCapabilitySid @(Join-Path $packageRoot 'LocalCache') "capability form of the test package SID $packageContainerSid ($($package.PackageFamilyName))"
     Write-Host "PACKAGE_SID derived=$packageContainerSid capability=$packageCapabilitySid"
     # Launch the packaged app to read its token and the WebView2 sandbox it starts.
     Start-Process -FilePath "shell:AppsFolder\$($package.PackageFamilyName)!TrackerMaster"
@@ -224,7 +236,6 @@ if ($Mode -eq 'Packaged') {
         Write-Host "PACKAGE_TOKEN pid=$($packaged.Id) user=$($appToken[0]) appContainer=$($appToken[1]) capabilities=$(($appToken | Select-Object -Skip 2) -join ',')"
         if ($appToken[0] -ne $currentSid) { Fail "The packaged app runs as $($appToken[0]), not the current user." }
         Write-Host "PACKAGE_TOKEN holds derived package capability: $(($appToken | Select-Object -Skip 2) -contains $packageCapabilitySid)"
-        Register-WebViewSandbox $packaged.Id
     } finally {
         Get-Process -Name 'tracker-master' -ErrorAction SilentlyContinue | Stop-Process -Force
         Wait-WebViewExit
@@ -242,6 +253,9 @@ if ($Mode -eq 'Packaged') {
     $osPackageFiles | ForEach-Object { Write-Host "  $($_.FullName)$(if (!$_.PSIsContainer) { " [$($_.Length) B]" })" }
 }
 Wait-WebViewExit
+$networkSandboxSid = [Dev14Token]::CapabilitySid('lpacEdgeStableNetworkSandbox')
+$networkRoots = foreach ($dir in $webDirs) { foreach ($name in 'Network', 'Cache', 'Shared Dictionary') { Join-Path $dir "EBWebView\Default\$name" } }
+Add-ScopedSid $networkSandboxSid $networkRoots 'WebView2 network-service LPAC capability lpacEdgeStableNetworkSandbox'
 
 if ($Mode -eq 'Unpackaged') {
     # 2. Unique synthetic marker: written to the database, then rendered by the app.
@@ -272,7 +286,6 @@ try {
             Start-Sleep -Milliseconds 250
         }
         if (!(Select-String -LiteralPath $trace -SimpleMatch 'setup-complete' -Quiet)) { throw 'The test application did not finish setup.' }
-        Register-WebViewSandbox $app.Id
         $deadline = (Get-Date).AddSeconds(30)
         do { Start-Sleep -Milliseconds 250; $app.Refresh() } while ($app.MainWindowHandle -eq 0 -and (Get-Date) -lt $deadline)
         Start-Sleep -Seconds 3 # let the window render the marker data
@@ -337,9 +350,7 @@ foreach ($shared in @($env:ProgramData, (Join-Path $env:SystemDrive 'Users\Publi
 foreach ($item in $dataItems) { Test-PrivateAcl $item.FullName 'data' }
 foreach ($item in $webItems) { Test-PrivateAcl $item.FullName 'webview' }
 Write-Host "ACL checked $(@($dataItems).Count) data items and $(@($webItems).Count) webview items ($script:vanished vanished during the check)"
-foreach ($sid in $script:allowedContainerSids.Keys) {
-    Write-Host "ACL allowed $sid = $($script:allowedContainerSids[$sid]); present on items: $($script:seenContainerSids.Contains($sid))"
-}
+foreach ($entry in $script:scopedSids) { Write-Host "ACL scoped $($entry.Sid) present on checked items: $($script:seenScoped.Contains($entry.Sid))" }
 
 # 5. Logs and diagnostics contain no client, project, task names or descriptions.
 Test-NoSecret ($dataItems + @($webItems)) $secrets 'profile'
