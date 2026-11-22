@@ -88,9 +88,18 @@ const handlers: Record<string, (a: any) => unknown> = {
   widget_project_start: a => { start(a.projectId, a.taskId ?? null, a.description ?? ''); return snapshot(); },
   stop_timer: () => { if (active?.recovered) throw 'Pomiar wymaga ręcznego zakończenia.'; close(now()); return snapshot(); },
   widget_stop: () => { if (active?.recovered || active?.uncertain) throw 'Pomiar wymaga weryfikacji w aplikacji.'; close(now()); return snapshot(); },
+  // D4 rule from #50: the end may precede recorded sleep; later periods no longer belong
+  // to the entry and an unfinished period is clipped to the end. Never adds time.
   recover_timer: a => {
-    if (pending.some(p => p.endedMs === null)) throw 'Najpierw ustal koniec każdego okresu uśpienia.';
-    close(Date.parse(a.endedAt)); return snapshot();
+    if (!active) throw 'Nie ma pomiaru do odzyskania.';
+    const end = Date.parse(a.endedAt), start = Date.parse(active.started_at);
+    if (!Number.isFinite(end)) throw 'Podaj poprawną datę zakończenia.';
+    if (end > now()) throw 'Zakończenie nie może być w przyszłości.';
+    if (end < start) throw 'Zakończenie nie może być przed rozpoczęciem pomiaru.';
+    const id = active.id;
+    pending = pending.filter(p => p.entryId !== id || p.startedMs < end)
+      .map(p => p.entryId === id && (p.endedMs === null || p.endedMs > end) ? { ...p, endedMs: end } : p);
+    close(end); return snapshot();
   },
   set_entry_description: a => { const e = entries.find(x => x.id === a.entryId) ?? (active?.id === a.entryId ? active : null); if (e) e.description = a.description; return snapshot(); },
   set_entry_billable: a => { const e = entries.find(x => x.id === a.entryId) ?? (active?.id === a.entryId ? active : null); if (e) e.billable = a.billable; return snapshot(); },
