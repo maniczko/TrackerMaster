@@ -13,6 +13,13 @@ import { clientLabels } from './clientLabels';
 import EntryMenu from './EntryMenu';
 import { entryTimeRange } from './historyFormat';
 import { defaultShortcut, shortcutLabel } from './shortcut';
+import { MiniTimerTaskPicker } from './MiniTimerPanel';
+import { choicesFor, createRequestGate, recentChoices } from './miniTimerModel';
+import { selectionFor, selectionKey, startBlocked } from './timerChoice';
+import { historyDays, timerTotals } from './reportDayModel';
+import type { HistoryRow } from './reportDayModel';
+import { useAllClientsReport } from './useAllClientsReport';
+import './miniTimer.css';
 
 type Id = number | string;
 type Client = { id: Id; name: string; archived: boolean };
@@ -129,8 +136,34 @@ export default function App() {
   const elapsed = data.active ? Math.max(0, (now - new Date(data.active.started_at).getTime() - (data.active.excluded_sleep_ms ?? 0)) / 1000) : 0;
   const displayElapsed = Number.isFinite(elapsed) ? elapsed : 0;
   const entries = useMemo(() => [...data.entries].sort((a, b) => b.started_at.localeCompare(a.started_at)), [data.entries]);
+  // Quick start: the mini timer's project/task choice (same model and component), mapped onto the lists below.
+  const pickerInput = useRef<HTMLInputElement>(null);
+  const timerDescriptionInput = useRef<HTMLInputElement>(null);
+  const choices = useMemo(() => choicesFor(data), [data]);
+  const recent = useMemo(() => recentChoices(choices, data.entries), [choices, data.entries]);
+  const catalog = useMemo(() => ({ clients: data.clients, projects: data.projects, tasks: data.tasks }), [data.clients, data.projects, data.tasks]);
+  // Day/week totals and History day groups come from the report's own calculation (all clients).
+  const allClients = useAllClientsReport(loaded, reportRevision);
+  const totals = useMemo(() => {
+    if (!allClients.read) return null;
+    try { return timerTotals(allClients.read.data, catalog, allClients.read.at); } catch { return null; }
+  }, [allClients.read, catalog]);
+  const historyGroups = useMemo(() => {
+    if (!allClients.read) return null;
+    try { return historyDays(entries, allClients.read.data, catalog, allClients.read.at); } catch { return null; }
+  }, [entries, allClients.read, catalog]);
+  // One write at a time: a fast double click cannot send a second start before the first returns.
+  const writes = useRef(createRequestGate()).current;
+  const startDisabled = startBlocked({ busy, loaded, projectId, taskId, client: selectedClient, project: selectedProject, task: selectedTask, active: data.active });
+  function chooseTimerTarget(key: string) {
+    const next = selectionFor(choices, key);
+    if (!next) return;
+    setClientId(next.clientId); setProjectId(next.projectId); setTaskId(next.taskId);
+    timerDescriptionInput.current?.focus();
+  }
 
   async function execute(action: () => Promise<unknown>, message: string) {
+    if (!writes.beginWrite()) return;
     setBusy(true); setError(''); setNotice('');
     try {
       try { await action(); }
@@ -142,7 +175,7 @@ export default function App() {
       setReportRevision(version => version + 1);
       try { await refresh(); setNotice(message); }
       catch (e) { setError(`${message} Nie udało się odświeżyć danych: ${sentence(e)} Ponów odczyt, nie operację.`); }
-    } finally { setBusy(false); }
+    } finally { writes.endWrite(); setBusy(false); }
   }
   async function retryRefresh() {
     setBusy(true); setError(''); setNotice('');
@@ -225,6 +258,28 @@ export default function App() {
     {shortcutLabel(shortcut.shortcut || defaultShortcut).split(' + ').map((key, index) => <span key={key}>{index > 0 && ' + '}<kbd>{key}</kbd></span>)}
     {!shortcut.registered && <span> · obecnie niedostępny poza aplikacją</span>}</p>;
 
+  const piecePartText = { whole: '', first: 'Ciąg dalszy następnego dnia', middle: 'Wpis trwa przez cały dzień', last: 'Początek poprzedniego dnia' } as const;
+  // One History row; with a day piece (grouped view) it shows that day's clock range and report seconds.
+  const historyEntryRow = (e: Entry, piece?: HistoryRow<Entry>) => {
+                    const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, e.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id));
+          const name = t?.name || 'zadanie'; const when = entryTimeRange(e.started_at, e.ended_at, now);
+          const actions = !piece || piece.part === 'whole' || piece.part === 'first';
+          const billingLabel = e.billable ? 'Oznacz jako nierozliczalny' : 'Oznacz jako rozliczalny';
+          return <tr key={piece ? `${e.id}:${piece.date}` : e.id} data-part={piece?.part}><td><strong>{e.task_id === null ? 'Bez zadania' : t?.name || 'Nieznane zadanie'}</strong>{e.description && <small className="entry-description">{e.description}</small>}</td>
+            <td>{c ? clientLabelById.get(String(c.id)) : '—'} / {p?.name || '—'}<small className="entry-billing" data-billable={e.billable}>{e.billable ? 'Rozliczalny' : 'Nierozliczalny'}</small></td>
+            <td className="entry-when">{piece
+              ? <><time dateTime={e.started_at} title={formatPreciseDate(e.started_at)}>{piece.start}</time>–{e.ended_at && <time dateTime={e.ended_at} title={formatPreciseDate(e.ended_at)}>{piece.end}</time>}{piece.part !== 'whole' && <small className="entry-part">{piecePartText[piece.part]}{piece.seconds !== null && ` · w tym dniu ${formatDuration(piece.seconds)}`}</small>}{piece.seconds === null && <small className="entry-part">Poza sumą raportu</small>}</>
+              : <><time dateTime={e.started_at} title={formatPreciseDate(e.started_at)}>{when.start}</time>{' – '}{e.ended_at ? <time dateTime={e.ended_at} title={formatPreciseDate(e.ended_at)}>{when.end}</time> : when.end}</>}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td>
+            <td className={e.duration_seconds == null ? 'duration pending' : 'duration'}>{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td>
+            <td className="entry-actions">{!actions ? <small className="entry-part">Operacje przy dniu rozpoczęcia</small> : <><button type="button" className="secondary" disabled={busy || !loaded || !!data.active?.recovered} aria-label={`Wznów: ${name}`} onClick={() => void execute(() => invoke('resume_entry', { sourceId: Number(e.id), expectedActiveId: data.active ? Number(data.active.id) : null }), 'Pomiar wznowiony.')}>Wznów</button>
+              <EntryMenu label={`Więcej operacji: ${name}`} items={[
+                { key: 'description', label: 'Zmień opis', ariaLabel: `Zmień opis: ${name}`, disabled: busy || !loaded, onSelect: () => entryEditor.current?.openEntry(Number(e.id), 'description') },
+                { key: 'billing', label: billingLabel, ariaLabel: `${billingLabel}: ${name}`, disabled: busy || !loaded, onSelect: () => void execute(() => invoke('set_entry_billable', { entryId: Number(e.id), expected: e.billable, billable: !e.billable }), 'Zapisano rozliczalność wpisu.') },
+                { key: 'correct', label: 'Popraw wpis', ariaLabel: `Popraw wpis: ${name}`, disabled: busy || !e.ended_at, onSelect: () => entryEditor.current?.openEntry(Number(e.id), 'start') },
+                { key: 'history', label: 'Historia zmian', ariaLabel: `Historia zmian: ${name}`, onSelect: () => void showRevisions(e.id) },
+                { key: 'delete', label: 'Usuń wpis', ariaLabel: `Usuń wpis: ${name}`, danger: true, disabled: busy || !e.ended_at, onSelect: () => setDeleting(e) },
+              ]} /></>}</td></tr>;
+  };
   if (restoreDone) return <div className="app-shell"><main><section className="card"><h1>Kopia została przywrócona</h1><p>Ze względów bezpieczeństwa zamknij aplikację i uruchom ją ponownie. Jeśli kopia zawierała otwarty pomiar, po uruchomieniu będzie on wymagał weryfikacji.</p><p>Kopia danych sprzed przywrócenia: <code>{restoreDone}</code>. Nie jest szyfrowana.</p>{error && <div role="alert" className="alert error">{error}</div>}<button className="primary" onClick={() => invoke('exit_after_restore').catch(e => setError(`Nie udało się zamknąć aplikacji: ${String(e)}`))}>Zamknij aplikację</button></section></main></div>;
 
   return <div className="app-shell">
@@ -253,7 +308,8 @@ export default function App() {
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered && !data.active.uncertain ? 'running' : loaded && (data.active?.recovered || data.active?.uncertain) ? 'pending' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered || data.active?.uncertain ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
           {clockUnknown
             ? <div className="clock clock-unknown" role="img" aria-label={loaded ? 'Czas do weryfikacji' : 'Czas nieznany'} aria-live="off"><span>—</span><span className="clock-sep">:</span><span>—</span><span className="clock-sep">:</span><span>—</span></div>
-            : <div className="clock" aria-live="off">{formatDuration(displayElapsed)}</div>}<p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered || data.active?.uncertain ? 'Pomiar wymaga weryfikacji' : data.active ? 'Czas zapisze się przy zatrzymaniu' : 'Wybierz klienta i projekt, aby rozpocząć'}</p>
+            : <div className="clock" aria-live="off">{formatDuration(displayElapsed)}</div>}<p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered || data.active?.uncertain ? 'Pomiar wymaga weryfikacji' : data.active ? 'Czas zapisze się przy zatrzymaniu' : 'Wybierz projekt lub zadanie, aby rozpocząć'}</p>
+          <p className="timer-totals" aria-label="Suma czasu, wszyscy klienci">{totals ? totals.text : 'Dziś — · Tydzień —'}{totals?.needsReview && <span className="timer-totals-note"> · raport zawiera uwagi</span>}</p>
           {loaded && data.active && <div className="actions timer-stop">
             <button type="button" className="primary" disabled={busy || data.active.recovered} onClick={() => execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.')}>
               <span aria-hidden="true">■</span> Zatrzymaj
@@ -264,13 +320,17 @@ export default function App() {
           </div>
           <div className="timer-setup">
           {needsStructure && <p className="alert">Aby rozpocząć pomiar, dodaj najpierw klienta i projekt. <button type="button" className="secondary" onClick={openStructure}>Dodaj klienta i projekt</button></p>}
+          <div className="timer-picker"><MiniTimerTaskPicker input={pickerInput} choices={choices} recent={recent} selected={selectionKey(projectId, taskId)}
+            disabled={busy || !loaded || !!data.active?.recovered} onSelect={chooseTimerTarget} /></div>
+          <details className="timer-lists"><summary>Wybierz z list: klient, projekt, zadanie</summary>
           <div className="selectors">
             <label>Klient<select title={selectedClient ? clientLabelById.get(String(selectedClient.id)) : undefined} value={clientId} disabled={busy || !loaded} onChange={e => { setClientId(e.target.value); setProjectId(''); setTaskId(''); }}><option value="">Wybierz klienta</option>{data.clients.filter(c => showArchived || !c.archived).map(c => <option key={c.id} value={c.id}>{clientLabelById.get(String(c.id))}{c.archived ? ' (archiwum)' : ''}</option>)}</select></label>
             <label>Projekt<select title={selectedProject?.name} value={projectId} disabled={busy || !loaded || !clientId} onChange={e => { setProjectId(e.target.value); setTaskId(''); }}><option value="">Wybierz projekt</option>{projects.map(p => <option key={p.id} value={p.id}>{p.name}{p.archived ? ' (archiwum)' : ''}</option>)}</select></label>
             <label>Zadanie<select title={selectedTask?.name} value={taskId} disabled={busy || !loaded || !projectId} onChange={e => setTaskId(e.target.value)}><option value="">Bez zadania</option>{tasks.map(t => <option key={t.id} value={t.id}>{t.name}{t.archived ? ' (archiwum)' : ''}</option>)}</select></label>
           </div>
-          <label className="timer-description">Opis nowego pomiaru (opcjonalnie)<input value={timerDescription} maxLength={2000} disabled={busy || !loaded} onChange={e => setTimerDescription(e.target.value)} placeholder="Nad czym pracujesz?" /></label>
-          <div className="actions timer-start"><button type="button" className={data.active ? 'secondary' : 'primary'} disabled={busy || !projectId || !loaded || selectedClient?.archived || selectedProject?.archived || selectedTask?.archived || data.active?.recovered || (!!data.active && same(data.active.project_id, projectId) && (taskId ? same(data.active.task_id, taskId) : data.active.task_id === null))} onClick={() => execute(async () => { await invoke('start_project_timer', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, expectedActiveId: data.active ? Number(data.active.id) : null, description: timerDescription }); setTimerDescription(''); }, data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.')}><span aria-hidden="true">▶</span> {data.active ? 'Przełącz zadanie' : 'Rozpocznij pomiar'}</button></div>
+          </details>
+          <label className="timer-description">Opis nowego pomiaru (opcjonalnie)<input ref={timerDescriptionInput} value={timerDescription} maxLength={2000} disabled={busy || !loaded} onChange={e => setTimerDescription(e.target.value)} placeholder="Nad czym pracujesz?" /></label>
+          <div className="actions timer-start"><button type="button" className={data.active ? 'secondary' : 'primary'} disabled={startDisabled} onClick={() => execute(async () => { await invoke('start_project_timer', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, expectedActiveId: data.active ? Number(data.active.id) : null, description: timerDescription }); setTimerDescription(''); }, data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.')}><span aria-hidden="true">▶</span> {data.active ? 'Przełącz zadanie' : 'Rozpocznij pomiar'}</button></div>
           {!data.active && shortcutHint}
           <p className="helper">Jednocześnie może trwać jeden pomiar. Zadanie jest opcjonalne.</p>
           <details className="timer-settings"><summary>Archiwum i rozliczalność</summary>
@@ -308,22 +368,10 @@ export default function App() {
             } catch { setError('Zmiany zostały zapisane. Odśwież historię, aby je zobaczyć.'); }
           }} />
         {deleting && <div className="alert error" role="alert"><strong>Usunąć wpis #{deleting.id}?</strong> {formatPreciseDate(deleting.started_at)} – {deleting.ended_at && formatPreciseDate(deleting.ended_at)}. Nie będzie uwzględniany w zestawieniach; informacja o usunięciu pozostanie w historii. <button type="button" className="danger" disabled={busy || !loaded} onClick={() => void execute(async () => { await invoke('delete_time_entry', { entryId: Number(deleting.id), expectedStart: deleting.started_at, expectedEnd: deleting.ended_at }); setDeleting(null); if (deleted) await loadDeleted(); }, 'Wpis został usunięty z zestawień.')}>Potwierdź usunięcie</button>{' '}<button type="button" disabled={busy} onClick={() => setDeleting(null)}>Anuluj</button></div>}
-        {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : <div className="table-wrap history-table"><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead><tbody>{entries.map(e => {
-          const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, e.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id));
-          const name = t?.name || 'zadanie'; const when = entryTimeRange(e.started_at, e.ended_at, now);
-          const billingLabel = e.billable ? 'Oznacz jako nierozliczalny' : 'Oznacz jako rozliczalny';
-          return <tr key={e.id}><td><strong>{e.task_id === null ? 'Bez zadania' : t?.name || 'Nieznane zadanie'}</strong>{e.description && <small className="entry-description">{e.description}</small>}</td>
-            <td>{c ? clientLabelById.get(String(c.id)) : '—'} / {p?.name || '—'}<small className="entry-billing" data-billable={e.billable}>{e.billable ? 'Rozliczalny' : 'Nierozliczalny'}</small></td>
-            <td className="entry-when"><time dateTime={e.started_at} title={formatPreciseDate(e.started_at)}>{when.start}</time>{' – '}{e.ended_at ? <time dateTime={e.ended_at} title={formatPreciseDate(e.ended_at)}>{when.end}</time> : when.end}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td>
-            <td className={e.duration_seconds == null ? 'duration pending' : 'duration'}>{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td>
-            <td className="entry-actions"><button type="button" className="secondary" disabled={busy || !loaded || !!data.active?.recovered} aria-label={`Wznów: ${name}`} onClick={() => void execute(() => invoke('resume_entry', { sourceId: Number(e.id), expectedActiveId: data.active ? Number(data.active.id) : null }), 'Pomiar wznowiony.')}>Wznów</button>
-              <EntryMenu label={`Więcej operacji: ${name}`} items={[
-                { key: 'description', label: 'Zmień opis', ariaLabel: `Zmień opis: ${name}`, disabled: busy || !loaded, onSelect: () => entryEditor.current?.openEntry(Number(e.id), 'description') },
-                { key: 'billing', label: billingLabel, ariaLabel: `${billingLabel}: ${name}`, disabled: busy || !loaded, onSelect: () => void execute(() => invoke('set_entry_billable', { entryId: Number(e.id), expected: e.billable, billable: !e.billable }), 'Zapisano rozliczalność wpisu.') },
-                { key: 'correct', label: 'Popraw wpis', ariaLabel: `Popraw wpis: ${name}`, disabled: busy || !e.ended_at, onSelect: () => entryEditor.current?.openEntry(Number(e.id), 'start') },
-                { key: 'history', label: 'Historia zmian', ariaLabel: `Historia zmian: ${name}`, onSelect: () => void showRevisions(e.id) },
-                { key: 'delete', label: 'Usuń wpis', ariaLabel: `Usuń wpis: ${name}`, danger: true, disabled: busy || !e.ended_at, onSelect: () => setDeleting(e) },
-              ]} /></td></tr>; })}</tbody></table></div>}
+        {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : historyGroups && historyGroups.length > 0
+          ? <div className="table-wrap history-table"><p className="helper history-zone">Dni w strefie raportu ({allClients.read?.data.time_zone}). Suma dnia jak w raporcie: wszyscy klienci, z aktywnym pomiarem; wpis przez północ jest w obu dniach.</p><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead>
+            {historyGroups.map(day => <tbody key={day.date} aria-label={`${day.label}: ${formatDuration(day.seconds)}`}><tr className="history-day"><th scope="rowgroup" colSpan={5}><span>{day.label}</span><span className="history-day-total">{formatDuration(day.seconds)}</span></th></tr>{day.rows.map(row => historyEntryRow(row.entry, row))}</tbody>)}</table></div>
+          : <div className="table-wrap history-table"><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead><tbody>{entries.map(e => historyEntryRow(e))}</tbody></table></div>}
         <details onToggle={e => { if (e.currentTarget.open) void loadDeleted(); }}><summary>Usunięte wpisy</summary><p className="muted">Te wpisy nie są uwzględniane w aktywnej historii. Zachowano je wraz z historią zmian.</p><button type="button" className="secondary" onClick={() => void loadDeleted()}>Odśwież listę</button>{deleted === null ? <p className="muted">Odczytywanie lub brak dostępu do listy.</p> : deleted.length === 0 ? <p className="muted">Brak usuniętych wpisów.</p> : <ul>{deleted.map(entry => <li key={entry.id}><strong>{entry.task_id === null ? 'Bez zadania' : data.tasks.find(task => same(task.id, entry.task_id))?.name || 'Nieznane zadanie'}</strong> · {formatPreciseDate(entry.started_at)} – {formatPreciseDate(entry.ended_at)} · {formatDuration(entry.duration_seconds)} · usunięto {formatPreciseDate(entry.deleted_at)}{' '}<button type="button" className="secondary" onClick={() => void showRevisions(entry.id)}>Historia zmian</button></li>)}</ul>}{deleted?.length === 500 && <p className="muted">Wyświetlono ostatnie 500 usuniętych wpisów.</p>}</details>
         {revisions && <section ref={revisionSection} aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.origin && <p>Wpis powstał z odzyskanego szkicu wpisu #{revisions.origin.sourceEntryId} · {formatPreciseDate(revisions.origin.createdAt)}</p>}{!revisions.origin && revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
       </section>

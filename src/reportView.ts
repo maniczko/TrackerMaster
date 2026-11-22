@@ -69,6 +69,8 @@ export function makeReportView(data: ReportData, catalog: ReportCatalog, scope: 
     liveDays: report.days, liveSeconds: report.totalSeconds, averageSeconds: report.averageSeconds,
     active, overlaps, missingRelations, excludedEntryIds: report.excludedEntryIds,
     pendingSeconds: report.pendingSeconds, pendingPeriodCount: report.pendingPeriodCount,
+    // Per-entry, per-day seconds (TECH-09 segmentation) for views that list entries by day.
+    contributions: report.contributions,
   };
 }
 

@@ -268,7 +268,8 @@ async function exercisePage(data, phase) {
     });
   }
   const testProfileVisible = () => document.querySelector('[role="note"]')?.textContent.includes('Wersja testowa.');
-  await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled && pick('#new-client'));
+  await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
+    !pick(`${timer} .timer-picker [role="combobox"]`)?.disabled && pick('#new-client'));
 
   if (phase === 'hotkey-restart') return null;
 
@@ -309,17 +310,31 @@ async function exercisePage(data, phase) {
       await click(`create ${kind}`, () => pick(input)?.form?.querySelector('button'));
       await until(`selected ${kind} ${name}`, () => selected(document.querySelectorAll(`${timer} select`)[selectedIndex]) === name);
     }
-    async function measure(client, description, taskName) {
+    async function measure(client, description, taskName, first = false) {
       await create('client', client, 0);
       await create('project', data.project, 1);
       if (taskName) await create('task', taskName, 2);
+      if (first) {
+        // The quick-start picker reflects the same selection as the lists (no recent items yet).
+        await until('picker shows the created target', () => pick(`${timer} .timer-picker [role="option"][aria-selected="true"]`)
+          ?.getAttribute('aria-label') === `${taskName ?? 'Bez zadania'} — ${client} / ${data.project}`);
+      }
       await setValue(`${timer} .timer-description input`, description, 'input');
-      await click('start timer', () => pick(`${timer} .timer-start button`));
+      if (first) {
+        // A fast double click must send one start: the second click finds the request gate closed.
+        const start = await until('start enabled', () => enabled(pick(`${timer} .timer-start button`)));
+        start.click(); start.click();
+      } else await click('start timer', () => pick(`${timer} .timer-start button`));
       await waitForMeasurement();
+      if ([...document.querySelectorAll('[role="alert"]')].some(node => node.textContent.includes('Nie udało się potwierdzić operacji'))) fail('A double click sent a second start');
       await click('stop timer', () => pick(`${timer} .timer-stop button`));
       await until('completed entry in History', () => historyRow(description));
+      if (first) {
+        await until('day and week totals next to the timer', () => /^Dziś \d+ (h \d+ )?min · Tydzień \d+ (h \d+ )?min/.test(pick(`${timer} .timer-totals`)?.textContent ?? ''));
+        await until('History grouped by day', () => historyRow(description)?.closest('tbody')?.querySelector('tr.history-day th .history-day-total'));
+      }
     }
-    await measure(data.primaryClient, data.primaryDescription, data.task);
+    await measure(data.primaryClient, data.primaryDescription, data.task, true);
     await measure(data.secondClient, data.secondDescription);
     const archiveToggle = await until('show archived records', () =>
       [...document.querySelectorAll(`${timer} label`)].find(label => label.textContent.includes('Pokaż archiwum'))?.querySelector('input'));
@@ -658,18 +673,18 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   await waitFor('main window shows the active timer', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button:not(:disabled)'))`));
   await captureMainLayout(cdp, mainSession, 'running');
   await evaluate(mainSession, `(() => {
-    const select = document.querySelectorAll('[aria-label="Pomiar czasu"] select')[0];
-    const option = [...select.options].find(item => item.textContent === ${JSON.stringify(primaryClient)});
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, option.value);
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    const input = document.querySelector('[aria-label="Pomiar czasu"] .timer-picker [role="combobox"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(`${project} ${primaryClient}`)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  await waitFor('other client project available for switch', () => evaluate(mainSession, `[...document.querySelectorAll('[aria-label="Pomiar czasu"] select')[1].options].some(item => item.textContent === ${JSON.stringify(project)})`));
-  await evaluate(mainSession, `(() => {
-    const select = document.querySelectorAll('[aria-label="Pomiar czasu"] select')[1];
-    const option = [...select.options].find(item => item.textContent === ${JSON.stringify(project)});
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, option.value);
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-  })()`);
+  const switchTarget = `Bez zadania — ${primaryClient} / ${project}`;
+  const switchOption = `[...document.querySelectorAll('[aria-label="Pomiar czasu"] .timer-picker [role="option"]')].find(item => item.getAttribute('aria-label') === ${JSON.stringify(switchTarget)})`;
+  await waitFor('other client project found by the picker', () => evaluate(mainSession, `Boolean(${switchOption})`));
+  await evaluate(mainSession, `${switchOption}.click()`);
+  await waitFor('picker choice is the same client and project in the lists', () => evaluate(mainSession, `(() => {
+    const lists = document.querySelectorAll('[aria-label="Pomiar czasu"] select');
+    return lists[0].selectedOptions[0]?.textContent === ${JSON.stringify(primaryClient)} && lists[1].selectedOptions[0]?.textContent === ${JSON.stringify(project)} && lists[2].value === '';
+  })()`));
   await waitFor('switch enabled', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-start button:not(:disabled)'))`));
   const replacementDescription = 'Przełączenie po błędzie zapisu';
   await evaluate(mainSession, `(() => {
