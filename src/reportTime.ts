@@ -87,6 +87,18 @@ function calendarPieces(zone: string) {
 }
 
 /** Allocate stored durations without silently redistributing ambiguous time. */
+/**
+ * Adds day pieces to per-date totals. One local date can have several pieces (for example split at UTC
+ * midnight or around sleep), so every piece of that date is summed. The report day totals and any
+ * per-entry day amount (History) use this same function.
+ */
+export function addDaySeconds(totals: Map<string, number>, days: readonly ReportDay[]): Map<string, number> {
+  for (const day of days) {
+    if (day.seconds > 0) totals.set(day.date, (totals.get(day.date) ?? 0) + day.seconds);
+  }
+  return totals;
+}
+
 export function reportByDay(entries: ReportEntry[], from: string, through: string, timeZone: string): ReportResult {
   if (!validDate(from) || !validDate(through) || from > through || from < '1970-01-01') throw new Error('Nieprawidłowy zakres dat raportu.');
   if (!validTimeZone(timeZone)) throw new Error('Nieprawidłowa strefa czasowa.');
@@ -102,9 +114,7 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
 
   function addEntry(id: number, days: ReportDay[], pending: number, hasPendingSleep: boolean) {
     const seconds = days.reduce((sum, day) => sum + day.seconds, 0);
-    for (const day of days) {
-      if (day.seconds > 0) totals.set(day.date, (totals.get(day.date) ?? 0) + day.seconds);
-    }
+    addDaySeconds(totals, days);
     pendingSeconds += pending;
     contributions.push({ id, days, seconds, pendingSeconds: pending, hasPendingSleep });
   }

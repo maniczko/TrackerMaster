@@ -109,6 +109,40 @@ function assertCompactLayout(layout, label, reference) {
     assert.equal(layout.action.top, reference.action.top, `${label}: Start/Stop moved vertically`);
   }
 }
+// UIQ evidence for a whole page section (beyond the viewport); observation plus layout checks.
+async function captureSection(cdp, sessionId, selector, ready, name) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  await waitFor(`${name} ready`, () => evaluate(ready));
+  for (const [width, height] of [[1280, 720], [1920, 1080]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false }, sessionId);
+    try {
+      await waitFor(`${name} at ${width}x${height}`, () => evaluate(`window.innerWidth === ${width} && window.innerHeight === ${height}`));
+      await delay(300);
+      const box = await evaluate(`(() => {
+        const section = document.querySelector(${JSON.stringify(selector)});
+        if (!section) return null;
+        section.scrollIntoView({ block: 'start' });
+        const rect = section.getBoundingClientRect();
+        return { x: Math.max(0, rect.left + window.scrollX), y: Math.max(0, rect.top + window.scrollY), width: Math.ceil(rect.width), height: Math.ceil(rect.height),
+          scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
+      })()`);
+      assert.ok(box, `${name}: section is missing`);
+      console.log(`UI_LAYOUT ${name} ${width}x${height} ${JSON.stringify(box)}`);
+      assert.ok(box.scrollWidth <= box.clientWidth, `${name} ${width}x${height}: the page scrolls horizontally`);
+      const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true,
+        clip: { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 } }, sessionId);
+      await writeFile(join(screenshotDirectory, `${name}-${width}x${height}.png`), Buffer.from(data, 'base64'));
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+}
+const historyByDayReady = `Boolean(document.querySelector('section.history tr.history-day .history-day-total'))`;
+const reportCardReady = `(() => { const values = [...document.querySelectorAll('.report-glance dd')]; return values.length === 3 && values.every(node => /^\\d{2,}:\\d{2}:\\d{2}$/.test(node.textContent.trim())); })()`;
 async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = true } = {}) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
@@ -268,7 +302,15 @@ async function exercisePage(data, phase) {
     });
   }
   const testProfileVisible = () => document.querySelector('[role="note"]')?.textContent.includes('Wersja testowa.');
-  await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled && pick('#new-client'));
+  // Current data: the lists are enabled and the quick-start picker exists. The picker is disabled on
+  // purpose only while a recovered timer awaits its end time (Start is blocked then), so it must be
+  // enabled exactly when the "Pomiar wymaga weryfikacji." alert is absent.
+  const pickerReady = () => {
+    const search = pick(`${timer} .timer-picker [role="combobox"]`);
+    return Boolean(search) && search.disabled === Boolean(recoveryMessage());
+  };
+  await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
+    pickerReady() && pick('#new-client'));
 
   if (phase === 'hotkey-restart') return null;
 
@@ -309,17 +351,31 @@ async function exercisePage(data, phase) {
       await click(`create ${kind}`, () => pick(input)?.form?.querySelector('button'));
       await until(`selected ${kind} ${name}`, () => selected(document.querySelectorAll(`${timer} select`)[selectedIndex]) === name);
     }
-    async function measure(client, description, taskName) {
+    async function measure(client, description, taskName, first = false) {
       await create('client', client, 0);
       await create('project', data.project, 1);
       if (taskName) await create('task', taskName, 2);
+      if (first) {
+        // The quick-start picker reflects the same selection as the lists (no recent items yet).
+        await until('picker shows the created target', () => pick(`${timer} .timer-picker [role="option"][aria-selected="true"]`)
+          ?.getAttribute('aria-label') === `${taskName ?? 'Bez zadania'} — ${client} / ${data.project}`);
+      }
       await setValue(`${timer} .timer-description input`, description, 'input');
-      await click('start timer', () => pick(`${timer} .timer-start button`));
+      if (first) {
+        // A fast double click must send one start: the second click finds the request gate closed.
+        const start = await until('start enabled', () => enabled(pick(`${timer} .timer-start button`)));
+        start.click(); start.click();
+      } else await click('start timer', () => pick(`${timer} .timer-start button`));
       await waitForMeasurement();
+      if ([...document.querySelectorAll('[role="alert"]')].some(node => node.textContent.includes('Nie udało się potwierdzić operacji'))) fail('A double click sent a second start');
       await click('stop timer', () => pick(`${timer} .timer-stop button`));
       await until('completed entry in History', () => historyRow(description));
+      if (first) {
+        await until('day and week totals next to the timer', () => /^Dziś \d+ (h \d+ )?min · Tydzień \d+ (h \d+ )?min/.test(pick(`${timer} .timer-totals`)?.textContent ?? ''));
+        await until('History grouped by day', () => historyRow(description)?.closest('tbody')?.querySelector('tr.history-day th .history-day-total'));
+      }
     }
-    await measure(data.primaryClient, data.primaryDescription, data.task);
+    await measure(data.primaryClient, data.primaryDescription, data.task, true);
     await measure(data.secondClient, data.secondDescription);
     const archiveToggle = await until('show archived records', () =>
       [...document.querySelectorAll(`${timer} label`)].find(label => label.textContent.includes('Pokaż archiwum'))?.querySelector('input'));
@@ -658,18 +714,18 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   await waitFor('main window shows the active timer', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button:not(:disabled)'))`));
   await captureMainLayout(cdp, mainSession, 'running');
   await evaluate(mainSession, `(() => {
-    const select = document.querySelectorAll('[aria-label="Pomiar czasu"] select')[0];
-    const option = [...select.options].find(item => item.textContent === ${JSON.stringify(primaryClient)});
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, option.value);
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    const input = document.querySelector('[aria-label="Pomiar czasu"] .timer-picker [role="combobox"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(`${project} ${primaryClient}`)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  await waitFor('other client project available for switch', () => evaluate(mainSession, `[...document.querySelectorAll('[aria-label="Pomiar czasu"] select')[1].options].some(item => item.textContent === ${JSON.stringify(project)})`));
-  await evaluate(mainSession, `(() => {
-    const select = document.querySelectorAll('[aria-label="Pomiar czasu"] select')[1];
-    const option = [...select.options].find(item => item.textContent === ${JSON.stringify(project)});
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, option.value);
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-  })()`);
+  const switchTarget = `Bez zadania — ${primaryClient} / ${project}`;
+  const switchOption = `[...document.querySelectorAll('[aria-label="Pomiar czasu"] .timer-picker [role="option"]')].find(item => item.getAttribute('aria-label') === ${JSON.stringify(switchTarget)})`;
+  await waitFor('other client project found by the picker', () => evaluate(mainSession, `Boolean(${switchOption})`));
+  await evaluate(mainSession, `${switchOption}.click()`);
+  await waitFor('picker choice is the same client and project in the lists', () => evaluate(mainSession, `(() => {
+    const lists = document.querySelectorAll('[aria-label="Pomiar czasu"] select');
+    return lists[0].selectedOptions[0]?.textContent === ${JSON.stringify(primaryClient)} && lists[1].selectedOptions[0]?.textContent === ${JSON.stringify(project)} && lists[2].value === '';
+  })()`));
   await waitFor('switch enabled', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-start button:not(:disabled)'))`));
   const replacementDescription = 'Przełączenie po błędzie zapisu';
   await evaluate(mainSession, `(() => {
@@ -789,6 +845,41 @@ async function verifyRestoreRetry(cdp, sessionId) {
   }
 }
 
+// History row actions live in the "⋯" menu (EntryMenu). Open it like a person would (mouse, or
+// Enter/Space and the arrow keys), check that the item is visible and enabled, then choose it.
+// Returns false when the row or its menu is not ready yet, so callers can retry.
+async function chooseFromEntryMenu(cdp, sessionId, evaluate, description, labelPrefix, mode) {
+  const row = `[...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(description)}) && row.querySelector('.entry-menu-trigger'))`;
+  const trigger = `${row}?.querySelector('.entry-menu-trigger')`;
+  const item = `${row}?.querySelector(${JSON.stringify(`[role="menu"] [role="menuitem"][aria-label^="${labelPrefix}"]`)})`;
+  const shown = element => `(el => Boolean(el && !el.disabled && !el.closest('[hidden]') && el.getClientRects().length > 0))(${element})`;
+  if (!await evaluate(shown(trigger))) return false;
+  if (await evaluate(`${trigger}.getAttribute('aria-expanded') === 'true'`)) {
+    await evaluate(`${trigger}.click()`); // close a menu left open by an earlier attempt
+  }
+  const press = async (key, code, keyCode, text) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode, ...(text ? { text } : {}) }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode }, sessionId);
+  };
+  if (mode === 'mouse') await evaluate(`${trigger}.click()`);
+  else {
+    await evaluate(`${trigger}.focus()`);
+    if (mode === 'enter') await press('Enter', 'Enter', 13, '\r');
+    else await press(' ', 'Space', 32, ' ');
+  }
+  await waitFor('entry menu opens with a visible item', () => evaluate(`${trigger}.getAttribute('aria-expanded') === 'true' && ${shown(item)}`));
+  if (mode === 'mouse') await evaluate(`${item}.click()`);
+  else {
+    // Keyboard: focus starts on the first item; walk with the arrows (Space mode wraps upwards from it).
+    const [key, keyCode] = mode === 'enter' ? ['ArrowDown', 40] : ['ArrowUp', 38];
+    for (let step = 0; step < 6 && !await evaluate(`document.activeElement === ${item}`); step++) await press(key, key, keyCode);
+    assert.ok(await evaluate(`document.activeElement === ${item} && ${shown(item)}`), `keyboard focus did not reach ${labelPrefix}`);
+    await press('Enter', 'Enter', 13, '\r');
+  }
+  await waitFor('entry menu closes after the choice', () => evaluate(`${trigger}?.getAttribute('aria-expanded') !== 'true'`));
+  return true;
+}
+
 async function verifyDraft(cdp, sessionId, phase, primary) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
@@ -798,16 +889,16 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   const text = 'Szkic po przerwaniu aplikacji';
   if (phase === 'verify-recovery') {
     await waitFor('editor action for the first client is ready', () => evaluate(`(() => {
-      const row = [...document.querySelectorAll('section.history tbody tr')].find(item => item.textContent.includes(${JSON.stringify(primaryDescription)}));
-      const action = row?.querySelector('button[aria-label^="Popraw wpis:"]');
-      return Boolean(action && !action.disabled);
+      const row = [...document.querySelectorAll('section.history tbody tr')].find(item => item.textContent.includes(${JSON.stringify(primaryDescription)}) && item.querySelector('.entry-menu-trigger'));
+      const trigger = row?.querySelector('.entry-menu-trigger');
+      const action = row?.querySelector('[role="menuitem"][aria-label^="Popraw wpis:"]');
+      return Boolean(trigger && !trigger.disabled && action && !action.disabled);
     })()`));
-    await waitFor('entry editor opens', () => evaluate(`(() => {
-      if (document.querySelector('#entry-draft-description')) return true;
-      const action = [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(primaryDescription)}))?.querySelector('button[aria-label^="Popraw wpis:"]');
-      if (action && !action.disabled) action.click();
+    await waitFor('entry editor opens', async () => {
+      if (await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`)) return true;
+      await chooseFromEntryMenu(cdp, sessionId, evaluate, primaryDescription, 'Popraw wpis:', 'mouse');
       return false;
-    })()`)).catch(async error => {
+    }).catch(async error => {
       const alerts = await evaluate(`[...document.querySelectorAll('[role="alert"]')].map(node => node.textContent.trim())`);
       throw new Error(`${error.message}; application alerts: ${JSON.stringify(alerts)}`);
     });
@@ -947,12 +1038,11 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   } finally { db.close(); }
   console.log('PASS: draft survived interruption, identified a concurrent change, and applied only the selected field');
 
-  await waitFor('second entry editor opens', () => evaluate(`(() => {
-    if (document.querySelector('#entry-draft-description')) return true;
-    const action = [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(secondDescription)}))?.querySelector('button[aria-label^="Popraw wpis:"]');
-    if (action && !action.disabled) action.click();
+  await waitFor('second entry editor opens', async () => {
+    if (await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`)) return true;
+    await chooseFromEntryMenu(cdp, sessionId, evaluate, secondDescription, 'Popraw wpis:', 'enter');
     return false;
-  })()`));
+  });
   const discardedText = 'Niezapisana edycja do odrzucenia';
   await evaluate(`(() => {
     const field = document.querySelector('#entry-draft-description');
@@ -983,12 +1073,11 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   assert.equal(await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`), false);
   console.log('PASS: discard left the original entry unchanged and reopened the same window');
 
-  await waitFor('second entry reopens after discard', () => evaluate(`(() => {
-    if (document.querySelector('#entry-draft-description')) return true;
-    const action = [...document.querySelectorAll('section.history tbody tr')].find(row => row.textContent.includes(${JSON.stringify(secondDescription)}))?.querySelector('button[aria-label^="Popraw wpis:"]');
-    if (action && !action.disabled) action.click();
+  await waitFor('second entry reopens after discard', async () => {
+    if (await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`)) return true;
+    await chooseFromEntryMenu(cdp, sessionId, evaluate, secondDescription, 'Popraw wpis:', 'space');
     return false;
-  })()`));
+  });
   const savedText = 'Korekta zapisana przy zamknięciu';
   await evaluate(`(() => {
     const field = document.querySelector('#entry-draft-description');
@@ -1221,6 +1310,11 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'interrupt') {
       await verifyOccupiedShortcut(cdp, sessionId);
       await verifySecondLaunch(child, env);
+    }
+    if (phase === 'verify-recovery') {
+      // History by day and the closed-report card fed by the shared all-clients read (package 2).
+      await captureSection(cdp, sessionId, 'section.history', historyByDayReady, 'history-by-day');
+      await captureSection(cdp, sessionId, '[aria-label="Raport czasu"]', reportCardReady, 'report-card');
     }
     if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase, child);
     if (phase === 'draft-reopen') await verifyRestoreRetry(cdp, sessionId);

@@ -32,6 +32,9 @@ const entries: Entry[] = [
   { id: 2, task_id: null, project_id: 12, started_at: iso(dayStart + 1.75 * H), ended_at: iso(dayStart + 2.25 * H), duration_seconds: 1800, billable: false, description: 'Odpowiedź na zgłoszenie' },
   { id: 3, task_id: 211, project_id: 21, started_at: iso(dayStart - 22 * H), ended_at: iso(dayStart - 19 * H), duration_seconds: 10800, billable: true, description: 'Teksty ulotek — wersja z długim opisem, żeby sprawdzić zawijanie w tabeli' },
 ];
+// Crosses local midnight: History shows it in both days (TECH-09 day pieces).
+const midnight = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+entries.push({ id: 4, task_id: 112, project_id: 11, started_at: iso(midnight - 0.5 * H), ended_at: iso(midnight + 0.75 * H), duration_seconds: 4500, billable: true, description: 'Nocne wdrożenie poprawek' });
 let active: Entry | null = null;
 type Pending = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean };
 let pending: Pending[] = [];
@@ -85,6 +88,12 @@ const handlers: Record<string, (a: any) => unknown> = {
   set_sleep_resume: a => { const p = pending.find(x => x.id === a.periodId); if (p) { p.endedMs = Date.parse(a.endedAt); p.manualResume = true; } },
   resolve_sleep_period: a => { pending = pending.filter(x => x.id !== a.periodId); if (active && !pending.length) active.has_sleep = false; },
   start_project_timer: a => { start(a.projectId, a.taskId ?? null, a.description ?? ''); return snapshot(); },
+  resume_entry: a => {
+    if (active && active.id !== a.expectedActiveId) throw 'Pomiar uległ zmianie. Sprawdź aktualny stan.';
+    const source = entries.find(e => e.id === a.sourceId);
+    if (!source) throw 'Wpis do wznowienia nie istnieje lub został usunięty.';
+    start(source.project_id, source.task_id, source.description); return snapshot();
+  },
   widget_project_start: a => { start(a.projectId, a.taskId ?? null, a.description ?? ''); return snapshot(); },
   stop_timer: () => { if (active?.recovered) throw 'Pomiar wymaga ręcznego zakończenia.'; close(now()); return snapshot(); },
   widget_stop: () => { if (active?.recovered || active?.uncertain) throw 'Pomiar wymaga weryfikacji w aplikacji.'; close(now()); return snapshot(); },

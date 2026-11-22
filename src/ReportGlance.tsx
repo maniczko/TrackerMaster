@@ -1,39 +1,17 @@
-import { invoke } from '@tauri-apps/api/core';
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { formatDuration as duration } from './reportCsv';
 import { reportGlance } from './reportGlanceModel';
-import { allReportClients } from './reportScope';
 import type { ReportCatalog } from './reportScope';
-import type { ActiveReportEntry, CompletedReportEntry } from './reportView';
+import type { AllClientsReport } from './useAllClientsReport';
 
-type Data = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
-type Props = { catalog: ReportCatalog; loaded: boolean; revision: number };
+type Props = { catalog: ReportCatalog; loaded: boolean; summary: AllClientsReport };
 
 /**
  * Closed-report card: "Dziś / Ten tydzień / Rozliczalne w tym tygodniu" for all clients.
- * Read-only: the same get_report_data read the report uses, refreshed like the open report (every 5 s).
+ * Read-only: the main window's single all-clients read (useAllClientsReport), shared with the timer totals.
  */
-export default function ReportGlance({ catalog, loaded, revision }: Props) {
-  const [read, setRead] = useState<{ data: Data; at: number } | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    if (!loaded) { setRead(null); return; }
-    let cancelled = false;
-    let timer: number | undefined;
-    async function update() {
-      try {
-        const data = await invoke<Data>('get_report_data', { scope: allReportClients });
-        if (!cancelled) { setRead({ data, at: Date.now() }); setFailed(false); }
-      } catch {
-        if (!cancelled) { setRead(null); setFailed(true); }
-      } finally {
-        if (!cancelled) timer = window.setTimeout(update, 5000);
-      }
-    }
-    void update();
-    return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [loaded, revision]);
+export default function ReportGlance({ catalog, loaded, summary }: Props) {
+  const { read, failed } = summary;
 
   const glance = useMemo(() => {
     if (!read) return null;
