@@ -60,3 +60,22 @@ test('sleep decisions and manual re-read invalidate the report, the periodic ref
   assert.ok(refresh, 'App must define refresh()');
   assert.doesNotMatch(refresh[1], /setReportRevision/, 'the 2.5 s refresh must not reset the report');
 });
+
+// Review of #52: one all-clients report read for the card, timer totals and History (no second poll).
+test('the closed-report card shares the main window read: revision, focus and a 60 s interval', () => {
+  const hook = readFileSync(new URL('../src/useAllClientsReport.ts', import.meta.url), 'utf8');
+  const glance = readFileSync(new URL('../src/ReportGlance.tsx', import.meta.url), 'utf8');
+  assert.equal(app.match(/useAllClientsReport\(/g)?.length, 1, 'App owns the only read');
+  assert.match(app, /<Report\b[^>]*\bsummary=\{allClients\}/);
+  assert.match(report, /<ReportGlance catalog=\{catalog\} loaded=\{loaded\} summary=\{summary\} \/>/);
+  assert.doesNotMatch(glance, /useAllClientsReport\(|invoke\(/, 'the card must not start its own read');
+  assert.doesNotMatch(report, /useAllClientsReport\(/);
+  assert.match(hook, /ALL_CLIENTS_REPORT_INTERVAL_MS = 60_000/);
+  assert.match(hook, /window\.addEventListener\('focus', onFocus\)/);
+  assert.match(hook, /\}, \[loaded, revision\]\);/);
+});
+
+test('the shortcut hint is hidden while the timer awaits verification (Stop disabled or recovery)', () => {
+  assert.match(app, /\{loaded && data\.active && !data\.active\.recovered && !data\.active\.uncertain && shortcutHint\}/);
+  assert.equal(app.match(/&& shortcutHint\}/g)?.length, 2);
+});

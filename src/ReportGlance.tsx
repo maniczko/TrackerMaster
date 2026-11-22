@@ -2,16 +2,16 @@ import { useMemo } from 'react';
 import { formatDuration as duration } from './reportCsv';
 import { reportGlance } from './reportGlanceModel';
 import type { ReportCatalog } from './reportScope';
-import { useAllClientsReport } from './useAllClientsReport';
+import type { AllClientsReport } from './useAllClientsReport';
 
-type Props = { catalog: ReportCatalog; loaded: boolean; revision: number };
+type Props = { catalog: ReportCatalog; loaded: boolean; summary: AllClientsReport };
 
 /**
  * Closed-report card: "Dziś / Ten tydzień / Rozliczalne w tym tygodniu" for all clients.
- * Read-only: the shared all-clients get_report_data read (useAllClientsReport).
+ * Read-only: the main window's single all-clients read (useAllClientsReport), shared with the timer totals.
  */
-export default function ReportGlance({ catalog, loaded, revision }: Props) {
-  const { read, failed } = useAllClientsReport(loaded, revision);
+export default function ReportGlance({ catalog, loaded, summary }: Props) {
+  const { read, failed } = summary;
 
   const glance = useMemo(() => {
     if (!read) return null;

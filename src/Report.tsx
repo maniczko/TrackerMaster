@@ -15,11 +15,14 @@ import { allReportClients, changeReportScope, resolveReportScope } from './repor
 import type { ReportCatalog, ReportScope } from './reportScope';
 import { clientLabels } from './clientLabels';
 import ReportGlance from './ReportGlance';
+import type { AllClientsReport } from './useAllClientsReport';
 
 type Data = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
 type Props = ReportCatalog & {
   loaded: boolean;
   revision: number;
+  /** The main window's shared all-clients read for the closed-report card (one source, no second poll). */
+  summary: AllClientsReport;
   hasUnsavedEdit: () => boolean;
   onEditEntry: (entryId: number) => void;
   onShowHistory: (entryId: number) => void;
@@ -28,7 +31,7 @@ type Props = ReportCatalog & {
 const defaultZone = 'Europe/Warsaw';
 const archivedName = (name: string, archived?: boolean) => archived ? `${name} (Zarchiwizowany)` : name;
 
-export default function Report({ clients, projects, tasks, loaded, revision, hasUnsavedEdit, onEditEntry, onShowHistory }: Props) {
+export default function Report({ clients, projects, tasks, loaded, revision, summary, hasUnsavedEdit, onEditEntry, onShowHistory }: Props) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<'summary' | 'details'>('summary');
   const [initialFilter] = useState(() => { try { return readReportFilter(window.localStorage); } catch { return { filter: null, problem: true }; } });
@@ -221,7 +224,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
       if (!open && !hasUnsavedEdit()) setNow(Date.now());
       setOpen(!open);
     }}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
-    {!open && <ReportGlance catalog={catalog} loaded={loaded} revision={revision} />}
+    {!open && <ReportGlance catalog={catalog} loaded={loaded} summary={summary} />}
     {open && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
       {data && <ReportTimezone currentZone={data.time_zone} canChange={allowFilterChange}
