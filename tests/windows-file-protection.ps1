@@ -37,13 +37,96 @@ function Get-RuleSid($Rule) {
     catch { [string] $Rule.IdentityReference }
 }
 
-# Only the current user, SYSTEM and Administrators may hold access. Specific
-# AppContainer package (S-1-15-2-*) and capability (S-1-15-3-*) SIDs, which MSIX
-# and the WebView2 sandbox add, are reported but allowed: Windows grants an
-# AppContainer token access only if its user SID passes the same DACL too, so
-# they give no other account access. The broad ALL APPLICATION PACKAGES SIDs fail.
-$script:containerSids = [Collections.Generic.HashSet[string]]::new()
+# Only the current user, SYSTEM and Administrators may hold access. The only other
+# SIDs allowed are computed below for this run: the test package's own capability SID
+# and the capabilities held by the WebView2 network-service sandbox our app started.
+# AppContainer tokens pass an access check only if their user SID passes the same
+# DACL too, so these grant no other account access. Any other SID fails.
+$script:allowedContainerSids = @{}
+$script:seenContainerSids = [Collections.Generic.HashSet[string]]::new()
 $script:vanished = 0
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class Dev14Token {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr info, int length, out int returned);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr text);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+    [DllImport("userenv.dll", CharSet = CharSet.Unicode)] static extern int DeriveAppContainerSidFromAppContainerName(string name, out IntPtr sid);
+    [DllImport("advapi32.dll")] static extern IntPtr FreeSid(IntPtr sid);
+    static string Text(IntPtr sid) {
+        IntPtr text;
+        if (sid == IntPtr.Zero || !ConvertSidToStringSidW(sid, out text)) return "";
+        try { return Marshal.PtrToStringUni(text); } finally { LocalFree(text); }
+    }
+    static IntPtr Query(IntPtr token, int cls) {
+        int length;
+        GetTokenInformation(token, cls, IntPtr.Zero, 0, out length);
+        if (length <= 0) return IntPtr.Zero;
+        IntPtr buffer = Marshal.AllocHGlobal(length);
+        if (GetTokenInformation(token, cls, buffer, length, out length)) return buffer;
+        Marshal.FreeHGlobal(buffer);
+        return IntPtr.Zero;
+    }
+    // [0] token user, [1] AppContainer SID (empty when none), [2..] capability SIDs.
+    public static string[] Describe(int pid) {
+        IntPtr process = OpenProcess(0x1000, false, pid);
+        if (process == IntPtr.Zero) return null;
+        try {
+            IntPtr token;
+            if (!OpenProcessToken(process, 0x8, out token)) return null;
+            try {
+                var result = new List<string>();
+                IntPtr user = Query(token, 1);
+                result.Add(user == IntPtr.Zero ? "" : Text(Marshal.ReadIntPtr(user)));
+                if (user != IntPtr.Zero) Marshal.FreeHGlobal(user);
+                IntPtr container = Query(token, 31);
+                result.Add(container == IntPtr.Zero ? "" : Text(Marshal.ReadIntPtr(container)));
+                if (container != IntPtr.Zero) Marshal.FreeHGlobal(container);
+                IntPtr groups = Query(token, 30);
+                if (groups != IntPtr.Zero) {
+                    int count = Marshal.ReadInt32(groups);
+                    for (int i = 0; i < count; i++) result.Add(Text(Marshal.ReadIntPtr(groups, IntPtr.Size + i * IntPtr.Size * 2)));
+                    Marshal.FreeHGlobal(groups);
+                }
+                return result.ToArray();
+            } finally { CloseHandle(token); }
+        } finally { CloseHandle(process); }
+    }
+    public static string AppContainerSid(string name) {
+        IntPtr sid;
+        int hr = DeriveAppContainerSidFromAppContainerName(name, out sid);
+        if (hr != 0) throw new InvalidOperationException("DeriveAppContainerSidFromAppContainerName failed: 0x" + hr.ToString("x8"));
+        try { return Text(sid); } finally { FreeSid(sid); }
+    }
+}
+'@
+
+# Record the WebView2 network-service sandbox started for this profile by the given app process.
+function Register-WebViewSandbox([int] $AppPid) {
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $network = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object {
+            $_.CommandLine -like "*$identifier*" -and $_.CommandLine -like '*--utility-sub-type=network.mojom.NetworkService*' })
+        if ($network.Count) { break }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    if (!$network.Count) { Write-Host "SANDBOX no WebView2 network service process for app pid $AppPid"; return }
+    foreach ($process in $network) {
+        $token = [Dev14Token]::Describe([int] $process.ProcessId)
+        if (!$token) { Fail "Could not read the token of WebView2 network process $($process.ProcessId)."; continue }
+        Write-Host "SANDBOX WebView2 network pid=$($process.ProcessId) parent=$($process.ParentProcessId) user=$($token[0]) appContainer=$($token[1]) capabilities=$(($token | Select-Object -Skip 2) -join ',')"
+        if ($token[0] -ne $currentSid) { Fail "The WebView2 network process runs as $($token[0]), not the current user."; continue }
+        foreach ($capability in ($token | Select-Object -Skip 2 | Where-Object { $_ -like 'S-1-15-3-1024-*' })) {
+            $script:allowedContainerSids[$capability] = "WebView2 network-service sandbox capability (pid $($process.ProcessId))"
+        }
+    }
+}
 function Test-PrivateAcl([string] $Path, [string] $Label) {
     try { $acl = Get-Acl -LiteralPath $Path }
     catch [Management.Automation.ItemNotFoundException] { $script:vanished++; Write-Host "ACL $Label vanished before check: $Path"; return }
@@ -53,7 +136,7 @@ function Test-PrivateAcl([string] $Path, [string] $Label) {
         if ($rule.AccessControlType -ne 'Allow') { continue }
         if ($sid -eq 'S-1-3-0' -and $rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
         if ($broadSids.ContainsKey($sid)) { Fail "$Label grants $($broadSids[$sid]) ($sid) $($rule.FileSystemRights): $Path" }
-        elseif ($sid -match '^S-1-15-[23]-\d+(-\d+){6,}$') { [void] $script:containerSids.Add($sid) }
+        elseif ($script:allowedContainerSids.ContainsKey($sid)) { [void] $script:seenContainerSids.Add($sid) }
         elseif ($allowedSids -notcontains $sid) { Fail "$Label grants an unexpected identity $sid ($($rule.IdentityReference)): $Path" }
     }
     Write-Host "ACL $Label $Path :: $($entries -join '; ')"
@@ -124,15 +207,39 @@ if ($Mode -eq 'Packaged') {
         Fail "Packaged data was virtualized into the package cache instead of $dataDir."
     }
     Write-Host "Package $($package.PackageFullName)"
+    # The package's AppContainer SID is derived from its family name; Windows labels the
+    # package's LocalCache with the matching capability form (S-1-15-3- + same sub-authorities).
+    $packageContainerSid = [Dev14Token]::AppContainerSid($package.PackageFamilyName)
+    if ($packageContainerSid -notlike 'S-1-15-2-*') { throw "Unexpected package SID $packageContainerSid." }
+    $packageCapabilitySid = 'S-1-15-3-' + $packageContainerSid.Substring('S-1-15-2-'.Length)
+    $script:allowedContainerSids[$packageCapabilitySid] = "capability form of the test package SID $packageContainerSid ($($package.PackageFamilyName))"
+    Write-Host "PACKAGE_SID derived=$packageContainerSid capability=$packageCapabilitySid"
+    # Launch the packaged app to read its token and the WebView2 sandbox it starts.
+    Start-Process -FilePath "shell:AppsFolder\$($package.PackageFamilyName)!TrackerMaster"
+    $deadline = (Get-Date).AddSeconds(60)
+    do { Start-Sleep -Milliseconds 500; $packaged = Get-Process -Name 'tracker-master' -ErrorAction SilentlyContinue | Select-Object -First 1 } while (!$packaged -and (Get-Date) -lt $deadline)
+    if (!$packaged) { throw 'The packaged application did not start.' }
+    try {
+        $appToken = [Dev14Token]::Describe($packaged.Id)
+        Write-Host "PACKAGE_TOKEN pid=$($packaged.Id) user=$($appToken[0]) appContainer=$($appToken[1]) capabilities=$(($appToken | Select-Object -Skip 2) -join ',')"
+        if ($appToken[0] -ne $currentSid) { Fail "The packaged app runs as $($appToken[0]), not the current user." }
+        Write-Host "PACKAGE_TOKEN holds derived package capability: $(($appToken | Select-Object -Skip 2) -contains $packageCapabilitySid)"
+        Register-WebViewSandbox $packaged.Id
+    } finally {
+        Get-Process -Name 'tracker-master' -ErrorAction SilentlyContinue | Stop-Process -Force
+        Wait-WebViewExit
+    }
     # Package registration that Windows itself keeps in ProgramData (manifest copy, per-user
     # package state). Listed and scanned for user data, not treated as application files.
     $osPackageItems = @(
         Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'Microsoft\Windows\AppRepository') -Force -ErrorAction SilentlyContinue | Where-Object Name -like "$($package.Name)_*"
+        Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'Microsoft\Windows\AppRepository\Packages') -Force -ErrorAction SilentlyContinue | Where-Object Name -like "$($package.Name)_*"
         Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'Packages') -Force -ErrorAction SilentlyContinue | Where-Object Name -eq $package.PackageFamilyName
     )
     $osPackagePaths = @($osPackageItems | ForEach-Object FullName)
     $osPackageFiles = @($osPackageItems | ForEach-Object { $_; if ($_.PSIsContainer) { Get-ChildItem -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } })
     Write-Host "INVENTORY OS package registration in ProgramData: $($osPackagePaths -join ', ') ($($osPackageFiles.Count) items)"
+    $osPackageFiles | ForEach-Object { Write-Host "  $($_.FullName)$(if (!$_.PSIsContainer) { " [$($_.Length) B]" })" }
 }
 Wait-WebViewExit
 
@@ -165,6 +272,7 @@ try {
             Start-Sleep -Milliseconds 250
         }
         if (!(Select-String -LiteralPath $trace -SimpleMatch 'setup-complete' -Quiet)) { throw 'The test application did not finish setup.' }
+        Register-WebViewSandbox $app.Id
         $deadline = (Get-Date).AddSeconds(30)
         do { Start-Sleep -Milliseconds 250; $app.Refresh() } while ($app.MainWindowHandle -eq 0 -and (Get-Date) -lt $deadline)
         Start-Sleep -Seconds 3 # let the window render the marker data
@@ -229,7 +337,9 @@ foreach ($shared in @($env:ProgramData, (Join-Path $env:SystemDrive 'Users\Publi
 foreach ($item in $dataItems) { Test-PrivateAcl $item.FullName 'data' }
 foreach ($item in $webItems) { Test-PrivateAcl $item.FullName 'webview' }
 Write-Host "ACL checked $(@($dataItems).Count) data items and $(@($webItems).Count) webview items ($script:vanished vanished during the check)"
-Write-Host "ACL AppContainer package/capability SIDs seen (dual access check, no other account): $(@($script:containerSids) -join ', ')"
+foreach ($sid in $script:allowedContainerSids.Keys) {
+    Write-Host "ACL allowed $sid = $($script:allowedContainerSids[$sid]); present on items: $($script:seenContainerSids.Contains($sid))"
+}
 
 # 5. Logs and diagnostics contain no client, project, task names or descriptions.
 Test-NoSecret ($dataItems + @($webItems)) $secrets 'profile'
@@ -248,11 +358,20 @@ if ($Mode -eq 'Unpackaged') {
     $targets = @($dataItems | ForEach-Object FullName) + @($webItems | Select-Object -First 20 | ForEach-Object FullName)
     try {
         New-Item -ItemType Directory -Path $shared | Out-Null
-        # net user creates a standard account (local Users group only). The password is never printed.
-        & net.exe user $userName $plain /add /comment:"TrackerMaster CI DEV-14 (ephemeral)" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Could not create the temporary account ($LASTEXITCODE)." }
+        # A standard local account (member of Users only), created through ADSI so no prompt can
+        # block it. The password is never printed.
+        $computer = [ADSI] "WinNT://$env:COMPUTERNAME,computer"
+        $account = $computer.Create('User', $userName)
+        $account.SetPassword($plain)
+        $account.Put('Description', 'TrackerMaster CI DEV-14 (ephemeral)')
+        $account.SetInfo()
+        $account.Put('PasswordExpired', 0)
+        $account.SetInfo()
         Remove-Variable plain
         $userSid = ([Security.Principal.NTAccount] "$env:COMPUTERNAME\$userName").Translate([Security.Principal.SecurityIdentifier]).Value
+        $usersName = ([Security.Principal.SecurityIdentifier] 'S-1-5-32-545').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+        try { ([ADSI] "WinNT://$env:COMPUTERNAME/$usersName,group").Add("WinNT://$env:COMPUTERNAME/$userName,user") }
+        catch { if ($_.Exception.InnerException.ErrorCode -ne -2147023518) { throw } } # already a member
         Copy-Item -LiteralPath (Resolve-Path $Executable) -Destination (Join-Path $shared 'tracker-master.exe')
         Set-Content -LiteralPath (Join-Path $shared 'targets.txt') -Value $targets -Encoding utf8
         Set-Content -LiteralPath (Join-Path $shared 'second-user.ps1') -Encoding utf8 -Value @'
@@ -322,7 +441,7 @@ try {
         Get-CimInstance Win32_Process -Filter "Name='tracker-master.exe'" | Where-Object { (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $userName } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         if ($userSid) {
-            & net.exe user $userName /delete | Out-Null
+            ([ADSI] "WinNT://$env:COMPUTERNAME,computer").Delete('User', $userName)
             Get-CimInstance Win32_UserProfile | Where-Object SID -eq $userSid | Remove-CimInstance -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $shared -Recurse -Force -ErrorAction SilentlyContinue
