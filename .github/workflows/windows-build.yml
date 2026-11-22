@@ -102,6 +102,8 @@ jobs:
       - name: Verify isolated Windows application and CSV
         run: node tests/windows-application.mjs
       - name: Verify file protection and second-account isolation (DEV-14)
+        # Collect DEV-14 evidence even when an earlier E2E step failed; the job still fails.
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: ./tests/windows-file-protection.ps1 -Mode Unpackaged
       - name: Save UI layout screenshots
