@@ -1433,9 +1433,27 @@ async function verifyDraftAfterWriteFailure(cdp, sessionId, pending) {
   assert.equal(writeFailureState().entries.find(entry => entry.id === pending.editId).description, writeFailure.editEntryDescription, 'the draft silently overwrote the original');
   console.log('PASS: T26 the local draft survived the failed write and the restart, the original stayed unchanged, and the draft sort preference persisted');
 
-  // Retry once with writes possible: exactly one correction is saved.
-  await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
-  await waitFor('correction retry saved', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]') && [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(writeFailure.editDescription)}))`));
+  // Retry once with writes possible: exactly one correction is saved. The restored editor
+  // renders before the restore operation finishes; Save is disabled until then, and a click
+  // on a disabled button is ignored, so wait until Save can actually be pressed.
+  const submit = `document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]')`;
+  const editorState = `(() => ({
+    editor: Boolean(document.querySelector('[aria-label="Edycja wpisu"]')),
+    submitDisabled: ${submit}?.disabled ?? null,
+    description: document.querySelector('#entry-draft-description')?.value ?? null,
+    alerts: [...document.querySelectorAll('[role="alert"]')].map(node => node.textContent.trim()),
+    status: [...document.querySelectorAll('[role="status"]')].map(node => node.textContent.trim()),
+    historyHasCorrection: [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(writeFailure.editDescription)})),
+  }))()`;
+  const diagnose = async error => {
+    const draft = await readFile(draftPath, 'utf8').then(() => 'present', problem => problem.code ?? problem.message);
+    const state = writeFailureState();
+    const edited = state.entries.find(item => item.id === pending.editId);
+    throw new Error(`${error.message}; editor: ${JSON.stringify(await evaluate(editorState))}; draft file: ${draft}; entry: ${JSON.stringify(edited)}; revisions: ${state.revisions}/${state.descriptionRevisions}`);
+  };
+  await waitFor('restored correction can be saved', () => evaluate(`(el => Boolean(el && !el.disabled))(${submit})`)).catch(diagnose);
+  await evaluate(`${submit}.click()`);
+  await waitFor('correction retry saved', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]') && [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(writeFailure.editDescription)}))`)).catch(diagnose);
   const saved = writeFailureState();
   const entry = saved.entries.find(item => item.id === pending.editId);
   assert.equal(saved.entries.length, pending.after.entries.length);
