@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { historyDays, shortDuration, timerTotals } from '../src/reportDayModel.ts';
+import { historyDays, liveTimerTotals, shortDuration, timerTotals, totalsBaseData } from '../src/reportDayModel.ts';
 import { makeReportView } from '../src/reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from '../src/reportView.ts';
 import { reportPresetRange } from '../src/reportPresets.ts';
@@ -154,4 +154,52 @@ test('sleep at the day boundary: each day counts only its work', () => {
   const days = daysMatchReport([sleepy], Date.parse('2026-11-20T09:00:00Z'));
   assert.deepEqual(piece(days, '2026-11-19'), ['first', '23:00', '24:00', 1800]);
   assert.deepEqual(piece(days, '2026-11-20'), ['last', '00:00', '02:00', 5400]);
+});
+
+// Review of #53: the totals run with the clock. Base = report; added = time after the report projection,
+// only while the fresh snapshot shows the same timer as running and resolved.
+const projection = (id: number, start: string, end: string): ActiveReportEntry => ({ id, task_id: null, project_id: 10, started_at: start, ended_at: end,
+  duration_seconds: (Date.parse(end) - Date.parse(start)) / 1000, billable: true, description: '', unresolved: false });
+const live = (d: ReturnType<typeof data>, now: number, clock: Parameters<typeof liveTimerTotals>[3], fresh = true) => {
+  const baseData = totalsBaseData(d, clock);
+  return liveTimerTotals(timerTotals(baseData, catalog, now)!, baseData, now, clock, fresh);
+};
+
+test('live totals count the running timer exactly once (base projection + time after it)', () => {
+  const done = entry(1, '2026-11-19T07:00:00Z', '2026-11-19T08:00:00Z');
+  const active = projection(9, '2026-11-19T10:00:00Z', '2026-11-19T10:30:00Z');
+  const now = Date.parse('2026-11-19T10:40:00Z');
+  const totals = live(data([done], active), now, { id: 9 });
+  // The same as a report read at `now`: the projection simply reaching the current instant.
+  const truth = data([done], projection(9, '2026-11-19T10:00:00Z', '2026-11-19T10:40:00Z'));
+  assert.equal(totals.todaySeconds, report(truth, now, 'today'));
+  assert.equal(totals.weekSeconds, report(truth, now, 'week'));
+  assert.equal(totals.todaySeconds, 3600 + 40 * 60);
+  assert.equal(totals.text, 'Dziś 1 h 40 min · Tydzień 1 h 40 min');
+});
+
+test('nothing is added for a stale snapshot, another timer, or a timer awaiting verification', () => {
+  const done = entry(1, '2026-11-19T07:00:00Z', '2026-11-19T08:00:00Z');
+  const d = data([done], projection(9, '2026-11-19T10:00:00Z', '2026-11-19T10:30:00Z'));
+  const now = Date.parse('2026-11-19T10:40:00Z');
+  const base = 3600 + 30 * 60;
+  assert.equal(live(d, now, { id: 9 }, false).todaySeconds, base, 'stale snapshot (e.g. just after waking up)');
+  assert.equal(live(d, now, { id: 10 }).todaySeconds, base, 'the clock shows a different timer');
+  assert.equal(live(d, now, null).todaySeconds, base, 'the clock shows no timer (stopped; the report is re-read)');
+  // Uncertain time after sleep or a recovered timer: not counted at all, not even the earlier projection.
+  assert.equal(live(d, now, { id: 9, uncertain: true }).todaySeconds, 3600);
+  assert.equal(live(d, now, { id: 9, recovered: true }).weekSeconds, 3600);
+  const unresolved = data([done], { ...projection(9, '2026-11-19T10:00:00Z', '2026-11-19T10:30:00Z'), ended_at: null, duration_seconds: null, unresolved: true });
+  assert.equal(live(unresolved, now, { id: 9 }).todaySeconds, 3600);
+});
+
+test('live totals split the running time at midnight and at the week boundary', () => {
+  // Wed 23:00 → projection to 23:55 (Warsaw); now Thu 00:05: today has only 00:00–00:05.
+  const midweek = data([], projection(9, '2026-11-18T22:00:00Z', '2026-11-18T22:55:00Z'));
+  const thursday = live(midweek, Date.parse('2026-11-18T23:05:00Z'), { id: 9 });
+  assert.deepEqual([thursday.todaySeconds, thursday.weekSeconds], [300, 65 * 60]);
+  // Sun 23:00 → projection to 23:55; now Mon 00:05: a new day and a new week.
+  const sunday = data([], projection(9, '2026-11-22T22:00:00Z', '2026-11-22T22:55:00Z'));
+  const monday = live(sunday, Date.parse('2026-11-22T23:05:00Z'), { id: 9 });
+  assert.deepEqual([monday.todaySeconds, monday.weekSeconds], [300, 300]);
 });
