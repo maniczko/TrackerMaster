@@ -386,8 +386,10 @@ if ($Mode -eq 'Unpackaged') {
         Copy-Item -LiteralPath (Resolve-Path $Executable) -Destination (Join-Path $shared 'tracker-master.exe')
         Set-Content -LiteralPath (Join-Path $shared 'targets.txt') -Value $targets -Encoding utf8
         Set-Content -LiteralPath (Join-Path $shared 'second-user.ps1') -Encoding utf8 -Value @'
+param([string] $Root)
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+trap { Set-Content -LiteralPath (Join-Path $Root 'error.txt') -Value ($_ | Out-String) -Encoding utf8; exit 1 }
+$root = $Root
 $reads = foreach ($target in Get-Content -LiteralPath (Join-Path $root 'targets.txt')) {
     $result = try {
         if ([IO.Directory]::Exists($target)) { [void] [IO.Directory]::GetFileSystemEntries($target) } else { [void] [IO.File]::ReadAllBytes($target) }
@@ -419,8 +421,12 @@ $admin = $principal.IsInRole([Security.Principal.SecurityIdentifier]::new('S-1-5
         $credential = [pscredential]::new("$env:COMPUTERNAME\$userName", $secure)
         $pwsh = (Get-Command pwsh).Source
         $helper = Start-Process -FilePath $pwsh -Credential $credential -LoadUserProfile -WorkingDirectory $shared -PassThru -Wait `
-            -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $shared 'second-user.ps1'))
-        if ($helper.ExitCode -ne 0) { Fail "The second account helper exited with $($helper.ExitCode)." }
+            -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP 'dev14-helper.out') -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'dev14-helper.err') `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $shared 'second-user.ps1'), '-Root', $shared)
+        foreach ($log in (Join-Path $env:RUNNER_TEMP 'dev14-helper.out'), (Join-Path $env:RUNNER_TEMP 'dev14-helper.err'), (Join-Path $shared 'error.txt')) {
+            if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length) { Write-Host "SECOND_ACCOUNT log $(Split-Path -Leaf $log):"; Get-Content -LiteralPath $log | ForEach-Object { Write-Host "  $_" } }
+        }
+        if ($helper.ExitCode -ne 0) { throw "The second account helper exited with $($helper.ExitCode)." }
         $result = Get-Content -LiteralPath (Join-Path $shared 'result.json') -Raw | ConvertFrom-Json
         Write-Host "SECOND_ACCOUNT user=$($result.user) admin=$($result.admin) appData=$($result.appData) ownDataExistedBefore=$($result.ownDataExistedBefore) ready=$($result.ready) exit=$($result.exit)"
         if ($result.user -ne $userName) { Fail "The helper ran as '$($result.user)', not the test account." }
