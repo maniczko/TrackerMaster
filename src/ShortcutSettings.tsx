@@ -4,7 +4,7 @@ import { defaultShortcut, shortcutKeys, shortcutLabel } from './shortcut';
 
 type ShortcutStatus = { registered: boolean; message: string; shortcut: string };
 
-export default function ShortcutSettings() {
+export default function ShortcutSettings({ onChange }: { onChange?: (status: ShortcutStatus) => void } = {}) {
   const [status, setStatus] = useState<ShortcutStatus | null>(null);
   const [modifier, setModifier] = useState('Shift');
   const [key, setKey] = useState('Space');
@@ -28,7 +28,7 @@ export default function ShortcutSettings() {
     setBusy(true); setError(''); setNotice('');
     try {
       const next = await invoke<ShortcutStatus>('set_global_shortcut', { shortcut: `Ctrl+${modifier}+${key}`, expected: status.shortcut });
-      setStatus(next); setNotice(`Zapisano skrót ${shortcutLabel(next.shortcut)}.`);
+      setStatus(next); onChange?.(next); setNotice(`Zapisano skrót ${shortcutLabel(next.shortcut)}.`);
     } catch (e) { setError(String(e)); }
     finally { setBusy(false); }
   }

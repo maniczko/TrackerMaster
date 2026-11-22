@@ -14,6 +14,7 @@ import type { ActiveReportEntry, CompletedReportEntry } from './reportView';
 import { allReportClients, changeReportScope, resolveReportScope } from './reportScope';
 import type { ReportCatalog, ReportScope } from './reportScope';
 import { clientLabels } from './clientLabels';
+import ReportGlance from './ReportGlance';
 
 type Data = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
 type Props = ReportCatalog & {
@@ -220,6 +221,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, has
       if (!open && !hasUnsavedEdit()) setNow(Date.now());
       setOpen(!open);
     }}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
+    {!open && <ReportGlance catalog={catalog} loaded={loaded} revision={revision} />}
     {open && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
       {data && <ReportTimezone currentZone={data.time_zone} canChange={allowFilterChange}
