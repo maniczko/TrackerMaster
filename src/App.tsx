@@ -320,6 +320,13 @@ export default function App() {
           </div>
           <div className="timer-setup">
           {needsStructure && <p className="alert">Aby rozpocząć pomiar, dodaj najpierw klienta i projekt. <button type="button" className="secondary" onClick={openStructure}>Dodaj klienta i projekt</button></p>}
+          {/* Toggl-like bar: description and Start/Switch stay at the top, above the picker results (UIQ-01: visible without scrolling). */}
+          <div className="timer-bar">
+            <label className="timer-description">Opis nowego pomiaru (opcjonalnie)<input ref={timerDescriptionInput} value={timerDescription} maxLength={2000} disabled={busy || !loaded} onChange={e => setTimerDescription(e.target.value)} placeholder="Nad czym pracujesz?" /></label>
+            <div className="actions timer-start"><button type="button" className={data.active ? 'secondary' : 'primary'} disabled={startDisabled} onClick={() => execute(async () => { await invoke('start_project_timer', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, expectedActiveId: data.active ? Number(data.active.id) : null, description: timerDescription }); setTimerDescription(''); }, data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.')}><span aria-hidden="true">▶</span> {data.active ? 'Przełącz zadanie' : 'Rozpocznij pomiar'}</button></div>
+          </div>
+          <p className="timer-target" aria-live="polite">{selectedProject ? <>Wybrano: <strong>{selectedTask ? selectedTask.name : 'Bez zadania'}</strong> · {selectedClient ? clientLabelById.get(String(selectedClient.id)) : '—'} / {selectedProject.name}</> : 'Wybierz projekt lub zadanie poniżej.'}</p>
+          {!data.active && shortcutHint}
           <div className="timer-picker"><MiniTimerTaskPicker input={pickerInput} choices={choices} recent={recent} selected={selectionKey(projectId, taskId)}
             disabled={busy || !loaded || !!data.active?.recovered} onSelect={chooseTimerTarget} /></div>
           <details className="timer-lists"><summary>Wybierz z list: klient, projekt, zadanie</summary>
@@ -329,9 +336,6 @@ export default function App() {
             <label>Zadanie<select title={selectedTask?.name} value={taskId} disabled={busy || !loaded || !projectId} onChange={e => setTaskId(e.target.value)}><option value="">Bez zadania</option>{tasks.map(t => <option key={t.id} value={t.id}>{t.name}{t.archived ? ' (archiwum)' : ''}</option>)}</select></label>
           </div>
           </details>
-          <label className="timer-description">Opis nowego pomiaru (opcjonalnie)<input ref={timerDescriptionInput} value={timerDescription} maxLength={2000} disabled={busy || !loaded} onChange={e => setTimerDescription(e.target.value)} placeholder="Nad czym pracujesz?" /></label>
-          <div className="actions timer-start"><button type="button" className={data.active ? 'secondary' : 'primary'} disabled={startDisabled} onClick={() => execute(async () => { await invoke('start_project_timer', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, expectedActiveId: data.active ? Number(data.active.id) : null, description: timerDescription }); setTimerDescription(''); }, data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.')}><span aria-hidden="true">▶</span> {data.active ? 'Przełącz zadanie' : 'Rozpocznij pomiar'}</button></div>
-          {!data.active && shortcutHint}
           <p className="helper">Jednocześnie może trwać jeden pomiar. Zadanie jest opcjonalne.</p>
           <details className="timer-settings"><summary>Archiwum i rozliczalność</summary>
           <div className="archive-controls"><label><input type="checkbox" checked={showArchived} onChange={e => { setShowArchived(e.target.checked); if (!e.target.checked && selectedClient?.archived) { setClientId(''); setProjectId(''); setTaskId(''); } else if (!e.target.checked && selectedProject?.archived) { setProjectId(''); setTaskId(''); } else if (!e.target.checked && selectedTask?.archived) setTaskId(''); }} /> Pokaż archiwum klientów, projektów i zadań</label>

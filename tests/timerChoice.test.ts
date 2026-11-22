@@ -58,3 +58,14 @@ test('the request gate lets only one write through until it ends (fast double cl
   gate.endWrite();
   assert.equal(gate.beginWrite(), true);
 });
+
+test('UIQ-01: description and Start/Switch come before the picker results in the setup column', async () => {
+  const { readFileSync } = await import('node:fs');
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../src/app.css', import.meta.url), 'utf8');
+  const bar = app.indexOf('<div className="timer-bar">');
+  assert.ok(bar > 0);
+  assert.ok(bar < app.indexOf('className="actions timer-start"') && app.indexOf('className="actions timer-start"') < app.indexOf('<div className="timer-picker">'),
+    'Start must not sit under the results list');
+  assert.match(css, /\.timer-picker \.qp-results \{ max-height: 176px; \}/);
+});

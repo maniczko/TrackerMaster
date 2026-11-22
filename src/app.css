@@ -460,3 +460,10 @@ footer { margin: var(--space-6) 0; text-align: center; color: var(--color-text-m
 .history-day th { display: table-cell; }
 .history-day-total { float: right; font-variant-numeric: tabular-nums; }
 .entry-part { display: block; color: var(--color-text-muted); font-size: var(--text-xs); }
+/* UIQ-01: Start/Switch sits next to the description at the top of the setup column; results scroll in their own box. */
+.timer-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-2); }
+.timer-bar .timer-description { flex: 1 1 220px; min-width: 0; }
+.timer-bar .timer-start { flex: 0 0 auto; margin: 0; }
+.timer-target { margin: 0; color: var(--color-text-muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.timer-target strong { color: var(--color-text); }
+.timer-picker .qp-results { max-height: 176px; }
