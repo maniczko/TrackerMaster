@@ -2535,6 +2535,9 @@ mod tests {
             project_id: 1, task_id: None, description: "Original",
         }).unwrap();
         let id = snapshot(&tracker).unwrap().active.unwrap().id;
+        // A new database passes the v14 rebuild of sleep_periods (rename, create, drop), which leaves
+        // free pages that SQLite would reuse. Compact the file so the page limit below has none left.
+        tracker.db.execute_batch("VACUUM;").unwrap();
         let pages: i64 = tracker.db.pragma_query_value(None, "page_count", |row| row.get(0)).unwrap();
         let free: i64 = tracker.db.pragma_query_value(None, "freelist_count", |row| row.get(0)).unwrap();
         assert_eq!(free, 0);

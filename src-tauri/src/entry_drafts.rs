@@ -980,6 +980,9 @@ mod tests {
         let mut original = read_source(&db, 1).unwrap().unwrap();
         db.execute_batch("DROP TABLE entry_draft_resolutions; DROP TABLE entry_database_identity; PRAGMA user_version=12;")
             .unwrap();
+        // A real v12 database has the v12 sleep table; v14 rebuilt it (sleep_periods_v14.sql).
+        db.execute_batch("DROP TABLE sleep_periods;").unwrap();
+        db.execute_batch(include_str!("sleep_periods.sql")).unwrap();
         let dir = test_directory("migration");
         crate::initialise_with_backup(&mut db, &dir, true).unwrap();
         assert_eq!(
@@ -987,6 +990,7 @@ mod tests {
                 .unwrap(),
             LATEST_SCHEMA_VERSION
         );
+        crate::sleep_periods::validate(&db).unwrap();
         let migrated = read_source(&db, 1).unwrap().unwrap();
         assert_ne!(migrated.database_id, original.database_id);
         original.database_id = migrated.database_id.clone();
