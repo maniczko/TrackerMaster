@@ -20,7 +20,7 @@ W powyższych przebiegach wszystkie trzy joby (`build`, `windows-application`, `
 | Rodzaj | Łącznie | Stan na migawce |
 | --- | ---: | --- |
 | Wymagania PTT | 60 | 59 `Do analizy`, 1 `Zablokowane`; status PTT nie oznacza, że kodu nie ma |
-| Zadania TECH/DEV/QA | 55 | 5 `Zrobione`, 15 `Do weryfikacji`, 8 `W realizacji`, 27 `Zablokowane` |
+| Zadania TECH/DEV/QA | 55 | 5 `Zrobione`, 15 `Do weryfikacji`, 11 `W realizacji`, 24 `Zablokowane` (po aktualizacji DEV-24/25/31) |
 | Decyzje D1–D13 | 13 | **Wszystkie zatwierdzone na bezpośrednio odczytanych kartach**; zapytanie zbiorcze SQL nieaktualnie pokazuje D8/D9 `Do decyzji` |
 
 **Nie przeliczaj 5/55 ani 11/13 na procent gotowości aplikacji.** Statusy opisują proces, nie zweryfikowane pokrycie kryteriów odbioru. Zestawienie SQL z 23.11 ma niespójne wartości D8/D9; przed raportowaniem decyzji użyj bezpośredniego `fetch` kart [D8](https://app.notion.com/p/418e1de1f67a8147bc62c5feff5c0307) i [D9](https://app.notion.com/p/418e1de1f67a815eb86dea3d494a3528) zamiast wnioskować o nowych decyzjach.
