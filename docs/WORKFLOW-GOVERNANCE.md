@@ -31,7 +31,7 @@ Dla każdego zadania aktualizuj istniejące pola: `Status`, `Bloker`, `Dowody`, 
 W polu `Dowody` zapisuj:
 - ID zadania i PR oraz **dokładny HEAD SHA**, gałąź bazowa i ewentualne zależności.
 - Co jest wdrożone na `main`, a co nadal na Draft PR.
-- Konkretne GitHub Actions `run_id` / `run_attempt`, status każdego wymaganej joby i wynik nowego testu.
+- Konkretne GitHub Actions `run_id` / `run_attempt`, status każdego wymaganego joba i wynik nowego testu.
 - System testowy (Windows Server w CI vs Windows 11 x64), wersję pakietu, profil i czy podpisany.
 - `PASS / FAIL / BLOCKED / NOT RUN` dla kryterium; link do logu, artefaktu i defektu.
 - Kto wykonał niezależny review oraz jakie warunki nadal otwarte.
