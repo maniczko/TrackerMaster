@@ -903,7 +903,7 @@ async function verifyCalendar(cdp, sessionId) {
   await setDate('2026-03-25');
   const read = `(() => {
     const root = document.querySelector('[aria-label="Kalendarz"]');
-    return { heading: root.querySelector('.calendar-heading h2')?.textContent, week: root.querySelector('.calendar-week-total')?.textContent,
+    return { heading: root.querySelector('.calendar-range')?.textContent, week: root.querySelector('.calendar-week-total')?.textContent,
       days: [...root.querySelectorAll('.calendar-day-total')].map(node => node.textContent),
       blocks: root.querySelectorAll('.calendar-block').length,
       labels: [...root.querySelectorAll('.calendar-block')].map(node => node.getAttribute('aria-label')) };
