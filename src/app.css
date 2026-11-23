@@ -447,7 +447,7 @@ footer { margin: var(--space-6) 0; text-align: center; color: var(--color-text-m
 .timer-totals { margin: var(--space-2) 0 0; color: var(--color-text); font-size: var(--text-sm); font-weight: 600; font-variant-numeric: tabular-nums; }
 .timer-totals-note { color: var(--color-pending-text); font-weight: 500; }
 .timer-picker { margin-bottom: var(--space-3); }
-.timer-picker .qp-search input { flex: 1; min-width: 0; height: var(--control-h-sm); min-height: 0; padding: 0 var(--space-2); border: 0; background: transparent; color: var(--color-text); box-shadow: none; }
+.timer-picker .qp-search input { flex: 1; min-width: 0; height: var(--control-h); min-height: 0; padding: 0 var(--space-2); border: 0; background: transparent; color: var(--color-text); box-shadow: none; }
 .timer-picker .qp-results { max-height: 232px; }
 .timer-picker .qp-option-name small { color: var(--color-text-muted); font-size: var(--text-xs); }
 .timer-picker .qp-text-button { justify-self: start; min-height: var(--control-h-sm); padding: 0 var(--space-2); border: 1px solid transparent; background: transparent; color: var(--color-accent-strong); font-size: var(--text-sm); font-weight: 600; }
@@ -483,3 +483,6 @@ footer { margin: var(--space-6) 0; text-align: center; color: var(--color-text-m
 .timer-review-why p { margin: var(--space-2) 0 0; }
 /* Main action under the clock: the same place and size for Start and Stop. */
 .timer-main-hint { margin: 0; text-align: left; }
+
+/* UIQ-05 / WCAG 2.5.8: a checkbox without visible text keeps its 18 px look; its label is the 32×32 target. */
+.app-shell label.check-target { justify-content: center; min-width: var(--control-h-sm); min-height: var(--control-h-sm); cursor: pointer; }
