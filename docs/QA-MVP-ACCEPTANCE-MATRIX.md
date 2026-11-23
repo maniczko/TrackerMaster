@@ -1,8 +1,9 @@
 # TECH-06 — Macierz testów i odbioru MVP TrackerMaster
 
-**Data opracowania:** 2026-11-17  
-**Źródła:** Notion „Backlog — Personal Time Tracker”: PTT-01–PTT-41, TECH-06, DEV-15, QA-01 oraz decyzje D1–D13; GitHub `main` bazowo `d9f70423d9cb2ffff0ed22d6308fb08c7da3de8c`.  
-**Status dokumentu:** PLAN QA zaktualizowany o finalne D11/D12 — do niezależnego odbioru TECH-06. Wszystkie wyniki testów aplikacji to **NOT RUN**; dokument nie jest protokołem odbioru DEV-15/QA-01.  
+**Data opracowania:** 2026-11-17; **aktualizacja:** 2026-11-23 (dowody CI i runbook Windows 11)  
+**Źródła:** Notion „Backlog — Personal Time Tracker”: PTT-01–PTT-41, TECH-06, DEV-15, QA-01 oraz decyzje D1–D13; GitHub `main` bazowo `9de9f4c5` (poprzednio `d9f70423d9cb2ffff0ed22d6308fb08c7da3de8c`).  
+**Status dokumentu:** PLAN QA z finalnymi D11/D12, uzupełniony o dowody automatyczne z CI (§2a) — do niezależnego odbioru TECH-06. Statusy z CI dotyczą **runnera Windows Server w GitHub Actions** i **niepodpisanego buildu testowego**; nie są odbiorem na Windows 11 x64. Dokument nie jest protokołem odbioru DEV-15/QA-01.  
+**Dowód CI (bazowy):** workflow „Windows test build”, push na `main` `9de9f4c5`, run [45162324375](https://github.com/maniczko/TrackerMaster/actions/runs/45162324375) — SUCCESS: `build` (job 137650570684: `cargo test` 137/137, node 95 + 13 + 16 = 124/124), `windows-application` (job 137655018638: `tests/windows-application.mjs` + `tests/windows-file-protection.ps1 -Mode Unpackaged`), `msix-lifecycle` (job 137655018632: `packaging/msix/Test-TestMsixLifecycle.ps1` + `tests/windows-file-protection.ps1 -Mode Packaged`). Kontrakty z filtrem ścieżek, ostatnie zielone na `main`: TECH-10 run [45035415760](https://github.com/maniczko/TrackerMaster/actions/runs/45035415760) (`7916ff9`), TECH-09 run [44255043975](https://github.com/maniczko/TrackerMaster/actions/runs/44255043975) (`2235b9a`).  
 **Kryterium pokrycia:** 30 wymaganych w backlogu pozycji oznaczonych *MVP + Must* (PTT-05 i PTT-21 mają priorytet Should, więc nie są bramką Must). „Must” to priorytet wpisu, nie dowód zatwierdzonej akceptacji każdej karty PTT — właściwość Akceptacja wymaga odrębnego rozstrzygnięcia. Decyzje biznesowe D11/D12 są finalnie zatwierdzone od 17.11.2026; wykonanie DEV i QA to osobne bramki.
 
 ## 1. Środowisko, dane i zasady
@@ -16,42 +17,98 @@
 
 ## 2. Macierz: wymagania Must MVP → scenariusze
 
-| Wymaganie | Priorytet / wersja | Testy akceptacyjne |
-|---|---|---|
-| PTT-01 Uruchomienie timera | Must / MVP | T01, T02, T16 |
-| PTT-02 Zatrzymanie timera | Must / MVP | T01, T02, T20 |
-| PTT-03 Przełączenie na inne zadanie | Must / MVP | T02 |
-| PTT-04 Globalny skrót start/stop | Must / MVP | T03 |
-| PTT-06 Konfiguracja/konflikt skrótu | Must / MVP | T03 |
-| PTT-07 Praca w tle i tray | Must / MVP | T04, T21 |
-| PTT-08 Widoczny stan i kontekst pomiaru | Must / MVP | T01, T04 |
-| PTT-09 Odzyskiwanie po awarii | Must / MVP | T05, T26 |
-| PTT-10 Uśpienie komputera | Must / MVP | T06, T23 |
-| PTT-11 Lokalni klienci | Must / MVP | T07, T16 |
-| PTT-12 Projekty przypisane do klienta | Must / MVP | T07 |
-| PTT-13 Zadania w projekcie | Must / MVP | T07 |
-| PTT-14 Archiwizacja z historią | Must / MVP | T08, T09 |
-| PTT-16 Historia pomiarów | Must / MVP | T09 |
-| PTT-17 Ręczny wpis czasu | Must / MVP | T10 |
-| PTT-18 Korekta i historia zmian | Must / MVP | T11, T26 |
-| PTT-19 Nakładanie się przedziałów | Must / MVP | T10, T11 |
-| PTT-20 Raport czasu klienta | Must / MVP | T12, T19, T24, T25 |
-| PTT-22 CSV jednego klienta | Must / MVP | T13, T22, T25 |
-| PTT-23 Podgląd przed CSV | Must / MVP | T13, T25 |
-| PTT-25 Kopia i odtworzenie | Must / MVP | T14 |
-| PTT-26 Ochrona danych/poświadczeń | Must / MVP | T15, R01, R02 |
-| PTT-32 Pełne offline | Must / MVP | T16 |
-| PTT-33 Pojedyncza instancja | Must / MVP | T17 |
-| PTT-34 Zmiana zegara/strefy | Must / MVP | T18, T24 |
-| PTT-35 Północ/granice raportu | Must / MVP | T19, T24, T25 |
-| PTT-36 Błąd zapisu/brak miejsca | Must / MVP | T20, T26 |
-| PTT-37 Jawne zakończenie podczas pomiaru | Must / MVP | T21 |
-| PTT-38 Dokładność/format eksportu | Must / MVP | T13, T19, T25 |
-| PTT-39 Bezpieczny tekst w eksporcie | Must / MVP | T22 |
+| Wymaganie | Priorytet / wersja | Testy akceptacyjne | Dowód CI (szczegóły w §2a) | Status |
+|---|---|---|---|---|
+| PTT-01 Uruchomienie timera | Must / MVP | T01, T02, T16 | #40, #45, #56; E2E `initial`, `hotkey-restart` | częściowo (CI) — reszta na W11 |
+| PTT-02 Zatrzymanie timera | Must / MVP | T01, T02, T20 | #40, #45, #56, #58; E2E `initial`, `write-failure` | PASS (CI, Windows Server runner) |
+| PTT-03 Przełączenie na inne zadanie | Must / MVP | T02 | #45, #56; E2E `verifyShortcutAfterRestart`, `verifyWriteFailure` | PASS (CI, Windows Server runner) |
+| PTT-04 Globalny skrót start/stop | Must / MVP | T03 | #37, #40; E2E `verifyMiniTimer`, `verifyShortcutAfterRestart` | PASS (CI, Windows Server runner) |
+| PTT-06 Konfiguracja/konflikt skrótu | Must / MVP | T03 | #37, #40; E2E `verifyOccupiedShortcut` | PASS (CI, Windows Server runner) |
+| PTT-07 Praca w tle i tray | Must / MVP | T04, T21 | #35, #40, #46; E2E `verifySecondLaunch`, MSIX reaktywacja | częściowo (CI) — reszta na W11 |
+| PTT-08 Widoczny stan i kontekst pomiaru | Must / MVP | T01, T04 | #40, #57; E2E `initial` | częściowo (CI) — reszta na W11 |
+| PTT-09 Odzyskiwanie po awarii | Must / MVP | T05, T26 | #31, #45, #56, #58; E2E `interrupt` → `recover`, `write-failure-reopen` | częściowo (CI) — reszta na W11 |
+| PTT-10 Uśpienie komputera | Must / MVP | T06, T23 | #26, #29, #50 (tylko symulacja) | NOT RUN (rzeczywisty sen); logika: CI |
+| PTT-11 Lokalni klienci | Must / MVP | T07, T16 | #40; E2E `initial` | częściowo (CI) — reszta na W11 |
+| PTT-12 Projekty przypisane do klienta | Must / MVP | T07 | #40; E2E `initial`; Rust `project_target_checks_parent_task_and_billing` | PASS (CI, Windows Server runner) |
+| PTT-13 Zadania w projekcie | Must / MVP | T07 | #40; E2E `initial`; Rust `preserves_ids_history_references_and_enforces_project_consistency` | PASS (CI, Windows Server runner) |
+| PTT-14 Archiwizacja z historią | Must / MVP | T08, T09 | #40; E2E `initial` (archiwum/przywrócenie); Rust `archive_preserves_history…` | PASS (CI, Windows Server runner) |
+| PTT-16 Historia pomiarów | Must / MVP | T09 | #40, #53; E2E wszystkie fazy | PASS (CI, Windows Server runner) |
+| PTT-17 Ręczny wpis czasu | Must / MVP | T10 | Rust `manual_entries_reject_overlaps…`; node `localDateTime.test.ts` | częściowo (CI) — reszta na W11 |
+| PTT-18 Korekta i historia zmian | Must / MVP | T11, T26 | #31, #56, #58; E2E `verifyDraft`, `verifyDraftAfterWriteFailure` | PASS (CI, Windows Server runner) |
+| PTT-19 Nakładanie się przedziałów | Must / MVP | T10, T11 | #58; Rust `corrections_keep_history_reject_conflicts…` | częściowo (CI) — reszta na W11 |
+| PTT-20 Raport czasu klienta | Must / MVP | T12, T19, T24, T25 | #36, #44; E2E `initial`/`interrupt`; node `report*.test.ts` | częściowo (CI) — reszta na W11 |
+| PTT-22 CSV jednego klienta | Must / MVP | T13, T22, T25 | #22, #44; E2E pobranie CSV, `verifyDuplicateClientChoices` | częściowo (CI) — reszta na W11 |
+| PTT-23 Podgląd przed CSV | Must / MVP | T13, T25 | #34, #44; E2E podgląd CSV | częściowo (CI) — reszta na W11 |
+| PTT-25 Kopia i odtworzenie | Must / MVP | T14 | #45; E2E `verifyRestoreRetry`; Rust `storage_safety::tests::*` | PASS (CI, Windows Server runner) |
+| PTT-26 Ochrona danych/poświadczeń | Must / MVP | T15, R01, R02 | #55; `windows-file-protection.ps1` (oba tryby); R01 BLOCKED, R02 częściowo (testowy MSIX) | częściowo (CI) — reszta na W11 |
+| PTT-32 Pełne offline | Must / MVP | T16 | brak testu z odłączoną siecią | częściowo (CI) — reszta na W11 |
+| PTT-33 Pojedyncza instancja | Must / MVP | T17 | #40, #55; E2E `verifySecondLaunch`; drugie konto w DEV-14 | PASS (CI, Windows Server runner) |
+| PTT-34 Zmiana zegara/strefy | Must / MVP | T18, T24 | #29, #44 (symulacja, testy jednostkowe) | częściowo (CI) — reszta na W11 |
+| PTT-35 Północ/granice raportu | Must / MVP | T19, T24, T25 | #16, #44, #53; node `reportTime`/`reportDay`; TECH-09 | częściowo (CI) — reszta na W11 |
+| PTT-36 Błąd zapisu/brak miejsca | Must / MVP | T20, T26 | #45, #56, #58; E2E `verifyWriteFailure`; Rust `sqlite_full…`, `read_only…` | PASS (CI, Windows Server runner) |
+| PTT-37 Jawne zakończenie podczas pomiaru | Must / MVP | T21 | #35, #40; Rust `exit_dialog_has_explicit_choices_and_safe_default` | częściowo (CI) — reszta na W11 |
+| PTT-38 Dokładność/format eksportu | Must / MVP | T13, T19, T25 | #18, #44; E2E plik CSV; node `reportCsv.test.ts`; TECH-10 | częściowo (CI) — reszta na W11 |
+| PTT-39 Bezpieczny tekst w eksporcie | Must / MVP | T22 | node `reportCsv.test.ts` (formuły); TECH-10 | częściowo (CI) — reszta na W11 |
+
+Status wymagania = najsłabszy status jego scenariuszy T (wg §2a). `PASS (CI, Windows Server runner)` oznacza wykonanie w CI na niepodpisanym buildzie testowym, nie odbiór na Windows 11 x64.
 
 **Wynik macierzy:** 30/30 pól Must MVP ma przypisany przynajmniej jeden scenariusz. To tylko pokrycie planem, NIE pokrycie wykonaniem. T01–T26 mają instrukcję poniżej, w tym T23–T26 weryfikujące skonsolidowane D11/D12. R01–R03 to dodatkowe bramki D11; nie utożsamiać ich z nowymi identyfikatorami PTT.
 
-## 3. Procedury szczegółowe T01–T26 (wszystkie: NOT RUN)
+## 2a. Status wykonania T01–T26 i R01–R03 (dowody CI, stan na `9de9f4c5`)
+
+Run „Windows test build” na `main`: [45162324375](https://github.com/maniczko/TrackerMaster/actions/runs/45162324375). Skróty dowodów:
+- **E2E:** `tests/windows-application.mjs` w jobie `windows-application`. W nawiasie podana jest faza `runWindow` lub funkcja `verify*`; cudzysłów to linia `PASS:` z logu.
+- **DEV-14:** `tests/windows-file-protection.ps1`.
+- **MSIX:** `packaging/msix/Test-TestMsixLifecycle.ps1` (job `msix-lifecycle`).
+- **Rust:** `cargo test` w jobie `build`. **node:** pliki `tests/*.test.*` z workflow.
+
+Zasady oceny:
+- **`PASS (CI, Windows Server runner)`** — główny przebieg scenariusza wykonało E2E na rzeczywistej aplikacji, a każdy oczekiwany wynik z §3 jest asertowany w CI (E2E, Rust lub node).
+- **„częściowo (CI) — reszta na W11”** — wykonano tylko część. Brakujące elementy opisuje kolumna „Brak / do W11”.
+- **`NOT RUN` / `BLOCKED`** — scenariusz wymaga rzeczywistego sprzętu, podpisanego pakietu lub Store.
+
+Żaden status nie zastępuje odbioru na Windows 11 x64 (§7).
+
+| Test | Dowód CI (PR → test/krok) | Status | Brak / do W11 |
+|---|---|---|---|
+| T01 | #40, #57: E2E fazy `initial` (Start, ≥5 s, Stop, wpis w Historii) i `interrupt` (ta sama historia po restarcie procesu); końcowe „PASS: two clients, project timers, History…” | PASS (CI, Windows Server runner) | — |
+| T02 | #45, #56, #58: E2E `verifyShortcutAfterRestart` (koniec poprzedniego = początek nowego, bez duplikatów), `verifyMiniTimer` „repeated key-downs … started exactly one timer”, `verifyWriteFailure` „T20 Switch failing after the previous entry was closed rolled back completely”; Rust `switching_timer_closes_old_entry_and_starts_new_one`, `repeated_start_does_not_split_active_entry`, `invalid_switch_rolls_back_the_old_timer`, `database_failure_during_switch_rolls_back_and_retry_succeeds` | PASS (CI, Windows Server runner) | — |
+| T03 | #37, #40: E2E `verifyOccupiedShortcut` „an actual shortcut conflict preserved the working old shortcut…” (inny proces zajmuje skrót, `tests/windows-occupy-hotkey.ps1`), `verifyMiniTimer` (skrót przy fokusie innego okna, `tests/windows-hotkey.ps1`), `verifyShortcutAfterRestart` (skrót po restarcie); Rust `failed_shortcut_conflict_or_save_keeps_the_old_registration`, `global_shortcut_refuses_archived_targets_and_unsupported_schema` | PASS (CI, Windows Server runner) | PTT-05 (USB, Should) poza bramką |
+| T04 | #40, #46: E2E `verifySecondLaunch` „X hid the original window, second launch restored it, and active entry #3 was unchanged”; MSIX 4× „close hid the packaged window and reactivation restored the original process and window” | częściowo (CI) — reszta na W11 | otwarcie z ikony w zasobniku i widget na fizycznym pulpicie |
+| T05 | #45, #49, #50: E2E `interrupt` (zabicie procesu przy aktywnym wpisie; „retained open entry #3 without assigning a duration”) → `recover` (odrzucenie końca przed startem, ręczne zakończenie) → `verify-recovery` („history showed the manually recovered entry”); Rust `recovery_requires_valid_explicit_end_and_marks_the_entry`, `recovered_timer_is_not_falsely_closed` | częściowo (CI) — reszta na W11 | krok „anuluj rozstrzygnięcie” w GUI; wymuszone zakończenie na W11 |
+| T06 | #26, #29, #50: tylko symulacja — Rust `power_events::tests::notifications_record_suspend_and_resume_without_duplicate_periods`, `sleep_detection_preserves_entry_for_manual_recovery`; node `sleepPeriods.test.mjs`, `sleepTime.test.ts` | NOT RUN | rzeczywisty suspend/resume Windows 11 (sprzęt/VM z S3/Modern Standby) |
+| T07 | #40: E2E `initial` (dwie hierarchie K-A/K-B przez GUI, restart w kolejnych fazach); Rust `project_target_checks_parent_task_and_billing`, `preserves_ids_history_references_and_enforces_project_consistency`, `renaming_keeps_relationships_and_history_and_rejects_stale_updates` | PASS (CI, Windows Server runner) | — |
+| T08 | #40: E2E `initial` (archiwizacja i przywrócenie projektu i klienta z zachowaniem historii obu klientów); Rust `archive_preserves_history_and_prevents_new_timer_until_restored`, `client_archival_requires_archived_projects_and_restores_independently`, `task_archive_preserves_history_blocks_timer_and_restores_only_after_project` | PASS (CI, Windows Server runner) | — |
+| T09 | #40, #53: E2E Historia we wszystkich fazach po restartach; `verifyEntryMenu` „History entry menu opens from the keyboard and by click…”; Rust `archive_preserves_history…`; node `historyFormat.test.ts`, `reportDay.test.ts` | PASS (CI, Windows Server runner) | — |
+| T10 | Rust `manual_entries_reject_overlaps_and_allow_touching_boundaries`, `manual_entry_cannot_overlap_a_running_timer_or_use_an_archived_project`; node `localDateTime.test.ts` „rejects nonexistent and repeated local times on daylight saving changes” | częściowo (CI) — reszta na W11 | formularz „Dodaj czas ręcznie” w GUI |
+| T11 | #31, #56, #58: E2E `verifyDraft` „validation and SQLite failures preserved the edit; retry saved exactly one revision”, `verifyWriteFailure` „T20 correction with an unwritable database…”; Rust `corrections_keep_history_reject_conflicts_and_roll_back_together`, `correcting_only_the_end_keeps_a_millisecond_start_shared_with_the_previous_entry` | PASS (CI, Windows Server runner) | — |
+| T12 | #44: E2E `initial`/`interrupt` „report matched the selected client”, raport Detailed bez obcego wpisu; node `reportClientFilter.test.ts`, `reportTime.test.ts`; Rust `reports_include_full_history_but_exclude_deleted_entries`, `reports_withhold_active_projection_after_sleep_or_restart` | PASS (CI, Windows Server runner) | — |
+| T13 | #3, #22, #44: E2E pobranie CSV („First window: downloaded CSV matched Report Details”: BOM, 1 wiersz klienta, sekundy = Detailed), `verifyDuplicateClientChoices` „identical client names are distinguishable and each CSV preview contains only its own entries”; node `reportCsv.test.ts`; TECH-10 | częściowo (CI) — reszta na W11 | otwarcie w polskim Excelu |
+| T14 | #45: E2E `verifyRestoreRetry` „real restore failure kept the preview and data; retry created a safety backup and succeeded”; Rust `storage_safety::tests::restore_rejects_corrupt_or_newer_files_and_active_destination`, `backup_is_consistent_and_preserves_active_and_completed_entries`, `failed_backup_restore_can_be_retried_with_the_same_preview` | PASS (CI, Windows Server runner) | — |
+| T15 | #55: DEV-14 `-Mode Unpackaged` „private ACLs, nothing in shared locations, no user data in diagnostics, second account isolated” (drugie konto standardowe: odmowa 34/34 elementów, własna pusta baza) i `-Mode Packaged`; build „Reject tracked SQLite data files” | PASS (CI, Windows Server runner) | profil właściciela na W11 z podpisanym pakietem (R01–R03); kopie nieszyfrowane — ryzyko odnotowane |
+| T16 | E2E przechodzi pełny cykl (CRUD, Start/Switch/Stop, Historia, raport, CSV, restarty) bez usług sieciowych, ale z dostępem do sieci | częściowo (CI) — reszta na W11 | cały scenariusz przy odłączonej sieci |
+| T17 | #40, #55: E2E `verifySecondLaunch` (druga kopia kończy się kodem 0 i przywraca okno, wpis bez zmian); DEV-14 drugie konto z osobną bazą; Rust `instance_guard_rejects_second_open_and_releases_on_drop` | PASS (CI, Windows Server runner) | — |
+| T18 | tylko symulacja: Rust `clock_discrepancy_preserves_entry_for_manual_recovery`, `power_events::tests::clock_change_does_not_invent_a_resume_time`; node `reportTime.test.ts` „handles a clock rollback crossing midnight twice” | częściowo (CI) — reszta na W11 | zmiana zegara i strefy Windows w VM |
+| T19 | #16, #44, #53: node `reportTime.test.ts` (23/25-godzinne dni DST, ułamkowa granica północy), `reportDay.test.ts` (wpis przez dwie północe), `reportCsv.test.ts` „exports the same contribution as the report…”; TECH-09 | częściowo (CI) — reszta na W11 | porównanie raportu miesięcznego i podglądu CSV w GUI |
+| T20 | #45, #56, #58: E2E `verifyWriteFailure` — „T20 Stop with an unwritable database…”, „T20 Switch with an unwritable database…”, „T20 retry after restoring writes saved one switch and one stop … without duplicates”, „PTT-36 write failures in the running app kept the timer and data intact…”; Rust `sqlite_full_during_switch_rolls_back_and_retry_keeps_boundary`, `read_only_database_keeps_timer_open_and_allows_stop_after_reopen` | PASS (CI, Windows Server runner) | — |
+| T21 | #35, #40: Rust `exit_dialog_has_explicit_choices_and_safe_default` (rzeczywisty MessageBox na runnerze), `quit_dialog::tests::*`, `exit_stops_only_the_confirmed_timer_and_preserves_failed_writes`, `tray_exit_hands_unverifiable_timer_to_recovery_without_stopping_it` | częściowo (CI) — reszta na W11 | „Zakończ aplikację” z menu zasobnika na fizycznym pulpicie |
+| T22 | node `reportCsv.test.ts` „escapes formula-like text without mutating original data”; TECH-10 | częściowo (CI) — reszta na W11 | otwarcie w arkuszu (Excel) |
+| T23 | #29, #50: tylko symulacja — Rust `multiple_sleep_periods_remain_pending_until_individually_decided_and_match_csv`, `stopping_after_verified_sleep_preserves_individual_pending_decision`; node `sleepTime.test.ts` „D4: one hour work and two hours pending…” | NOT RUN | rzeczywisty suspend/resume Windows 11, baner i decyzje w GUI |
+| T24 | #36, #44: node `reportPresets.test.ts`, `reportFilterStorage.test.ts`, `reportTime.test.ts` „changing the report zone changes day allocation without changing total duration”; Rust `timezone_migration_preserves_history_and_uses_optimistic_updates`, `ui_preferences::tests::report_filter_migrates_once_and_keeps_the_last_valid_range` | częściowo (CI) — reszta na W11 | dialog strefy (Anuluj/Zastosuj) i błąd zapisu ustawienia w GUI |
+| T25 | #18, #44: E2E plik CSV (BOM, wiersze); node `reportCsv.test.ts`; TECH-10 (rzeczywisty plik UTF-8 na Windows) | częściowo (CI) — reszta na W11 | widok w polskim Excelu, porównanie podglądu Detailed |
+| T26 | #31, #56, #58: E2E `verifyDraft` „draft survived interruption, identified a concurrent change, and applied only the selected field”, „manual and automatic sort retries were counted, rate-limited…”, `verifyDraftAfterWriteFailure` „T26 … survived the failed write and the restart…”, „T26 retry saved exactly one correction…”; node `entryDraft.test.ts` | PASS (CI, Windows Server runner) | — |
+| R01 | — | BLOCKED | brak konta Partner Center i podpisanego pakietu Store (D11) |
+| R02 | #46, #55: MSIX (niepodpisany pakiet testowy `TrackerMaster.TestOnly`): „Update preserved the test client and preferences.”, „Uninstall preserved the database and preferences.”, „Reinstall reopened the test profile and preserved its data.” | częściowo (CI) — reszta na W11 | to samo na podpisanym pakiecie docelowym (BLOCKED: brak podpisanego buildu) |
+| R03 | — | BLOCKED | brak podpisanego pakietu; SAC na W11 nie uruchomi niepodpisanego buildu |
+
+**Podsumowanie (9de9f4c5):**
+- `PASS (CI, Windows Server runner)`: 13 scenariuszy — T01, T02, T03, T07, T08, T09, T11, T12, T14, T15, T17, T20, T26.
+- Częściowo: 11 — T04, T05, T10, T13, T16, T18, T19, T21, T22, T24, T25.
+- `NOT RUN`: T06, T23 (rzeczywisty sen).
+- R01 i R03: `BLOCKED`; R02: częściowo.
+- Według wymagań: 12/30 Must ma wszystkie scenariusze w `PASS (CI)`. **Bramki DEV-15 i QA-01 pozostają zablokowane** do wykonania §7 na Windows 11 x64 z podpisanym pakietem.
+
+## 3. Procedury szczegółowe T01–T26 (statusy wykonania: §2a)
 
 **T01 — start/stop i stan timera (PTT-01/02/08).** Dane: K-A / Wspólny / A1, zegar Windows bez modyfikacji. Kroki: uruchom aplikację offline; wybierz K-A, projekt i zadanie; naciśnij Start; odczekaj co najmniej 5 s, sprawdź stan w głównym oknie; Stop; zamknij i uruchom ponownie. Oczekiwane: dokładnie jeden zamknięty wpis K-A, czas nieujemny odpowiada rzeczywiście upływającemu czasowi, stan „zatrzymany”, ta sama historia po restarcie; brak drugiego bieżącego pomiaru.
 
@@ -106,7 +163,7 @@
 
 **T26 — szkice po awarii i preferencje sortowania (PTT-09/18/36).** Dane: formularz edycji E1, lokalny szkic, później zmodyfikowany bądź usunięty oryginał oraz dwa oczekujące szkice. Kroki: zmień formularz, odczekaj około 1 s bez wpisywania i wywołaj blur, wymuś zamknięcie procesu i restart; odłóż powiadomienie do końca sesji, sprawdź listę „Szkice (N)”, konflikt wersji E1, brak oryginału i ręczne odtworzenie nowego wpisu ze śladem pochodzenia; wybierz „Najnowsze/Najstarsze”, wykonaj restart, zasymuluj błąd persist, automatyczne ograniczone ponowienia i ręczne „Spróbuj ponownie”. Oczekiwane: szkice zachowane bez automatycznego usunięcia i bez cichego nadpisania oryginału, trwały audyt pochodzenia, poprawny porządek i zapamiętanie preferencji; przy błędzie zapisu preferencja działa w bieżącej sesji z ostrzeżeniem, a ręczne retry nie resetuje limitu automatycznych prób. Scenariusz początkowo NOT RUN.
 
-## 4. Dodatkowe bramki D11 wydania Store (NOT RUN)
+## 4. Dodatkowe bramki D11 wydania Store (statusy: §2a — R01/R03 BLOCKED, R02 częściowo)
 
 **R01 — prawdziwe MSIX i Private audience.** Dane: konto MSA właściciela (bez wpisywania adresu do dowodów), drugie niezaproszone MSA, czysty Windows 11 x64. Kroki: zweryfikuj zatwierdzony pakiet w Store, pozytywny pobór przez właściciela, negatywna próba obcego konta także z bezpośrednim linkiem. Oczekiwane: produkt Free, prywatna grupa tylko z MSA właściciela, brak nieautoryzowanego pobrania, nie rozszerzano grona testerów. Nie tworzyć konta/nie publikować bez osobnej operacyjnej autoryzacji.
 
@@ -136,3 +193,71 @@
 - Akceptacja D11/D12 nie oznacza odbioru żadnego DEV ani wykonania testów. Wiele kart PTT ma nadal Akceptacja=Propozycja. TECH-06 ocenia kompletność *planu*; QA-01/DEV-15 oceniają rzeczywiście uruchomione testy i pozostają osobne.
 - Przy nowym Must zmienić macierz, dodać scenariusz i ponownie zrewidować bramkę; nie zaliczać pokrycia testem, który nie spełnia nowego kontraktu.
 - Pokrycie scenariuszami = plan. Pokrycie wdrożeniem = osobny przegląd GitHub. Pokrycie wykonaniem = zarejestrowany wynik QA. Te trzy poziomy raportować oddzielnie.
+
+## 7. Runbook odbioru Windows 11 (do wykonania po otrzymaniu podpisanego buildu)
+
+**Warunek wejścia:** podpisany pakiet docelowy, czyli MSIX ze Store (D11) lub pakiet podpisany zaakceptowanym certyfikatem. Do tego czasu cały runbook ma status `BLOCKED` (brak podpisanego buildu). **Nie wyłączać Smart App Control ani innych zabezpieczeń**, żeby uruchomić niepodpisany build. Zasady z §1 obowiązują bez zmian.
+
+### 7.1 Przygotowanie środowiska
+
+1. VM lub osobny komputer z czystym **Windows 11 x64**. Zrób migawkę „przed instalacją”, żeby móc powtarzać scenariusze destrukcyjne (T05, T18, T20).
+2. Dwa konta **standardowe** (bez uprawnień administratora): **QA-A** (główne) i **QA-B** (T15, T17). Administrator służy tylko do zmiany zegara lub strefy (T18) i skalowania (UIQ-09). Aplikację uruchamia zawsze konto standardowe.
+3. Strefa systemowa `Europe/Warsaw`. Format regionalny polski (dla Excela w T13, T22, T25). Do T13/T22/T25 potrzebny jest Excel lub inny arkusz z polskimi ustawieniami.
+4. Zainstaluj pakiet z docelowego kanału (R01/R03): w Store przez zaproszone MSA właściciela, w pozostałych przypadkach podpisany MSIX.
+
+### 7.2 Metadane do zapisu przed testami (bez danych kont)
+
+| Pole | Jak odczytać (tylko odczyt) | Wartość |
+|---|---|---|
+| Build Windows / architektura | `winver` lub `Get-ComputerInfo -Property OsName,OsBuildNumber,OsArchitecture` | |
+| Commit / tag źródła | SHA z opisu wydania (np. `9de9f4c5` + kolejne) | |
+| Wersja i nazwa pakietu | `Get-AppxPackage *TrackerMaster*` → `Version`, `PackageFullName` | |
+| SHA-256 pakietu | `Get-FileHash -Algorithm SHA256 <plik .msix>` (przy instalacji z pliku) lub identyfikator przesyłki Store | |
+| Stan Smart App Control | Zabezpieczenia Windows → Kontrola aplikacji i przeglądarki → Smart App Control (Włączone/Ewaluacja/Wyłączone). Tylko zapisać, **nie zmieniać** | |
+| Strefa systemowa i raportu | `Get-TimeZone`; w aplikacji: Raport → strefa raportowania | |
+| Ścieżka danych | `%APPDATA%\pl.tracker.personal` (dla MSIX niewirtualizowana, zgodnie z D11) | |
+| `user_version` SQLite | Panel „Kopia zapasowa” → „Utwórz kopię”. Na **kopii** (nie na bazie roboczej) odczytaj nagłówek SQLite, bajty 60–63 big-endian: `$b=[IO.File]::ReadAllBytes('<ścieżka kopii>'); [BitConverter]::ToInt32(@($b[63],$b[62],$b[61],$b[60]),0)`. Oczekiwane `LATEST_SCHEMA_VERSION` z commitu (13 na `9de9f4c5`). „Sprawdź bazę” pokazuje tylko liczności. | |
+| Wykonawca / niezależny recenzent | identyfikatory (§5) | |
+
+### 7.3 Dane syntetyczne
+
+Jak w §1: **K-A „Test Alfa”** i **K-B „Test Beta”**, w każdym projekt **„Wspólny”** (odrębne ID). Zadania **A1, A2** (K-A) i **B1** (K-B). Wpisy z 2026-03-29 i 2026-10-25 do testów DST w `Europe/Warsaw`. Do T13, T22 i T25: opisy z polskimi znakami (`Zażółć gęślą jaźń`), średnikiem, cudzysłowem, nową linią i początkiem `=`, `+`, `-`, `@`. Żadnych danych prawdziwych klientów.
+
+### 7.4 Kolejność scenariuszy
+
+Szczegółowe kroki i pełne oczekiwane wyniki są w §3. Każdy wynik zapisz według §5. W kolumnie „Dowód” wpisz nazwę pliku zrzutu lub logu (np. `T05-recovery-banner.png`, `T13-csv-excel.png`, `T20-error.png`) albo link.
+
+| Krok | Scenariusz | Działanie (skrót) | Oczekiwany wynik (skrót; pełny w §3) | Dowód | Wynik |
+|---|---|---|---|---|---|
+| 1 | R03, R01 | Instalacja z docelowego kanału; drugie, niezaproszone MSA próbuje pobrać | Podpis prawidłowy, uruchomienie przy aktywnym SAC; obcy MSA nie pobiera | | |
+| 2 | T16 (otwarcie) | **Odłącz sieć** przed pierwszym startem; kroki 3–12 wykonuj offline | Brak wymagań sieci w kluczowych czynnościach | | |
+| 3 | T07 | Utwórz K-A/K-B, projekty, zadania; restart | ID i relacje trwałe, obce przypisanie odrzucone | | |
+| 4 | T01, T02 | Start A1 ≥5 s, Stop; Start A1 → Start A2; restart | Jeden wpis na pomiar, wspólna granica, jeden aktywny timer | | |
+| 5 | T03 | Ustaw skrót, użyj go przy innym oknie na pierwszym planie; konflikt z innym programem; restart | Działa globalnie, konflikt czytelny, stary skrót zachowany | | |
+| 6 | T04, T21 | X przy aktywnym A1 → przywróć z **ikony w zasobniku**; widget; „Zakończ aplikację” → Anuluj, potem Stop i zakończ | Stan zachowany; po Anuluj timer trwa; brak zawieszenia | | |
+| 7 | T17 | Drugi start `TrackerMaster` z menu Start przy otwartej aplikacji | Wraca istniejące okno, brak drugiego procesu/timera | | |
+| 8 | T08, T09 | Archiwizacja/przywracanie zadania, projektu, klienta; Historia | Historia nienaruszona, archiwum blokuje nowy Start | | |
+| 9 | T10, T11 | Ręczne wpisy z nakładaniem i stykaniem; korekta i konflikt; godzina DST | Overlap odrzucony, stykanie OK, jedna rewizja na korektę | | |
+| 10 | T12, T19, T24 | Raport K-A/K-B/wszyscy; północ, 23/25-godzinne dni; zmiana strefy raportu (Anuluj/Zastosuj), presety, restart | Sumy zgodne z §3 T12/T19/T24 | | |
+| 11 | T13, T22, T25 | Podgląd i CSV dla K-A; otwarcie w polskim Excelu | 12 kolumn, BOM, `;`, brak wykonania formuł, brak K-B, zgodność z podglądem | | |
+| 12 | T16 (zamknięcie) | Restart offline; potem **przywróć sieć** | Dane i raport zgodne po restarcie | | |
+| 13 | T05 | Wymuś zakończenie procesu przy aktywnym A1 (Menedżer zadań); restart; anuluj, potem rozstrzygnij | Brak automatycznego dopisania czasu, jeden wpis po decyzji | | |
+| 14 | T26 | Edycja wpisu bez zapisu → wymuszone zamknięcie → restart → „Szkice (N)”; konflikt wersji; sortowanie | Szkic zachowany, bez nadpisania oryginału, preferencja zapamiętana | | |
+| 15 | T20 | Na kopii bazy w VM: tylko do odczytu lub brak miejsca; Stop/Switch/korekta; przywróć zapis i ponów | Brak fałszywego „Zapisano”, brak duplikatów, jedno udane ponowienie | | |
+| 16 | T14 | Kopia przy aktywnym timerze; Stop; przywróć z podglądem (Anuluj, potem Potwierdź); zła i nowsza kopia | Kopia bezpieczeństwa przed podmianą, odmowa złej kopii | | |
+| 17 | T18 | Konto administratora: zegar w przód i w tył, zmiana strefy systemowej; powrót i restart | Brak cichego ujemnego/zawyżonego czasu; strefa raportu bez zmian | | |
+| 18 | T06, T23 | **Rzeczywisty sen/wybudzenie** (Start → Zasilanie → Uśpij); scenariusz S1/S2 z §3 T23; „Później”, restart, decyzje | Sen jawnie oznaczony, pending poza sumą do decyzji, sumy jak w §3 | | |
+| 19 | T15 | Konto QA-B: uruchom aplikację; spróbuj otworzyć `%APPDATA%\pl.tracker.personal` konta QA-A | Odmowa dostępu; QA-B ma własną pustą bazę | | |
+| 20 | R02 | Aktualizacja do N+1, odinstalowanie, ponowna instalacja (QA-A) | Baza, kopie, ustawienia i ID zachowane | | |
+| 21 | UIQ-09 | Skalowanie 100%, 125%, 150% (Ustawienia → System → Ekran); główne okno, mini timer, dialogi, raport | Brak obciętych tekstów i poziomego przewijania, cele ≥24×24 px, czytelne etykiety; zrzut na każdą skalę | | |
+| 22 | Dostępność | **Narrator** (Ctrl+Win+Enter): licznik, Start/Stop, wyszukiwarka projektu, menu ⋯ w Historii, dialogi zamknięcia/szkicu | Nazwy i stany ogłaszane, logiczna kolejność fokusu, Escape zwraca fokus | | |
+
+**Poza MVP:** tryb ciemny (dark mode) — decyzja PO z 23.11.2026, przeniesiony do V1.1. Nie testować go jako bramki; ewentualne obserwacje zapisać jako informacyjne.
+
+### 7.5 Kryteria zamknięcia DEV-15 / QA-01
+
+- Wszystkie 30 pozycji Must z §2 mają wykonane scenariusze na Windows 11 x64 z podpisanym pakietem i wynik `PASS`. Status „częściowo (CI)” z §2a nie wystarcza.
+- T05, T06, T13, T14, T15, T16, T20 oraz R01–R03 mają dowody (zrzut lub log) według §5.
+- Brak krytycznych `FAIL`/`BLOCKED`. Każdy defekt ma zgłoszenie i ponowny wynik.
+- UIQ-09 (125%/150%) i Narrator bez blokujących usterek (UIQ). Dark mode nie jest kryterium (V1.1).
+- Niezależny recenzent QA potwierdza wyniki. Autor kodu nie zatwierdza wydania samodzielnie (QA-01).
