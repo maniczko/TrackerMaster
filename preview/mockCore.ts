@@ -1,10 +1,17 @@
 // PREVIEW ONLY: in-memory stand-in for the Tauri backend. Fictional data; nothing is persisted.
 type Id = number;
 type Entry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null;
-  recovered?: boolean; uncertain?: boolean; has_sleep?: boolean; excluded_sleep_ms?: number; manually_resolved?: boolean; billable: boolean; description: string };
+  recovered?: boolean; uncertain?: boolean; has_sleep?: boolean; excluded_sleep_ms?: number; manually_resolved?: boolean; billable: boolean; description: string;
+  sleep_periods?: { id: number; entryId: number; startedMs: number; endedMs: number | null; decision: 'pending' | 'included' | 'excluded' }[] };
 
 const params = new URLSearchParams(location.search);
 const scenario = params.get('scenario') ?? 'running';
+// ?view=calendar|timer opens that view (preview convenience; the app remembers the last view in localStorage).
+const previewView = params.get('view');
+if (previewView === 'calendar' || previewView === 'timer') { try { localStorage.setItem('trackermaster.view.v1', previewView); localStorage.removeItem('trackermaster.calendar.v1'); } catch { /* ignore */ } }
+// ?week=YYYY-MM-DD opens the calendar on the week of that day.
+const previewWeek = params.get('week');
+if (previewWeek && /^\d{4}-\d{2}-\d{2}$/.test(previewWeek)) { try { localStorage.setItem('trackermaster.calendar.v1', JSON.stringify({ week: previewWeek })); } catch { /* ignore */ } }
 const now = () => Date.now();
 const iso = (ms: number) => new Date(ms).toISOString();
 const H = 3_600_000, M = 60_000;
@@ -35,6 +42,17 @@ const entries: Entry[] = [
 // Crosses local midnight: History shows it in both days (TECH-09 day pieces).
 const midnight = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); })();
 entries.push({ id: 4, task_id: 112, project_id: 11, started_at: iso(midnight - 0.5 * H), ended_at: iso(midnight + 0.75 * H), duration_seconds: 4500, billable: true, description: 'Nocne wdrożenie poprawek' });
+// Calendar (DEV-24): entries on each of the 7 days before today (a full week whatever the weekday), one with sleep still to decide.
+const weekMonday = midnight - 7 * 24 * H + 2 * H; // a moment on the day a week ago (DST-safe); the loop starts at that day
+let weekId = 60;
+for (const day = new Date(weekMonday); day.setHours(0, 0, 0, 0), day.getTime() < midnight; day.setDate(day.getDate() + 1)) {
+  const at = (hours: number) => { const d = new Date(day); d.setHours(Math.floor(hours), Math.round((hours % 1) * 60), 0, 0); return d.getTime(); };
+  const id = weekId++;
+  const sleep = id === 60 ? [{ id: 9, entryId: id, startedMs: at(14.5), endedMs: at(14.75), decision: 'pending' as const }] : undefined;
+  entries.push({ id, task_id: 111, project_id: 11, started_at: iso(at(14)), ended_at: iso(at(15.5)), duration_seconds: sleep ? 4500 : 5400, billable: true,
+    description: sleep ? 'Projekt graficzny — z uśpieniem do rozstrzygnięcia' : 'Projekt graficzny — iteracja', ...(sleep ? { sleep_periods: sleep } : {}) });
+  entries.push({ id: weekId++, task_id: null, project_id: 12, started_at: iso(at(16)), ended_at: iso(at(16.75)), duration_seconds: 2700, billable: false, description: 'Wsparcie klienta' });
+}
 // ?scenario=empty: first run without clients, projects or entries.
 if (scenario === 'empty') { clients.length = 0; projects.length = 0; tasks.length = 0; entries.length = 0; }
 let active: Entry | null = null;

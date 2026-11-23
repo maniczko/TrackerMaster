@@ -31,3 +31,15 @@ Mocki są podpinane wyłącznie przez `vite.preview.config.ts`. Test `tests/prev
 - `vite.config.ts` (build aplikacji) nie podmieniał API Tauri;
 - konfiguracja podglądu podmieniała każdy moduł Tauri używany przez aplikację;
 - zbudowany bundle nie zawierał kodu podglądu.
+
+## Kalendarz (tydzień, pakiet A)
+
+Przełącznik **Timer / Kalendarz** jest pod nagłówkiem okna głównego. Podgląd ma wpisy na każdy z 7 dni przed dzisiejszym, wpis przez północ (wczoraj 23:30 – dziś 00:45), jedno uśpienie do rozstrzygnięcia (zakreskowane, nieliczone) i w scenariuszu „Pomiar w trakcie” żywy blok z linią „teraz”. W scenariuszach „Do weryfikacji” i „Niepewny czas” aktywny pomiar jest zakreskowany i nie wlicza się do sum.
+
+Bezpośrednie adresy (tylko podgląd):
+
+- `http://127.0.0.1:1430/index.html?scenario=running&view=calendar` — bieżący tydzień;
+- `…&view=calendar&week=2026-11-16` — tydzień, w którym jest podany dzień;
+- `…&view=timer` — powrót do widoku Timer.
+
+Kalendarz tylko pokazuje wpisy (edycja i dodawanie: pakiet B). Sumy dni i tygodnia liczy ta sama funkcja co raport (`makeReportView` → `reportByDay`).

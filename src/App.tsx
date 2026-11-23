@@ -20,6 +20,7 @@ import { historyDays, liveTimerTotals, timerTotals, totalsBaseData } from './rep
 import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
 import { useAllClientsReport } from './useAllClientsReport';
+import CalendarWeek from './CalendarWeek';
 import './miniTimer.css';
 
 type Id = number | string;
@@ -147,6 +148,9 @@ export default function App() {
   const catalog = useMemo(() => ({ clients: data.clients, projects: data.projects, tasks: data.tasks }), [data.clients, data.projects, data.tasks]);
   // Day/week totals and History day groups come from the report's own calculation (all clients).
   const allClients = useAllClientsReport(loaded, reportRevision);
+  // Timer or calendar (DEV-24). Only what is shown changes: the timer, its state and any open edit stay mounted.
+  const [view, setView] = useState<'timer' | 'calendar'>(() => { try { return window.localStorage.getItem('trackermaster.view.v1') === 'calendar' ? 'calendar' : 'timer'; } catch { return 'timer'; } });
+  const showView = (next: 'timer' | 'calendar') => { setView(next); try { window.localStorage.setItem('trackermaster.view.v1', next); } catch { /* convenience only */ } };
   // Totals run with the clock: the report base (re-read on changes, focus and every 60 s) plus the
   // running timer after its report projection, only while the fresh snapshot shows it resolved.
   const clockActive = data.active ? { id: data.active.id, recovered: data.active.recovered, uncertain: data.active.uncertain } : null;
@@ -322,6 +326,7 @@ export default function App() {
     <main>
       {import.meta.env.VITE_TRACKER_TEST_MODE === '1' && <div role="note" className="alert warning"><strong>Wersja testowa.</strong> Korzysta z osobnej bazy na tym komputerze. Wprowadzaj wyłącznie fikcyjne dane.</div>}
       <div className="heading"><div><h1>Rejestracja czasu</h1><p className="subtitle">Wybierz projekt i skup się na pracy. Resztą zajmie się licznik.</p></div><div className="date">{new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())}</div></div>
+      <div className="view-switch" role="group" aria-label="Widok"><button type="button" aria-pressed={view === 'timer'} onClick={() => showView('timer')}>Timer</button><button type="button" aria-pressed={view === 'calendar'} onClick={() => showView('calendar')}>Kalendarz</button></div>
       {error && <div role="alert" className="alert error">{error}</div>}
       {!loaded && <div role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie przed wykonaniem kolejnej operacji. <button type="button" disabled={busy} onClick={retryRefresh}>Ponów odczyt</button></div>}
       {/* One compact review banner (UIQ-01): title and one sentence, the end-time form, the sleep note with the
@@ -342,6 +347,7 @@ export default function App() {
       {loaded && !data.active?.recovered && !data.active?.uncertain && sleep.items.length > 0 && <div role="status" className="alert timer-review"><SleepNote sleep={sleep} /></div>}
       <SleepReadError sleep={sleep} />
       {notice && <div role="status" className="alert success">{notice}</div>}
+      <div className="timer-view" hidden={view !== 'timer'}>
       <section className="timer card" aria-label="Pomiar czasu">
         <div className="timer-layout">
           <div className="timer-now">
@@ -438,6 +444,9 @@ export default function App() {
       </section>
         </div>
       </details>
+      </div>
+      {view === 'calendar' && <CalendarWeek report={allClients} catalog={catalog} loaded={loaded} now={now} snapshotFresh={now - snapshotAt <= 5000}
+        snapshotActive={data.active ? { id: data.active.id, project_id: data.active.project_id, task_id: data.active.task_id, started_at: data.active.started_at, description: data.active.description, billable: data.active.billable, recovered: data.active.recovered, uncertain: data.active.uncertain } : null} />}
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
     </main>
   </div>;
