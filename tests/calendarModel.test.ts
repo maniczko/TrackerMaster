@@ -209,3 +209,17 @@ test('calendar.css has no raw colours, no own custom properties and token font s
   assert.doesNotMatch(css, /--[\w-]+\s*:/);
   for (const [, value] of css.matchAll(/font-size:\s*([^;]+);/g)) assert.match(value.trim(), /^var\(--text-(xs|sm|md|lg|xl)\)$/);
 });
+
+// D4 / #62: a short sleep counted without a question ('auto_included') is work, like 'included'.
+test('auto-included short sleep is work in the calendar and in the report', () => {
+  const at = (time: string) => Date.parse(`2026-11-18T${time}:00Z`);
+  const short = entry(1, '2026-11-18T08:00:00Z', '2026-11-18T09:00:00Z', {
+    sleep_periods: [{ id: 1, entryId: 1, startedMs: at('08:20'), endedMs: at('08:22'), decision: 'auto_included' }],
+  });
+  const data = { entries: [short], active: null, time_zone: zone };
+  const view = week(data, '2026-11-16', 0);
+  assert.equal(view.days[2].seconds, 3600);
+  assert.equal(view.days[2].seconds, report(data, view.from, view.through).liveSeconds);
+  assert.deepEqual(view.days[2].blocks.map(block => [block.kind, pieceRange(block)]), [['work', '09:00–10:00']]);
+  assert.equal(view.pendingPeriodCount, 0);
+});

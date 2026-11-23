@@ -2,7 +2,7 @@
 type Id = number;
 type Entry = { id: Id; task_id: Id | null; project_id: Id; started_at: string; ended_at: string | null; duration_seconds?: number | null;
   recovered?: boolean; uncertain?: boolean; has_sleep?: boolean; excluded_sleep_ms?: number; manually_resolved?: boolean; billable: boolean; description: string;
-  sleep_periods?: { id: number; entryId: number; startedMs: number; endedMs: number | null; decision: 'pending' | 'included' | 'excluded' }[] };
+  sleep_periods?: { id: number; entryId: number; startedMs: number; endedMs: number | null; decision: 'pending' | 'included' | 'excluded' | 'auto_included' }[] };
 
 const params = new URLSearchParams(location.search);
 const scenario = params.get('scenario') ?? 'running';
@@ -35,7 +35,9 @@ const tasks = [
 ];
 let nextId = 100;
 const entries: Entry[] = [
-  { id: 1, task_id: 111, project_id: 11, started_at: iso(dayStart), ended_at: iso(dayStart + 1.5 * H), duration_seconds: 5400, billable: true, description: 'Makiety strony głównej' },
+  { id: 1, task_id: 111, project_id: 11, started_at: iso(dayStart), ended_at: iso(dayStart + 1.5 * H), duration_seconds: 5400, billable: true, description: 'Makiety strony głównej',
+    // D4 short sleep (v14): a 2-minute sleep observed by the app is work, without a question or a banner.
+    sleep_periods: [{ id: 9, entryId: 1, startedMs: dayStart + 0.5 * H, endedMs: dayStart + 0.5 * H + 2 * M, decision: 'auto_included' }] },
   { id: 2, task_id: null, project_id: 12, started_at: iso(dayStart + 1.75 * H), ended_at: iso(dayStart + 2.25 * H), duration_seconds: 1800, billable: false, description: 'Odpowiedź na zgłoszenie' },
   { id: 3, task_id: 211, project_id: 21, started_at: iso(dayStart - 22 * H), ended_at: iso(dayStart - 19 * H), duration_seconds: 10800, billable: true, description: 'Teksty ulotek — wersja z długim opisem, żeby sprawdzić zawijanie w tabeli' },
 ];
@@ -70,7 +72,7 @@ if (scenario === 'recovered' || scenario === 'sleep') {
 }
 
 const snapshot = () => ({ clients, projects, tasks, active: active && { ...active }, entries: [...entries].reverse() });
-const health = () => ({ schema_version: 13, clients: clients.length, projects: projects.length, tasks: tasks.length, completed_entries: entries.length, open_entries: active ? 1 : 0 });
+const health = () => ({ schema_version: 14, clients: clients.length, projects: projects.length, tasks: tasks.length, completed_entries: entries.length, open_entries: active ? 1 : 0 });
 const close = (end: number) => {
   if (!active) throw 'Brak aktywnego pomiaru.';
   const start = Date.parse(active.started_at);

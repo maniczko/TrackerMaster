@@ -144,4 +144,21 @@ mod tests {
         let periods=crate::sleep_periods::list_for_entry(&tracker.db,1).unwrap();
         assert_eq!(periods[0].ended_ms,None);
     }
+
+    #[test]
+    fn short_observed_sleep_is_counted_without_a_question_and_five_minutes_asks() {
+        let (mut tracker,start)=fixture();
+        // 2 min sleep at 11:00 (power counters agree with the wall clock).
+        handle_suspend(&mut tracker,start+3_600_000,PowerSample { total_ms:4_600_000,awake_ms:4_600_000 }).unwrap();
+        handle_resume(&mut tracker,start+3_720_000,PowerSample { total_ms:4_720_000,awake_ms:4_600_000 }).unwrap();
+        // Exactly 5 min at 11:06:40: the boundary asks.
+        handle_suspend(&mut tracker,start+4_000_000,PowerSample { total_ms:5_000_000,awake_ms:4_880_000 }).unwrap();
+        handle_resume(&mut tracker,start+4_300_000,PowerSample { total_ms:5_300_000,awake_ms:4_880_000 }).unwrap();
+        let periods=crate::sleep_periods::list_for_entry(&tracker.db,1).unwrap();
+        assert_eq!(periods.iter().map(|p| (p.ended_ms.unwrap()-p.started_ms,p.decision.as_str())).collect::<Vec<_>>(),
+            [(120_000,"auto_included"),(crate::sleep_periods::SHORT_SLEEP_AUTO_INCLUDE_MS,"pending")]);
+        // A repeated resume event changes nothing.
+        handle_resume(&mut tracker,start+4_300_000,PowerSample { total_ms:5_300_000,awake_ms:4_880_000 }).unwrap();
+        assert_eq!(crate::sleep_periods::list_for_entry(&tracker.db,1).unwrap(),periods);
+    }
 }
