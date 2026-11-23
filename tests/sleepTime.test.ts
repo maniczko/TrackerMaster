@@ -42,3 +42,12 @@ test('elapsed duration remains correct over Warsaw DST rollback and subsecond bo
   assert.equal(r.workMs + r.pendingMs + r.excludedMs, end - start);
   assert.equal(r.workMs, 1250);
 });
+
+test('D4 short sleep: an automatically included period is work, counted once next to pending and excluded sleep', () => {
+  const p = [period(1, 10, 20, 'auto_included'), period(2, 30, 60), period(3, 70, 80, 'excluded'), period(4, 90, 95, 'auto_included')];
+  const split = splitSleepTime(1, 0, 100, p);
+  assert.deepEqual({ work: split.workMs, pending: split.pendingMs, excluded: split.excludedMs }, { work: 60, pending: 30, excluded: 10 });
+  assert.equal(split.workMs + split.pendingMs + split.excludedMs, 100, 'no second is counted twice or lost');
+  assert.deepEqual(split.segments.filter(part => part.sleepId).map(part => [part.sleepId, part.kind]), [[1, 'work'], [2, 'pending'], [3, 'excluded'], [4, 'work']]);
+  assert.throws(() => splitSleepTime(1, 0, 100, [period(1, 40, null, 'auto_included')]), /otwarte/);
+});

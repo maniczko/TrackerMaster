@@ -346,7 +346,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'short-sleep') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -1598,6 +1598,87 @@ async function verifyDuplicateClientChoices(cdp, sessionId) {
   }
 }
 
+// D4 short sleep (schema v14, owner decision 23.11.2026, as in Toggl): a sleep shorter than 5 minutes is
+// work without a question; 5 minutes or more still asks. A real suspend cannot run on the CI runner, and a
+// sleep recorded on a running timer would disagree with the power counters, so the periods are recorded on
+// a completed entry on a fixed past day with the app's own resume statement and threshold (sleep_periods.rs).
+async function verifyShortSleep(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const main = await readFile(join('src-tauri', 'src', 'main.rs'), 'utf8');
+  const rust = await readFile(join('src-tauri', 'src', 'sleep_periods.rs'), 'utf8');
+  const latest = Number(main.match(/const LATEST_SCHEMA_VERSION: i64 = (\d+);/)[1]);
+  const threshold = rust.match(/pub const SHORT_SLEEP_AUTO_INCLUDE_MS: i64 = ([\d_ *]+);/)[1].replace(/_/g, '').split('*').reduce((product, factor) => product * Number(factor), 1);
+  const resumeSql = rust.match(/"(UPDATE sleep_periods SET ended_ms=\?1, decision=CASE[^"]+)"/)[1];
+  assert.equal(threshold, 300_000);
+  const description = 'D4 krótkie uśpienie';
+  const start = Date.parse('2026-01-05T08:00:00.000Z');
+  const minute = 60_000;
+  let db = new DatabaseSync(testDb, { readOnly: true });
+  let project;
+  try {
+    // The packaged app migrated the test database to the current schema with 'auto_included'.
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, latest);
+    assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name='sleep_periods'").get().sql, /'auto_included'/);
+    project = db.prepare(`SELECT p.id AS projectId, p.client_id AS clientId FROM projects p WHERE p.archived=0
+      AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=p.client_id) ORDER BY p.id LIMIT 1`).get();
+    assert.ok(project, 'an active project for the short-sleep entry');
+  } finally { db.close(); }
+  await invoke('create_project_manual_entry', { projectId: project.projectId, taskId: null, startedAt: new Date(start).toISOString(), endedAt: new Date(start + 60 * minute).toISOString(), description });
+  db = new DatabaseSync(testDb);
+  let entryId, ids;
+  try {
+    entryId = db.prepare('SELECT e.id FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE d.description=?').get(description).id;
+    const record = (offset, length) => {
+      const id = Number(db.prepare('INSERT INTO sleep_periods(entry_id,started_ms) VALUES(?,?)').run(entryId, start + offset).lastInsertRowid);
+      assert.equal(db.prepare(resumeSql).run(start + offset + length, id, entryId, threshold).changes, 1);
+      return id;
+    };
+    // 2 min, exactly 5 min, 10 min: only the first is counted without a question.
+    ids = { short: record(10 * minute, 2 * minute), boundary: record(20 * minute, threshold), long: record(30 * minute, 10 * minute) };
+    const rows = db.prepare('SELECT id, decision, decided_ms, ended_ms FROM sleep_periods WHERE entry_id=? ORDER BY started_ms').all(entryId).map(row => ({ ...row }));
+    assert.deepEqual(rows.map(row => row.decision), ['auto_included', 'pending', 'pending']);
+    assert.equal(rows[0].decided_ms, rows[0].ended_ms, 'the automatic decision is recorded at the observed resume');
+    assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='auto_included', decided_ms=ended_ms WHERE id=?").run(ids.boundary), /CHECK/);
+    assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='excluded', decided_ms=1 WHERE id=?").run(ids.short), /immutable/);
+  } finally { db.close(); }
+
+  // One note above the timer for the two questions; the short sleep is not among them.
+  const note = () => evaluate(`document.querySelector('.sleep-note')?.textContent ?? ''`);
+  await waitFor('sleep note lists only the 5 and 10 minute periods', async () => (await note()).includes('2 okresy · 00:15:00'));
+  const pending = await invoke('get_pending_sleep');
+  assert.deepEqual(pending.filter(item => item.entryId === entryId).map(item => item.id), [ids.boundary, ids.long]);
+  // History, report and CSV count the same seconds: 60 min minus the 15 undecided minutes, the 2 min are work.
+  const counted = async () => {
+    const snapshot = await invoke('get_snapshot');
+    const report = await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } });
+    const csv = await invoke('get_client_export_data', { scope: { clientId: project.clientId, projectId: null, taskId: null } });
+    const seconds = list => list.find(item => item.id === entryId)?.duration_seconds;
+    return [seconds(snapshot.entries), seconds(report.entries), seconds(csv.entries)];
+  };
+  assert.deepEqual(await counted(), [2700, 2700, 2700]);
+  // The 5-minute sleep is included and the 10-minute one rejected through the list, as before.
+  await evaluate(`document.querySelector('.sleep-note button').click()`);
+  const list = '#pending-sleep-list';
+  // Rows are told apart by entry and duration (the dates follow the app's locale and time zone).
+  const row = duration => `[...document.querySelectorAll(${JSON.stringify(`${list} tbody tr`)})].find(row => row.textContent.includes(${JSON.stringify(`#${entryId}`)}) && row.cells[2]?.textContent.startsWith(${JSON.stringify(duration)}))`;
+  const button = (duration, label) => `[...(${row(duration)}?.querySelectorAll('button') ?? [])].find(item => item.textContent.trim() === ${JSON.stringify(label)})`;
+  await waitFor('pending list shows both questions', () => evaluate(`Boolean(${row('00:05:00')}) && Boolean(${row('00:10:00')})`));
+  assert.equal(await evaluate(`Boolean(${row('00:02:00')})`), false, 'the short sleep is not offered for a decision');
+  await evaluate(`${button('00:05:00', 'Dolicz')}.click()`);
+  await waitFor('5-minute sleep included', async () => (await invoke('get_pending_sleep')).filter(item => item.entryId === entryId).length === 1);
+  await waitFor('10-minute sleep button ready', () => evaluate(`(button => Boolean(button && !button.disabled))(${button('00:10:00', 'Odrzuć')})`));
+  await evaluate(`${button('00:10:00', 'Odrzuć')}.click()`);
+  await waitFor('no question left for the entry', async () => (await invoke('get_pending_sleep')).every(item => item.entryId !== entryId));
+  await waitFor('sleep note gone', async () => !(await note()));
+  assert.deepEqual(await counted(), [3000, 3000, 3000]);
+  console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -1668,7 +1749,7 @@ async function runWindow(port, phase, recovery) {
       await captureReportDetail(cdp, sessionId, phase === 'initial' ? 'selected-client' : 'restored-scope');
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -1723,6 +1804,7 @@ async function runWindow(port, phase, recovery) {
     }
     if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
+    if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -1840,6 +1922,9 @@ try {
   await runWindow(port, 'write-failure', recovery);
   await waitForWindowClosed(port);
   await runWindow(port, 'write-failure-reopen', recovery);
+  // D4 short sleep (schema v14): last, so the entry counts asserted above are unaffected.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'short-sleep', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

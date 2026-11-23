@@ -93,3 +93,53 @@ test('a manually supplied resume remains pending and cannot be silently rewritte
     assert.throws(() => db.prepare('UPDATE sleep_periods SET ended_ms=3000').run(), /immutable/);
   } finally { db.close(); }
 });
+
+// D4 short sleep, schema v14: the same SQL files the Rust migration executes (sleep_periods.rs).
+const schemaV14 = readFileSync(new URL('../src-tauri/src/sleep_periods_v14.sql', import.meta.url), 'utf8');
+const migrationV14 = readFileSync(new URL('../src-tauri/src/sleep_periods_v14_migration.sql', import.meta.url), 'utf8');
+const sleepRows = db => db.prepare('SELECT id,entry_id,started_ms,ended_ms,manual_resume,decision,decided_ms FROM sleep_periods ORDER BY id').all().map(row => ({ ...row }));
+const schemaObjects = ['sleep_periods', 'sleep_periods_pending', 'sleep_periods_one_open', 'sleep_periods_initial_pending', 'sleep_periods_no_overlap_insert', 'sleep_periods_no_overlap_update', 'sleep_periods_immutable', 'sleep_periods_no_delete'];
+
+test('v14 migration rebuilds the table with every row and decision kept and the exact v14 definitions', () => {
+  const db = dbAt();
+  insert(db, 1, 1000, 2000); insert(db, 1, 3000, 400000); insert(db, 1, 500000, 600000); insert(db, 2, 1000, null);
+  db.prepare("UPDATE sleep_periods SET decision='included', decided_ms=700000 WHERE started_ms=3000").run();
+  db.prepare("UPDATE sleep_periods SET decision='excluded', decided_ms=700001 WHERE started_ms=500000").run();
+  const before = sleepRows(db);
+  const [prepare, copy] = migrationV14.split('-- @schema');
+  assert.ok(prepare && copy, 'the migration has one schema marker');
+  db.exec('BEGIN IMMEDIATE');
+  db.exec(prepare); db.exec(schemaV14); db.exec(copy);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM (SELECT id,entry_id,started_ms,ended_ms,manual_resume,decision,decided_ms FROM sleep_periods EXCEPT SELECT id,entry_id,started_ms,ended_ms,manual_resume,decision,decided_ms FROM sleep_periods_v13)').get().n, 0);
+  db.exec('DROP TABLE sleep_periods_v13; COMMIT');
+  assert.deepEqual(sleepRows(db), before, 'ids, boundaries, flags and decisions are unchanged; the short pending sleep stays pending');
+  const canonical = new DatabaseSync(':memory:');
+  canonical.exec('CREATE TABLE time_entries(id INTEGER PRIMARY KEY);'); canonical.exec(schemaV14);
+  const definition = (target, name) => target.prepare('SELECT sql FROM sqlite_master WHERE name=?').get(name)?.sql;
+  for (const name of schemaObjects) assert.equal(definition(db, name), definition(canonical, name), name);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='sleep_periods_v13'").get().n, 0);
+  // The v14 protections still hold after the rebuild.
+  assert.throws(() => insert(db, 1, 1500, 2500), /overlapping/);
+  assert.throws(() => db.prepare('DELETE FROM sleep_periods').run(), /retained for audit/);
+  assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='excluded' WHERE started_ms=3000").run(), /immutable/);
+  canonical.close(); db.close();
+});
+
+test('v14 stores an automatic decision only for a complete, observed sleep under 300000 ms, at its end', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec('PRAGMA foreign_keys=ON; CREATE TABLE time_entries(id INTEGER PRIMARY KEY); INSERT INTO time_entries VALUES (1);');
+  db.exec(schemaV14);
+  const auto = id => db.prepare("UPDATE sleep_periods SET decision='auto_included', decided_ms=ended_ms WHERE id=?").run(id);
+  const id = (start, end) => Number(insert(db, 1, start, end).lastInsertRowid);
+  assert.throws(() => db.prepare("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms,decision,decided_ms) VALUES(1,800000,801000,'auto_included',801000)").run(), /start pending/);
+  const short = id(0, 299999), boundary = id(300000, 600000), open = id(700000, null);
+  auto(short);
+  assert.throws(() => auto(boundary), /CHECK/, 'exactly five minutes asks');
+  assert.throws(() => auto(open), /CHECK/, 'an unfinished period asks');
+  assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='auto_included', decided_ms=ended_ms-1 WHERE id=?").run(boundary), /CHECK/);
+  db.prepare('UPDATE sleep_periods SET ended_ms=750000, manual_resume=1 WHERE id=?').run(open);
+  assert.throws(() => auto(open), /CHECK/, 'a user-supplied resume is never decided automatically');
+  assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='excluded', decided_ms=1 WHERE id=?").run(short), /immutable/);
+  assert.deepEqual(sleepRows(db).map(row => [row.decision, row.decided_ms]), [['auto_included', 299999], ['pending', null], ['pending', null]]);
+  db.close();
+});

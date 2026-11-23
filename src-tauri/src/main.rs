@@ -12,7 +12,8 @@ mod quit_dialog;
 #[cfg(windows)]
 mod instance_activation;
 
-const LATEST_SCHEMA_VERSION: i64 = 13;
+// v14: sleep_periods allows 'auto_included' (D4 short sleep, sleep_periods.rs).
+const LATEST_SCHEMA_VERSION: i64 = 14;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -225,7 +226,7 @@ fn active_projection(db: &Connection, clock: Option<&RunningClock>, id: i64, sta
         for period in &periods {
             let duration = period.ended_ms?.checked_sub(period.started_ms)?;
             known = known.checked_add(u64::try_from(duration).ok()?)?;
-            if period.decision != "included" { excluded = excluded.checked_add(duration)?; }
+            if !sleep_periods::counts_as_work(&period.decision) { excluded = excluded.checked_add(duration)?; }
         }
         if known.abs_diff(total.saturating_sub(awake)) > 4_000 { return None; }
         return Some(ActiveProjection { end, seconds, excluded_sleep_ms: excluded, periods: Some(periods) });
@@ -255,7 +256,7 @@ fn snapshot(tracker: &Tracker) -> Cmd<Snapshot> {
         let recovered = tracker.running_since.is_none();
         let projection = active_projection(db, tracker.running_since.as_ref(), id, &started_at, Utc::now(), &power_sample());
         let uncertain = !recovered && projection.is_none();
-        let has_sleep = has_sleep_periods(db,id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let has_sleep = has_reviewable_sleep(db,id).map_err(|_| rusqlite::Error::InvalidQuery)?;
         let excluded_sleep_ms = projection.map(|p| p.excluded_sleep_ms).unwrap_or(0);
         Ok(Active { id, task_id:r.get(1)?, started_at, recovered, uncertain, has_sleep, excluded_sleep_ms, billable:r.get(3)?, description:r.get(4)?, project_id:r.get(5)? })
     }).optional().map_err(db_err)?;
@@ -279,6 +280,13 @@ fn has_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<bool> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     if version < 12 { return Ok(false); }
     db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods WHERE entry_id=?1)", [entry_id], |r| r.get(0)).map_err(db_err)
+}
+// Sleep the user sees in the review banners: a short sleep counted automatically
+// ('auto_included') needs no explanation there. Editing still checks every period.
+fn has_reviewable_sleep(db: &Connection, entry_id: i64) -> Cmd<bool> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
+    if version < 12 { return Ok(false); }
+    db.query_row("SELECT EXISTS(SELECT 1 FROM sleep_periods WHERE entry_id=?1 AND decision<>'auto_included')", [entry_id], |r| r.get(0)).map_err(db_err)
 }
 fn ensure_no_sleep_periods(db: &Connection, entry_id: i64) -> Cmd<()> {
     if has_sleep_periods(db,entry_id)? { return Err("Wpis zawiera okresy uśpienia. Jego zmiana wymaga pełnej obsługi tych okresów.".into()); }
@@ -1404,7 +1412,10 @@ fn initialise(db: &mut Connection) -> rusqlite::Result<()> {
     optional_task_migration::validate(db)?;
     validate_project_timer_activity(db)?;
     if version <= 12 { entry_drafts::migrate_resolutions(db)?; }
-    entry_drafts::validate_resolution_schema(db)
+    entry_drafts::validate_resolution_schema(db)?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version == sleep_periods::AUTO_INCLUDE_SCHEMA_VERSION - 1 { sleep_periods::migrate_auto_include(db)?; }
+    sleep_periods::validate(db)
 }
 
 // Existing databases are backed up and verified before any schema migration.
@@ -3378,5 +3389,64 @@ mod tests {
         assert_eq!(seconds, 3600); // 3 h wall time minus 2 h pending sleep.
         let periods = sleep_periods::list_for_entry(&tracker.db, 1).unwrap();
         assert_eq!((periods.len(), periods[0].manual_resume, periods[0].decision.as_str()), (1, true, "pending"));
+    }
+
+    // D4 short sleep: a synthetic v13 database (built by the real migrations) is backed up and
+    // migrated to v14 by initialise_with_backup; every sleep row and decision is kept.
+    #[test]
+    fn v13_sleep_ledger_is_backed_up_and_migrated_to_v14_with_identical_rows() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.pragma_update(None, "foreign_keys", true).unwrap();
+        initialise_v10(&mut db).unwrap();
+        optional_task_migration::migrate(&mut db).unwrap();
+        sleep_periods::migrate(&mut db).unwrap();
+        entry_drafts::migrate_resolutions(&mut db).unwrap();
+        let version = |db: &Connection| db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(version(&db), LATEST_SCHEMA_VERSION - 1);
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');
+            INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(1,1,'2026-01-01T09:00:00Z','2026-01-01T12:00:00Z',10800);
+            INSERT INTO time_entries(id,project_id,started_at) VALUES(2,1,'2026-01-02T08:00:00Z');").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T09:00:00Z").unwrap().timestamp_millis();
+        for (offset, length) in [(600_000, 60_000), (1_800_000, 600_000), (3_600_000, 1_200_000)] {
+            db.execute("INSERT INTO sleep_periods(entry_id,started_ms,ended_ms) VALUES(1,?1,?2)", params![start + offset, start + offset + length]).unwrap();
+        }
+        db.execute("UPDATE sleep_periods SET decision='included', decided_ms=?1 WHERE started_ms=?2", params![start + 9_000_000, start + 1_800_000]).unwrap();
+        db.execute("UPDATE sleep_periods SET decision='excluded', decided_ms=?1 WHERE started_ms=?2", params![start + 9_001_000, start + 3_600_000]).unwrap();
+        let running = DateTime::parse_from_rfc3339("2026-01-02T08:30:00Z").unwrap().timestamp_millis();
+        let open = sleep_periods::record_suspend(&mut db, 2, running).unwrap();
+        let rows = |db: &Connection| db.prepare("SELECT id,entry_id,started_ms,ended_ms,manual_resume,decision,decided_ms FROM sleep_periods ORDER BY id").unwrap()
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, Option<i64>>(6)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let before = rows(&db);
+        assert_eq!(before.len(), 4);
+
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tracker-sleep-v14-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        initialise_with_backup(&mut db, &dir, true).unwrap();
+        assert_eq!(version(&db), LATEST_SCHEMA_VERSION);
+        assert_eq!(rows(&db), before, "ids, boundaries, flags and decisions are unchanged");
+        sleep_periods::validate(&db).unwrap();
+        // The short sleep recorded before v14 stays pending: the threshold is not applied retroactively.
+        let pending = pending_sleep(&db).unwrap();
+        assert_eq!(pending.iter().map(|p| p.started_ms).collect::<Vec<_>>(), [start + 600_000, running]);
+        // 3 h minus the pending 1 min and the excluded 20 min; the included 10 min stay work.
+        let tracker = Tracker { db, running_since: None, restored: false };
+        let current = DateTime::parse_from_rfc3339("2026-01-03T10:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(report_data(&tracker, current, Err("unused".into())).unwrap().entries[0].duration_seconds, 10_800 - 60 - 1_200);
+
+        let backup_path = std::fs::read_dir(dir.join("backups")).unwrap().next().unwrap().unwrap().path();
+        storage_safety::preflight_existing(&backup_path).unwrap();
+        let backup = Connection::open_with_flags(&backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(version(&backup), LATEST_SCHEMA_VERSION - 1);
+        assert_eq!(rows(&backup), before);
+        drop(backup);
+        // After the migration a short observed resume is decided automatically.
+        let mut db = tracker.db;
+        sleep_periods::record_resume(&mut db, 2, open, running + 90_000).unwrap();
+        let period = sleep_periods::list_for_entry(&db, 2).unwrap().remove(0);
+        assert_eq!((period.ended_ms, period.decision.as_str()), (Some(running + 90_000), "auto_included"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

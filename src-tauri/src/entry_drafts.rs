@@ -9,7 +9,9 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State};
 
-use crate::{db_err, locked, ui_preferences::save_preference, Cmd, Shared, LATEST_SCHEMA_VERSION};
+use crate::{db_err, locked, ui_preferences::save_preference, Cmd, Shared};
+// The resolution history arrived with schema v13; later versions migrate on top of it.
+const RESOLUTIONS_SCHEMA_VERSION: i64 = 13;
 
 const FORMAT_VERSION: u16 = 1;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -42,7 +44,7 @@ pub(super) fn migrate_resolutions(db: &mut Connection) -> rusqlite::Result<()> {
         CREATE INDEX entry_draft_resolutions_by_entry ON entry_draft_resolutions(entry_id);",
     )?;
     validate_resolution_schema(&tx)?;
-    tx.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", RESOLUTIONS_SCHEMA_VERSION)?;
     tx.commit()
 }
 
@@ -660,6 +662,7 @@ pub(super) fn discard_entry_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LATEST_SCHEMA_VERSION;
 
     fn database() -> Connection {
         let mut db = Connection::open_in_memory().unwrap();
