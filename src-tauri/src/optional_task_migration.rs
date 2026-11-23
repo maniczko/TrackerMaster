@@ -437,6 +437,56 @@ mod tests {
     }
 
     #[test]
+    fn short_sleeps_count_once_without_a_question_and_a_five_minute_sleep_still_asks() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');
+            INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        let threshold = crate::sleep_periods::SHORT_SLEEP_AUTO_INCLUDE_MS;
+        // Each sleep is judged on its own: 1 min, 299 999 ms, exactly 5 min, 1 s.
+        let mut ids = Vec::new();
+        for (offset, length) in [(3_600_000, 60_000), (4_000_000, threshold - 1), (5_000_000, threshold), (6_000_000, 1_000)] {
+            let id = crate::sleep_periods::record_suspend(&mut db, 41, start + offset).unwrap();
+            crate::sleep_periods::record_resume(&mut db, 41, id, start + offset + length).unwrap();
+            ids.push(id);
+        }
+        let decisions: Vec<String> = crate::sleep_periods::list_for_entry(&db, 41).unwrap().into_iter().map(|p| p.decision).collect();
+        assert_eq!(decisions, ["auto_included", "auto_included", "pending", "auto_included"]);
+        let slept = u64::try_from(60_000 + threshold - 1 + threshold + 1_000).unwrap();
+
+        let clock = crate::RunningClock { since: Instant::now(), power: crate::PowerSample { total_ms: 1_000_000, awake_ms: 1_000_000 } };
+        let mut tracker = crate::Tracker { db, running_since: Some(clock), restored: false };
+        // Running at 12:00 (2 h): only the five-minute sleep is withheld; the clock is not uncertain.
+        let noon = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z").unwrap().with_timezone(&Utc);
+        let power = Ok(crate::PowerSample { total_ms: 8_200_000, awake_ms: 8_200_000 - slept });
+        let active = crate::report_data(&tracker, noon, power).unwrap().active.unwrap();
+        assert!(!active.unresolved);
+        assert_eq!(active.duration_seconds, Some((7_200_000 - threshold) / 1000));
+        assert_eq!(crate::pending_sleep(&tracker.db).unwrap().len(), 1);
+
+        let power = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 11_800_000 - slept });
+        transition_with_power(&mut tracker, Some(41), "2026-01-01T13:00:00Z", TimerAction::Stop, power).unwrap();
+        let expected = (10_800_000 - threshold) / 1000; // 10 500 s: the short sleeps are work, once.
+        let stored: i64 = tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=41", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, expected);
+        let current = DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(crate::report_data(&tracker, current, Err("no active timer".into())).unwrap().entries[0].duration_seconds, expected);
+        assert_eq!(crate::client_export_data(&tracker.db, 1).unwrap().entries[0].duration_seconds, expected);
+        let pending = crate::pending_sleep(&tracker.db).unwrap();
+        assert_eq!((pending.len(), pending[0].id), (1, ids[2]));
+
+        // The five-minute sleep is decided as before; automatic decisions cannot be changed.
+        assert!(crate::sleep_periods::resolve(&mut tracker.db, 41, ids[0], false, start + 12_000_000).is_err());
+        crate::sleep_periods::resolve(&mut tracker.db, 41, ids[2], true, start + 12_000_000).unwrap();
+        assert!(crate::pending_sleep(&tracker.db).unwrap().is_empty());
+        assert_eq!(crate::report_data(&tracker, current, Err("no active timer".into())).unwrap().entries[0].duration_seconds, 10_800);
+        assert_eq!(crate::client_export_data(&tracker.db, 1).unwrap().entries[0].duration_seconds, 10_800);
+        assert_eq!(tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=41", [], |r| r.get::<_, i64>(0)).unwrap(), expected);
+    }
+
+    #[test]
     fn open_sleep_period_prevents_stop_without_mutating_the_timer_or_decision() {
         let mut db = Connection::open_in_memory().unwrap();
         crate::initialise(&mut db).unwrap();

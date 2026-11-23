@@ -3,7 +3,8 @@
  * UTC milliseconds avoid local clock changes; intervals are half-open.
  * This is not yet wired to the report or the native sleep detector.
  */
-export type SleepDecision = 'pending' | 'included' | 'excluded';
+// 'auto_included': a short sleep (under 5 min) observed by the app and counted as work without a question (D4, schema v14).
+export type SleepDecision = 'pending' | 'included' | 'excluded' | 'auto_included';
 export type SleepPeriod = {
   id: number;
   entryId: number;
@@ -24,7 +25,7 @@ export function splitSleepTime(entryId: number, startedMs: number, endedMs: numb
   let cursor = startedMs;
   let hasOpenSleep = false;
   for (const p of sorted) {
-    if (!Number.isSafeInteger(p.id) || p.id <= 0 || ids.has(p.id) || p.entryId !== entryId || !Number.isSafeInteger(p.startedMs) || p.startedMs < cursor || p.startedMs < startedMs || p.startedMs >= endedMs || !['pending', 'included', 'excluded'].includes(p.decision)) {
+    if (!Number.isSafeInteger(p.id) || p.id <= 0 || ids.has(p.id) || p.entryId !== entryId || !Number.isSafeInteger(p.startedMs) || p.startedMs < cursor || p.startedMs < startedMs || p.startedMs >= endedMs || !['pending', 'included', 'excluded', 'auto_included'].includes(p.decision)) {
       throw new Error('Nieprawidłowy lub nakładający się okres uśpienia.');
     }
     ids.add(p.id);
@@ -33,7 +34,7 @@ export function splitSleepTime(entryId: number, startedMs: number, endedMs: numb
     const end = p.endedMs ?? endedMs;
     if (!Number.isSafeInteger(end) || end <= p.startedMs || end > endedMs) throw new Error('Nieprawidłowy koniec uśpienia.');
     if (cursor < p.startedMs) segments.push({ startedMs: cursor, endedMs: p.startedMs, kind: 'work' });
-    segments.push({ startedMs: p.startedMs, endedMs: end, kind: p.decision === 'included' ? 'work' : p.decision, sleepId: p.id, ...(open ? { open: true } : {}) });
+    segments.push({ startedMs: p.startedMs, endedMs: end, kind: p.decision === 'included' || p.decision === 'auto_included' ? 'work' : p.decision, sleepId: p.id, ...(open ? { open: true } : {}) });
     cursor = end;
     hasOpenSleep ||= open;
   }
