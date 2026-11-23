@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
 import { calendarWeek, clockText, DAY_MINUTES, MIN_BLOCK_PX, pieceRange, shiftWeek, validCalendarDate, weekLabel, weekStartOf } from './calendarModel';
 import type { CalendarBillable, CalendarBlock, CalendarClockEntry, CalendarFilter } from './calendarModel';
 import { formatDuration as duration } from './reportCsv';
@@ -8,12 +8,22 @@ import { allReportClients, changeReportScope, resolveReportScope } from './repor
 import type { ReportCatalog, ReportScope } from './reportScope';
 import type { AllClientsReport } from './useAllClientsReport';
 import { clientLabels } from './clientLabels';
+import CalendarEntryDialog from './CalendarEntryDialog';
+import type { CalendarEntryRequest } from './CalendarEntryDialog';
+import { defaultEnd, keyboardRange, minuteAt, slotStart } from './calendarEntry';
 import './calendar.css';
 
 type Props = {
   report: AllClientsReport; catalog: ReportCatalog; loaded: boolean; now: number;
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean;
+  /** DEV-26: adding and editing is possible (data current, no other write running). */
+  editable: boolean;
+  /** DEV-26: after a saved entry; refreshes the shared data (calendar, History, report). Throws when the refresh fails. */
+  onEntrySaved: () => Promise<void>;
 };
+/** DEV-26: finished work blocks open the edit form; running, sleep-to-decide and to-verify ones only show details. */
+const editableBlock = (block: CalendarBlock, all: readonly CalendarBlock[]) => block.kind === 'work' && !block.running && block.entryEndMs !== null
+  && !all.some(other => other.entryId === block.entryId && other.kind !== 'work');
 
 // Convenience only (DEV-28): the last week and filters. Never a source of data; failures are ignored.
 const STORAGE_KEY = 'trackermaster.calendar.v1';
@@ -43,7 +53,7 @@ const fullDate = (ms: number, zone: string) => new Intl.DateTimeFormat('pl-PL', 
 const kindLabel = { work: '', pending: 'Uśpienie do rozstrzygnięcia, nie wliczone do sum', unverified: 'Pomiar do weryfikacji, nie wliczony do sum' };
 
 function scopeNote(filtered: boolean, zone: string | undefined): string {
-  return `${filtered ? 'Sumy dotyczą wybranych filtrów, tak jak raport z tymi samymi filtrami.' : 'Sumy dla wszystkich klientów, tak jak w raporcie.'} Dni w strefie raportu${zone ? ` (${zone})` : ''}. Uśpienie do rozstrzygnięcia i pomiar do weryfikacji nie wliczają się do sum. Kalendarz tylko pokazuje wpisy; edycja jest w Historii.`;
+  return `${filtered ? 'Sumy dotyczą wybranych filtrów, tak jak raport z tymi samymi filtrami.' : 'Sumy dla wszystkich klientów, tak jak w raporcie.'} Dni w strefie raportu${zone ? ` (${zone})` : ''}. Uśpienie do rozstrzygnięcia i pomiar do weryfikacji nie wliczają się do sum. Kliknij puste miejsce, aby dodać wpis, albo wpis, aby go poprawić.`;
 }
 
 function blockLabel(block: CalendarBlock): string {
@@ -51,7 +61,7 @@ function blockLabel(block: CalendarBlock): string {
   return `${block.title} — ${block.path}, ${pieceRange(block)}, ${state}`;
 }
 
-export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh }: Props) {
+export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, editable, onEntrySaved }: Props) {
   const [saved] = useState(readSaved);
   const zone = report.read?.data.time_zone;
   const today = zone ? (() => { try { return dateInZone(now, zone); } catch { return null; } })() : null;
@@ -67,6 +77,11 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const body = useRef<HTMLDivElement>(null);
   const dialog = useRef<HTMLDivElement>(null);
   const scrolledFor = useRef('');
+  // DEV-26: the add/edit form, the control that opened it (focus returns there) and the message after it.
+  const [entryForm, setEntryForm] = useState<CalendarEntryRequest | null>(null);
+  const [entryNote, setEntryNote] = useState<{ text: string; problem: boolean } | null>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const addButton = useRef<HTMLButtonElement>(null);
 
   useEffect(() => { if (shownWeek) save({ week: shownWeek, scope, billable }); }, [shownWeek, scope, billable]);
 
@@ -114,6 +129,33 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   }
   function onDialogKey(event: ReactKeyboardEvent) { if (event.key === 'Escape') { event.preventDefault(); close(); } }
   function go(next: string | null) { setSelected(null); setWeek(next); }
+  function openForm(request: CalendarEntryRequest, from: HTMLElement | null) {
+    if (!editable || entryForm) return;
+    opener.current = from; setSelected(null); setEntryNote(null); setEntryForm(request);
+  }
+  function closeForm(note?: string) {
+    setEntryForm(null);
+    if (note) setEntryNote({ text: note, problem: false });
+    const from = opener.current;
+    opener.current = null;
+    window.setTimeout(() => (from?.isConnected ? from : addButton.current)?.focus(), 0);
+  }
+  async function entrySaved(message: string) {
+    try { await onEntrySaved(); setEntryNote({ text: message, problem: false }); }
+    catch (error) { setEntryNote({ text: `${message} Nie udało się odświeżyć widoku: ${String(error)} Odśwież dane w widoku Timer.`, problem: true }); }
+  }
+  function openBlock(block: CalendarBlock, node: HTMLElement) {
+    if (editableBlock(block, blocks)) openForm({ mode: 'edit', entryId: block.entryId }, node);
+    else setSelected(block.key === selected ? null : block.key);
+  }
+  function addAt(date: string, event: ReactMouseEvent<HTMLDivElement>) {
+    if (!view || (event.target as Element).closest('.calendar-block')) return;
+    const box = event.currentTarget.getBoundingClientRect();
+    const minute = minuteAt(event.clientY - box.top, box.height);
+    if (minute === null) return;
+    const start = slotStart(date, minute);
+    openForm({ mode: 'new', start, end: defaultEnd(start, view.zone) }, null);
+  }
   function changeScope(field: keyof ReportScope, value: string) {
     const next = changeReportScope(scope, field, value ? Number(value) : null, catalog);
     setScope(next.scope); setScopeNotice(next.message);
@@ -129,6 +171,8 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
         <button type="button" className="secondary" disabled={!today || (!!shownWeek && !!today && weekStartOf(today) === shownWeek)} onClick={() => go(null)}>Dziś</button>
         <input type="date" className="calendar-date" aria-label="Przejdź do dnia" title="Przejdź do dnia" value={shownWeek ?? ''} min="1970-01-05"
           onChange={event => { if (validCalendarDate(event.target.value)) go(weekStartOf(event.target.value)); }} />
+        <button type="button" ref={addButton} className="secondary calendar-add" aria-label="Dodaj wpis" title="Dodaj wpis (albo kliknij puste miejsce w kalendarzu)"
+          disabled={!view || !editable || !shownWeek} onClick={event => { if (view && shownWeek) openForm({ mode: 'new', ...keyboardRange(shownWeek, today, now, view.zone) }, event.currentTarget); }}>+ Wpis</button>
       </div>
       <h2 className="calendar-range">{view ? weekLabel(view.from, view.through) : 'Tydzień'}</h2>
       <div className="calendar-filters" role="group" aria-label="Filtry kalendarza">
@@ -153,6 +197,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
     </div>
     {noteOpen && <p id="calendar-scope-note" role="note" className="helper calendar-scope-note">{scopeNote(filtered, zone)}</p>}
     {scopeNotice && <p role="status" className="helper">{scopeNotice}</p>}
+    {entryNote && <p role={entryNote.problem ? 'alert' : 'status'} className={entryNote.problem ? 'alert error calendar-entry-note' : 'alert success calendar-entry-note'}>{entryNote.text}</p>}
     {resolved.problem && <p role="alert" className="alert error">{resolved.problem} Wybierz inny filtr.</p>}
     {!loaded ? <p role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie w widoku Timer.</p>
       : report.failed ? <p role="alert" className="alert error">Nie udało się odczytać wpisów do kalendarza. Spróbuj ponownie za chwilę.</p>
@@ -175,13 +220,14 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
             <div className="calendar-canvas" style={{ height: DAY_MINUTES * MINUTE_PX }}>
               <div className="calendar-hours" aria-hidden="true">{Array.from({ length: 24 }, (_, hour) => <span key={hour} style={{ top: hour * HOUR_PX }}>{String(hour).padStart(2, '0')}:00</span>)}</div>
               {view.days.map(day => <div key={day.date} className={day.isToday ? 'calendar-column is-today' : 'calendar-column'} role="group"
-                aria-label={`${new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }).format(utc(day.date))}: ${duration(day.seconds)}, wpisów ${day.blocks.length}`}>
+                aria-label={`${new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }).format(utc(day.date))}: ${duration(day.seconds)}, wpisów ${day.blocks.length}`}
+                data-date={day.date} data-addable={editable || undefined} onClick={event => addAt(day.date, event)}>
                 {day.blocks.length === 0 && <span className="calendar-empty-day">Brak wpisów</span>}
                 {day.blocks.map(block => <button key={block.key} type="button" ref={node => { if (node) blockRefs.current.set(block.key, node); else blockRefs.current.delete(block.key); }}
                   className="calendar-block" data-kind={block.kind} data-size={(block.bottom - block.top) * MINUTE_PX < 44 ? "short" : undefined} data-running={block.running || undefined} data-project-colour={block.colour}
                   aria-label={blockLabel(block)} title={`${block.title}\n${block.path}\n${pieceRange(block)}`} aria-haspopup="dialog" aria-expanded={selected === block.key}
                   style={{ top: block.top * MINUTE_PX, height: (block.bottom - block.top) * MINUTE_PX, left: `${(100 * block.lane) / block.lanes}%`, width: `${100 / block.lanes}%` }}
-                  onClick={() => setSelected(block.key === selected ? null : block.key)}>
+                  onClick={event => openBlock(block, event.currentTarget)}>
                   {(block.bottom - block.top) * MINUTE_PX < 44
                     ? <strong>{block.title} <small>{pieceRange(block)}</small></strong>
                     : <><strong>{block.title}</strong><span>{block.path}</span><small>{pieceRange(block)}</small></>}
@@ -204,8 +250,10 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
           {chosen.kind === 'pending' && <p className="alert">Uśpienie do rozstrzygnięcia nie wlicza się do sum. Rozstrzygnij je na liście okresów uśpienia w widoku Timer.</p>}
           {chosen.kind === 'unverified' && <p className="alert">Pomiar wymaga weryfikacji i nie wlicza się do sum. Rozlicz go w widoku Timer.</p>}
           {chosen.running && chosen.kind === 'work' && <p className="helper">Pomiar trwa od {clockText(chosen.entryStartMs, view.zone)}. Czas zapisze się przy zatrzymaniu.</p>}
-          <p className="helper">Edycja z kalendarza będzie w kolejnym pakiecie. Teraz popraw wpis w Historii.</p>
+          <p className="helper">{chosen.running ? 'Trwającego pomiaru nie edytuje się w kalendarzu.' : 'Tego wpisu nie można edytować w kalendarzu, dopóki ma okres do rozstrzygnięcia lub weryfikacji.'}</p>
         </div>}
+        {entryForm && report.read && <CalendarEntryDialog request={entryForm} zone={view.zone} now={now} catalog={catalog} data={report.read.data}
+          active={snapshotActive} enabled={editable} onClose={closeForm} onSaved={entrySaved} />}
       </>}
   </section>;
 }

@@ -450,7 +450,8 @@ export default function App() {
       </details>
       </div>
       {view === 'calendar' && <CalendarWeek report={allClients} catalog={catalog} loaded={loaded} now={now} snapshotFresh={now - snapshotAt <= 5000}
-        snapshotActive={data.active ? { id: data.active.id, project_id: data.active.project_id, task_id: data.active.task_id, started_at: data.active.started_at, description: data.active.description, billable: data.active.billable, recovered: data.active.recovered, uncertain: data.active.uncertain } : null} />}
+        snapshotActive={data.active ? { id: data.active.id, project_id: data.active.project_id, task_id: data.active.task_id, started_at: data.active.started_at, description: data.active.description, billable: data.active.billable, recovered: data.active.recovered, uncertain: data.active.uncertain } : null}
+        editable={loaded && !busy} onEntrySaved={async () => { setReportRevision(version => version + 1); await refresh(); }} />}
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
     </main>
   </div>;

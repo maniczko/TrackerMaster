@@ -46,7 +46,8 @@ export type DraftSourceStatus =
 
 type DraftRange = { startedAt: string; endedAt: string };
 export type DraftApplication =
-  | { kind: 'correction'; base: DraftSource; range: DraftRange | null; description: string }
+  // billable: only the calendar form sends it (DEV-26); omitted, billing stays as it is.
+  | { kind: 'correction'; base: DraftSource; range: DraftRange | null; description: string; billable?: boolean }
   | { kind: 'new_entry'; databaseId: string; clientId: number; projectId: number; taskId: number | null; range: DraftRange; description: string };
 
 export const editableFields: readonly EditableField[] = ['start', 'end', 'description'];
