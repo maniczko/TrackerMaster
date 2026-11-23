@@ -346,7 +346,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -974,6 +974,135 @@ async function verifyCalendar(cdp, sessionId) {
   await invoke('stop_timer', { expectedActiveId: running.id });
   await waitFor('calendar timer stopped', async () => (await active()) === null);
   console.log('PASS: calendar week equals the report (midnight and DST), navigation and keyboard details, and the timer survives view changes');
+}
+
+// DEV-25 / PTT-46 (calendar package C): the month grid. Fixed entries in October 2025 of a dedicated client,
+// so nothing depends on the runner's clock; expected figures are the report's own (reportByDay) for the same
+// entries in Europe/Warsaw (tests/calendarMonthModel.test.ts, "E2E fixture month").
+const calendarMonthFixture = {
+  client: 'Klient kalendarza miesięcznego E2E', project: 'Miesiąc z przełomami',
+  entries: [
+    ['2025-09-30T21:50:00Z', '2025-09-30T22:10:00Z', 'Miesiąc: przełom września 23:50–00:10'],
+    ['2025-10-01T08:00:00Z', '2025-10-01T09:30:00Z', 'Miesiąc: pierwszy dzień'],
+    ...[0, 15, 30, 45, 60].map((minutes, index) => {
+      const at = Date.parse('2025-10-15T07:00:00Z') + minutes * 60_000;
+      return [new Date(at).toISOString().replace('.000', ''), new Date(at + 10 * 60_000).toISOString().replace('.000', ''), `Miesiąc: krótki wpis ${index + 1}`];
+    }),
+    ['2025-10-25T23:00:00Z', '2025-10-26T01:00:00Z', 'Miesiąc: zmiana czasu'],
+    ['2025-10-31T22:50:00Z', '2025-10-31T23:10:00Z', 'Miesiąc: przełom października 23:50–00:10'],
+  ],
+  month: '2025-10', heading: 'październik 2025', rows: 5, total: '04:40:00',
+  cells: { '2025-09-30': '00:10', '2025-10-01': '01:40', '2025-10-15': '00:50', '2025-10-26': '02:00', '2025-10-31': '00:10', '2025-11-01': '00:10' },
+  outside: ['2025-09-30', '2025-11-01'], many: '2025-10-15', manyCount: 5, week: '13–19 października 2025', weekTotal: '00:50:00',
+};
+async function verifyCalendarMonth(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const press = async (key, code, keyCode, text) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode, ...(text ? { text } : {}) }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode }, sessionId);
+  };
+  assert.equal((await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } })).time_zone, 'Europe/Warsaw');
+  const clientId = await invoke('create_client', { name: calendarMonthFixture.client });
+  const projectId = await invoke('create_project', { clientId, name: calendarMonthFixture.project });
+  for (const [startedAt, endedAt, description] of calendarMonthFixture.entries) {
+    await invoke('create_project_manual_entry', { projectId, taskId: null, startedAt, endedAt, description });
+  }
+  const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  const modeButton = label => `[...document.querySelectorAll('.calendar-mode button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${viewButton('Kalendarz')}.click()`);
+  await waitFor('calendar opens', () => evaluate(`Boolean(${modeButton('Miesiąc')})`));
+  await evaluate(`${modeButton('Miesiąc')}.click()`);
+  await waitFor('month view opens', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-month-total')) && ${modeButton('Miesiąc')}.getAttribute('aria-pressed') === 'true'`));
+  await evaluate(`(() => {
+    const input = document.querySelector('[aria-label="Kalendarz"] input[type="month"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(calendarMonthFixture.month)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  })()`);
+  const read = `(() => {
+    const root = document.querySelector('[aria-label="Kalendarz"]');
+    const cells = Object.fromEntries([...root.querySelectorAll('.month-cell')].map(cell => [cell.dataset.date, {
+      total: cell.querySelector('.month-day-total')?.textContent ?? '', outside: cell.classList.contains('is-outside'),
+      shown: cell.querySelectorAll('.month-entry').length, more: cell.querySelector('.month-more')?.textContent ?? '',
+      label: cell.getAttribute('aria-label') }]));
+    return { heading: root.querySelector('.calendar-range')?.textContent, total: root.querySelector('.calendar-month-total')?.textContent,
+      rows: root.querySelectorAll('.month-row').length - 1, cells };
+  })()`;
+  // The entries were created outside the window's own actions; the shared report read follows the snapshot.
+  let last = null;
+  const month = await waitFor('fixture month shown', async () => {
+    last = await evaluate(read);
+    return last.heading === calendarMonthFixture.heading && last.total === calendarMonthFixture.total ? last : null;
+  }).catch(error => { throw new Error(`${error.message}; last month state: ${JSON.stringify(last && { heading: last.heading, total: last.total })}`); });
+  assert.equal(month.rows, calendarMonthFixture.rows, 'October 2025 is a 5-row month');
+  for (const [date, total] of Object.entries(calendarMonthFixture.cells)) {
+    assert.equal(month.cells[date]?.total, total, `cell ${date} differs from the report`);
+  }
+  for (const date of calendarMonthFixture.outside) assert.equal(month.cells[date].outside, true, `${date} must be styled as a neighbouring month`);
+  assert.equal(month.cells['2025-10-01'].outside, false);
+  // The neighbouring days' 00:10 are drawn but not added: the month total is the October days only.
+  assert.equal(month.cells[calendarMonthFixture.many].shown, 3);
+  assert.equal(month.cells[calendarMonthFixture.many].more, `+${calendarMonthFixture.manyCount - 3}`);
+  assert.ok(month.cells['2025-10-01'].label.includes('01:40:00'), 'the cell label carries the exact seconds');
+
+  // UI_LAYOUT: no cell content overflows, no horizontal page scroll, 40 px controls; 1280×720 and 125 % DPI.
+  for (const [name, metrics] of [['calendar-month-1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }],
+    ['calendar-month-1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
+    try {
+      await waitFor(`month at ${name}`, () => evaluate(`window.innerWidth === ${metrics.width} && window.innerHeight === ${metrics.height}`));
+      await delay(300);
+      const layout = await evaluate(`(() => {
+        const over = element => element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1;
+        const cells = [...document.querySelectorAll('.month-cell')];
+        const entries = [...document.querySelectorAll('.month-entry')];
+        const controls = [...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-toolbar button, [aria-label="Kalendarz"] .calendar-toolbar select, [aria-label="Kalendarz"] .calendar-toolbar input')];
+        const box = cells[0].getBoundingClientRect();
+        window.scrollTo(0, 0);
+        return { cells: cells.length, overflowingCells: cells.filter(over).map(cell => cell.dataset.date),
+          entriesOutside: entries.filter(entry => { const a = entry.getBoundingClientRect(), b = entry.closest('.month-cell').getBoundingClientRect(); return a.right > b.right + 0.5 || a.bottom > b.bottom + 0.5; }).length,
+          smallControls: controls.filter(control => control.getBoundingClientRect().height < 40).map(control => control.getAttribute('aria-label') || control.textContent.trim()),
+          cellWidth: Math.round(box.width), cellHeight: Math.round(box.height),
+          scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
+      })()`);
+      console.log(`UI_LAYOUT ${name} ${JSON.stringify(layout)}`);
+      assert.equal(layout.cells, calendarMonthFixture.rows * 7);
+      assert.deepEqual(layout.overflowingCells, [], 'a month cell overflows');
+      assert.equal(layout.entriesOutside, 0, 'an entry leaves its cell');
+      assert.deepEqual(layout.smallControls, [], 'a calendar control is lower than 40 px');
+      assert.ok(layout.scrollWidth <= layout.clientWidth, 'the month page scrolls horizontally');
+      await saveScreenshot(cdp, sessionId, name);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+
+  // Keyboard: arrows move between days, Enter opens the day's details, Escape closes them.
+  await evaluate(`document.querySelector('.month-cell[data-date="2025-10-14"]').focus()`);
+  await press('ArrowRight', 'ArrowRight', 39);
+  await waitFor('arrow moves to the next day', () => evaluate(`document.activeElement?.dataset.date === ${JSON.stringify(calendarMonthFixture.many)}`));
+  await press('Enter', 'Enter', 13, '\r');
+  await waitFor('day details open', () => evaluate(`document.querySelectorAll('.month-details li').length === ${calendarMonthFixture.manyCount}`));
+  assert.ok((await evaluate(`document.querySelector('.month-details-total')?.textContent`)).includes(calendarMonthFixture.weekTotal));
+  await press('Escape', 'Escape', 27);
+  await waitFor('day details closed, focus back on the day', () => evaluate(`!document.querySelector('.month-details') && document.activeElement?.dataset.date === ${JSON.stringify(calendarMonthFixture.many)}`));
+  // A day leads to its week, with the same total as the week view.
+  await press('Enter', 'Enter', 13, '\r');
+  await waitFor('day details open again', () => evaluate(`Boolean(document.querySelector('.month-details'))`));
+  await evaluate(`[...document.querySelectorAll('.month-details button')].find(button => button.textContent.trim() === 'Pokaż tydzień').click()`);
+  await waitFor('week of the chosen day', () => evaluate(`document.querySelector('.calendar-range')?.textContent === ${JSON.stringify(calendarMonthFixture.week)} && document.querySelector('.calendar-week-total')?.textContent === ${JSON.stringify(calendarMonthFixture.weekTotal)}`));
+  // Back to the month: it remembers October 2025; then the calendar is left in the week view for later runs.
+  await evaluate(`${modeButton('Miesiąc')}.click()`);
+  await waitFor('month remembered', () => evaluate(`document.querySelector('.calendar-range')?.textContent === ${JSON.stringify(calendarMonthFixture.heading)} && document.querySelector('.calendar-month-total')?.textContent === ${JSON.stringify(calendarMonthFixture.total)}`));
+  await evaluate(`${modeButton('Tydzień')}.click()`);
+  await evaluate(`${viewButton('Timer')}.click()`);
+  await waitFor('timer view again', () => evaluate(`!document.querySelector('.timer-view').hidden`));
+  console.log('PASS: calendar month equals the report (month ends, DST, neighbouring days not counted), +N, no overflow at 1280x720 and 125 %, keyboard and the way to the week');
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
@@ -2191,6 +2320,7 @@ async function runWindow(port, phase, recovery) {
       await verifyDuplicateClientChoices(cdp, sessionId);
     }
     if (phase === 'calendar') await verifyCalendar(cdp, sessionId);
+    if (phase === 'calendar-month') await verifyCalendarMonth(cdp, sessionId);
     if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
@@ -2309,6 +2439,9 @@ try {
   // DEV-24: calendar week with fixed entries (separate client), before PTT-36 adds its own entries.
   await waitForWindowClosed(port);
   await runWindow(port, 'calendar', recovery);
+  // DEV-25: calendar month with fixed entries in October 2025 (separate client).
+  await waitForWindowClosed(port);
+  await runWindow(port, 'calendar-month', recovery);
   // PTT-36: T20 (Stop, Switch, correction with an unwritable database, then one retry) and
   // T26 (the unsaved correction survives a restart and is saved exactly once).
   await waitForWindowClosed(port);

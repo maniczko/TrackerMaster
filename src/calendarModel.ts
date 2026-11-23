@@ -171,6 +171,20 @@ const inScope = (scope: ReportScope, catalog: ReportCatalog, projectId: Id, task
 const billableMatch = (billable: CalendarBillable, value: boolean) => billable === 'all' || (billable === 'billable') === value;
 
 /**
+ * The report data a calendar view counts: the totals base for the snapshot's timer state, filtered by
+ * billability before the report runs. Shared by the week and the month (DEV-25), so both count the same.
+ */
+export function calendarData(data: CalendarReportData, filter: CalendarFilter, snapshotActive: CalendarClockEntry | null): CalendarReportData {
+  const clock = snapshotActive ? { id: snapshotActive.id, recovered: snapshotActive.recovered, uncertain: snapshotActive.uncertain } : null;
+  const base = totalsBaseData(data, clock);
+  return {
+    ...base,
+    entries: base.entries.filter(entry => billableMatch(filter.billable, entry.billable)),
+    active: base.active && billableMatch(filter.billable, base.active.billable) ? base.active : null,
+  };
+}
+
+/**
  * The week view model. `now` drives the live block and the "now" line. Day totals are the report's day
  * totals for the same filters (client, project, task via the report scope; billable by filtering entries
  * before the report runs). A resolved running timer counts like in the report, and only the time after
@@ -186,13 +200,7 @@ export function calendarWeek(input: {
   if (!validTimeZone(zone) || !validCalendarDate(input.weekStart)) return null;
   const dates = weekDates(input.weekStart);
   const from = dates[0], through = dates[6];
-  const clock = snapshotActive ? { id: snapshotActive.id, recovered: snapshotActive.recovered, uncertain: snapshotActive.uncertain } : null;
-  const base = totalsBaseData(input.data, clock);
-  const data: CalendarReportData = {
-    ...base,
-    entries: base.entries.filter(entry => billableMatch(filter.billable, entry.billable)),
-    active: base.active && billableMatch(filter.billable, base.active.billable) ? base.active : null,
-  };
+  const data = calendarData(input.data, filter, snapshotActive);
   const view = makeReportView(data, catalog, filter.scope, from, through);
   const totals = addDaySeconds(new Map(), view.liveDays);
   const sources = new Map<string, CompletedReportEntry | ActiveReportEntry>();

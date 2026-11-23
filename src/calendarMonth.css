@@ -1,0 +1,61 @@
+/* Calendar month (DEV-25): Quiet Precision tokens from app.css only; no colours or custom properties here. */
+/* Tydzień | Miesiąc switch at the start of the calendar toolbar (both views). */
+.calendar-mode { display: inline-flex; gap: var(--space-1); padding: 2px; border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-surface-muted); }
+.app-shell .calendar-mode button { min-width: 88px; min-height: var(--control-h); border-color: transparent; background: transparent; color: var(--color-text-muted); }
+.app-shell .calendar-mode button[aria-pressed='true'] { background: var(--color-surface); border-color: var(--color-border-control); color: var(--color-accent-strong); box-shadow: var(--shadow-control); }
+.app-shell .calendar-month-picker { width: 160px; }
+
+/* The grid: 7 equal columns, 4–6 rows; every cell has the same fixed content box and never grows. */
+.month-grid { border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow: hidden; background: var(--color-surface); }
+.month-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.month-row + .month-row { border-top: 1px solid var(--color-border); }
+.month-head { background: var(--color-surface-muted); }
+.month-weekday { padding: var(--space-1) var(--space-2); color: var(--color-text-muted); font-size: var(--text-xs); font-weight: 650; text-align: left; }
+.month-weekday + .month-weekday, .month-cell-wrap + .month-cell-wrap { border-left: 1px solid var(--color-border); }
+.month-cell-wrap { min-width: 0; }
+
+.app-shell .month-cell { box-sizing: border-box; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 2px;
+  width: 100%; height: 104px; min-height: 0; min-width: 0; padding: var(--space-1) var(--space-2); overflow: hidden;
+  border: 0; border-radius: 0; background: var(--color-surface); color: var(--color-text); font-size: var(--text-xs); font-weight: 500; line-height: 1.3; text-align: left; box-shadow: none; }
+.app-shell .month-cell:hover:not(:disabled) { background: var(--color-accent-soft); }
+.app-shell .month-cell:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--color-focus); outline-offset: -2px; }
+.app-shell .month-cell.is-outside { background: var(--color-surface-muted); color: var(--color-text-muted); }
+.app-shell .month-cell.is-today { box-shadow: inset 0 3px 0 var(--color-accent); }
+.app-shell .month-cell.is-selected { background: var(--color-accent-soft); outline: 2px solid var(--color-accent-strong); outline-offset: -2px; }
+.month-cell-top { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-1); min-width: 0; }
+.month-day { font-size: var(--text-sm); font-weight: 650; font-variant-numeric: tabular-nums; }
+.month-cell.is-today .month-day { color: var(--color-accent-strong); }
+.month-day-total { overflow: hidden; color: var(--color-text); font-size: var(--text-sm); font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.month-cell.is-outside .month-day-total { color: var(--color-text-muted); font-weight: 500; }
+.month-entries { display: flex; flex-direction: column; gap: 1px; min-width: 0; overflow: hidden; }
+/* An entry: one shortened line; the project colour is the left edge, text stays on a light surface. */
+.month-entry { display: block; min-width: 0; padding: 0 var(--space-1) 0 6px; overflow: hidden; border-left: 3px solid var(--color-accent); border-radius: 2px; background: var(--color-surface-muted);
+  color: var(--color-text); font-size: var(--text-xs); white-space: nowrap; text-overflow: ellipsis; }
+.month-cell.is-outside .month-entry { color: var(--color-text-muted); }
+.month-entry[data-running='true'][data-kind='work'] { background: var(--color-success-bg); }
+.month-entry[data-kind='pending'], .month-entry[data-kind='unverified'] { border-left-style: dashed; background: var(--color-pending-bg); color: var(--color-pending-text); }
+.month-entry[data-project-colour='1'], .month-details-list li[data-project-colour='1'] { border-left-color: var(--project-1); }
+.month-entry[data-project-colour='2'], .month-details-list li[data-project-colour='2'] { border-left-color: var(--project-2); }
+.month-entry[data-project-colour='3'], .month-details-list li[data-project-colour='3'] { border-left-color: var(--project-3); }
+.month-entry[data-project-colour='4'], .month-details-list li[data-project-colour='4'] { border-left-color: var(--project-4); }
+.month-entry[data-project-colour='5'], .month-details-list li[data-project-colour='5'] { border-left-color: var(--project-5); }
+.month-entry[data-project-colour='6'], .month-details-list li[data-project-colour='6'] { border-left-color: var(--project-6); }
+.month-entry[data-project-colour='7'], .month-details-list li[data-project-colour='7'] { border-left-color: var(--project-7); }
+.month-entry[data-project-colour='8'], .month-details-list li[data-project-colour='8'] { border-left-color: var(--project-8); }
+.month-more { color: var(--color-text-muted); font-size: var(--text-xs); font-weight: 650; }
+
+/* Day details (read only). */
+.month-details-total { margin: var(--space-2) 0; font-size: var(--text-sm); }
+.month-details-total strong { font-variant-numeric: tabular-nums; }
+.month-details-list { display: flex; flex-direction: column; gap: var(--space-2); max-height: 320px; margin: 0 0 var(--space-3); padding: 0; overflow-y: auto; list-style: none; }
+.month-details-list li { display: flex; flex-direction: column; min-width: 0; padding: var(--space-1) var(--space-2); border-left: 4px solid var(--color-accent); border-radius: var(--radius-sm); background: var(--color-surface-muted); font-size: var(--text-sm); }
+.month-details-list li[data-kind='pending'], .month-details-list li[data-kind='unverified'] { border-left-style: dashed; background: var(--color-pending-bg); color: var(--color-pending-text); }
+.month-details-list strong, .month-details-list span, .month-details-list small { overflow-wrap: anywhere; }
+.month-details-list span, .month-details-list small { color: var(--color-text-muted); font-size: var(--text-xs); }
+.month-details-list li[data-kind='pending'] span, .month-details-list li[data-kind='pending'] small,
+.month-details-list li[data-kind='unverified'] span, .month-details-list li[data-kind='unverified'] small { color: var(--color-pending-text); }
+
+/* The cell keeps its height at 125 % DPI too (date, three entries and "+N" fit); a low window scrolls the page. */
+@media (forced-colors: active) {
+  .month-cell, .month-entry { forced-color-adjust: auto; border-color: CanvasText; }
+}
