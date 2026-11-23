@@ -39,4 +39,4 @@ Opcja `--strict` zwraca kod wyjścia 1 przy błędach danych (brak ID, nieznany 
 
 To weryfikator **snapshotów**. Nie ma dostępu na żywo do Notion ani do GitHub bez dostarczonego aktualnego eksportu i nie zapewnia pełnego pokrycia wszystkich 55 kart, jeśli wejście ma mniej rekordów. Nie weryfikuje treści każdego acceptance criterion, podpisu Store ani niezależnej tożsamości recenzenta. Nie wykorzystuj jego wyniku jako QA PASS. Docelowa integracja API/GitHub Actions wymaga osobnego projektu uprawnień i testów; nie zapisuj tokenów w kodzie.
 
-Powiązane zasady: [WORKFLOW-GOVERNANCE.md](WORKFLOW-GOVERNANCE.md) w PR #66. Ten audyt jest osobnym małym PR i wymaga oddzielnej akceptacji scalania.
+Powiązane zasady: [Draft PR #66 — WORKFLOW-GOVERNANCE.md](https://github.com/maniczko/TrackerMaster/pull/66) (dokument nie jest jeszcze dostępny na `main`). Ten audyt jest osobnym małym PR i wymaga oddzielnej akceptacji scalania.
