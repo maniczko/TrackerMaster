@@ -928,13 +928,21 @@ async function verifyCalendar(cdp, sessionId) {
           inside: box.left >= area.left - 0.5 && box.right <= area.right + 0.5 };
       }));
       const overlaps = blocks.filter((a, i) => blocks.some((b, j) => j > i && a.day === b.day && a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5)).length;
+      window.scrollTo(0, 0);
+      const body = document.querySelector('.calendar-body'); const head = document.querySelector('.calendar-head');
+      const hour = document.querySelectorAll('.calendar-hours span')[2].getBoundingClientRect().top - document.querySelectorAll('.calendar-hours span')[1].getBoundingClientRect().top;
+      const visibleAxis = Math.min(body.getBoundingClientRect().bottom, window.innerHeight) - head.getBoundingClientRect().bottom;
       return { count: blocks.length, minHeight: Math.min(...blocks.map(block => block.height)), allInside: blocks.every(block => block.inside), overlaps,
+        visibleAxis: Math.round(visibleAxis), visibleHours: Math.round(10 * visibleAxis / hour) / 10, headSticky: getComputedStyle(head).position,
         scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
     })()`);
     console.log(`UI_LAYOUT calendar-week 1280x720 ${JSON.stringify(layout)}`);
     assert.ok(layout.allInside && layout.overlaps === 0, 'calendar blocks leave their column or cover each other');
     assert.ok(layout.minHeight >= 24, 'a calendar block is lower than 24 px');
     assert.ok(layout.scrollWidth <= layout.clientWidth, 'the calendar page scrolls horizontally');
+    // PR #63 review: the grid fills the window; at least 8 hours of the axis are visible at 1280×720.
+    assert.ok(layout.visibleHours >= 8, `only ${layout.visibleHours} h of the calendar axis are visible at 1280x720`);
+    assert.equal(layout.headSticky, 'sticky');
     await saveScreenshot(cdp, sessionId, 'calendar-week-1280x720');
   } finally {
     await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);

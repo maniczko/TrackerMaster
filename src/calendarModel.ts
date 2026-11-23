@@ -28,6 +28,8 @@ export type CalendarClockEntry = {
 export const DAY_MINUTES = 24 * 60;
 /** Smallest block height on the axis (minutes), so a 1-minute entry stays visible and clickable. */
 export const MIN_BLOCK_MINUTES = 24;
+/** Smallest block height on screen (WCAG 2.5.8 target); the view converts it to minutes for its scale. */
+export const MIN_BLOCK_PX = 24;
 
 // ---------- Dates and weeks (reporting zone) ----------
 

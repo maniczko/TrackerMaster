@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
-import { calendarWeek, clockText, DAY_MINUTES, pieceRange, shiftWeek, validCalendarDate, weekLabel, weekStartOf } from './calendarModel';
+import { calendarWeek, clockText, DAY_MINUTES, MIN_BLOCK_PX, pieceRange, shiftWeek, validCalendarDate, weekLabel, weekStartOf } from './calendarModel';
 import type { CalendarBillable, CalendarBlock, CalendarClockEntry, CalendarFilter } from './calendarModel';
 import { formatDuration as duration } from './reportCsv';
 import { dateInZone } from './reportTime';
@@ -30,13 +30,21 @@ function readSaved(): Saved {
 }
 function save(value: Saved) { try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value)); } catch { /* convenience only */ } }
 
-const HOUR_PX = 60;
+// 40 px per hour: about 10 hours of the axis at 1280×720 and 6 at 125 % DPI (PO, PR #63 review).
+const HOUR_PX = 40;
 const MINUTE_PX = HOUR_PX / 60;
+const MIN_MINUTES = Math.ceil(MIN_BLOCK_PX / MINUTE_PX);
+/** Smallest height of the scrolling grid when the window is very low; the page scrolls below that. */
+const MIN_GRID_PX = 240;
 const weekday = new Intl.DateTimeFormat('pl-PL', { weekday: 'short', timeZone: 'UTC' });
 const dayNumber = new Intl.DateTimeFormat('pl-PL', { day: 'numeric', month: 'numeric', timeZone: 'UTC' });
 const utc = (date: string) => { const [y, m, d] = date.split('-').map(Number); return Date.UTC(y, m - 1, d); };
 const fullDate = (ms: number, zone: string) => new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short', timeZone: zone }).format(ms);
 const kindLabel = { work: '', pending: 'Uśpienie do rozstrzygnięcia, nie wliczone do sum', unverified: 'Pomiar do weryfikacji, nie wliczony do sum' };
+
+function scopeNote(filtered: boolean, zone: string | undefined): string {
+  return `${filtered ? 'Sumy dotyczą wybranych filtrów, tak jak raport z tymi samymi filtrami.' : 'Sumy dla wszystkich klientów, tak jak w raporcie.'} Dni w strefie raportu${zone ? ` (${zone})` : ''}. Uśpienie do rozstrzygnięcia i pomiar do weryfikacji nie wliczają się do sum. Kalendarz tylko pokazuje wpisy; edycja jest w Historii.`;
+}
 
 function blockLabel(block: CalendarBlock): string {
   const state = block.kind !== 'work' ? kindLabel[block.kind] : block.running ? `w trakcie, ${duration(block.seconds)} w tym dniu` : duration(block.seconds);
@@ -52,6 +60,8 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const [billable, setBillable] = useState<CalendarBillable>(saved.billable ?? 'all');
   const [selected, setSelected] = useState<string | null>(null);
   const [scopeNotice, setScopeNotice] = useState('');
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [gridHeight, setGridHeight] = useState<number | null>(null);
   const shownWeek = week ?? (today ? weekStartOf(today) : null);
   const blockRefs = useRef(new Map<string, HTMLButtonElement>());
   const body = useRef<HTMLDivElement>(null);
@@ -64,7 +74,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const filter: CalendarFilter = { scope, billable };
   const view = useMemo(() => {
     if (!report.read || !shownWeek || resolved.problem) return null;
-    try { return calendarWeek({ data: report.read.data, catalog, filter, weekStart: shownWeek, now, snapshotActive, snapshotFresh }); }
+    try { return calendarWeek({ data: report.read.data, catalog, filter, weekStart: shownWeek, now, snapshotActive, snapshotFresh, minMinutes: MIN_MINUTES }); }
     catch { return null; }
   }, [report.read, catalog, scope, billable, shownWeek, now, snapshotActive, snapshotFresh, resolved.problem]);
   const blocks = view ? view.days.flatMap(day => day.blocks) : [];
@@ -72,13 +82,27 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const filtered = scope.clientId !== null || billable !== 'all';
   const clientLabelById = useMemo(() => clientLabels(catalog.clients as { id: number | string; name: string }[]), [catalog.clients]);
 
-  // Scroll once per week: to the current hour this week, else to the first entry, else to 07:00.
+  // Scroll once per week: this week to two hours before now, other weeks to about 08:00.
   useLayoutEffect(() => {
     if (!view || !body.current || scrolledFor.current === view.from) return;
     scrolledFor.current = view.from;
-    const first = Math.min(...blocks.map(block => block.top), Infinity);
-    const minute = view.nowMinute !== null ? view.nowMinute - 120 : Number.isFinite(first) ? first - 30 : 7 * 60;
+    const minute = view.nowMinute !== null ? view.nowMinute - 120 : 8 * 60 - 30;
     body.current.scrollTop = Math.max(0, minute) * MINUTE_PX;
+  });
+  // The grid fills the rest of the window and scrolls inside; the day header stays on top (sticky).
+  useLayoutEffect(() => {
+    function fit() {
+      const node = body.current;
+      if (!node) return;
+      const top = node.getBoundingClientRect().top + window.scrollY;
+      const card = node.closest('.calendar');
+      const below = card ? card.getBoundingClientRect().bottom - node.getBoundingClientRect().bottom : 0;
+      const next = Math.max(MIN_GRID_PX, Math.floor(window.innerHeight - top - below - 8));
+      setGridHeight(current => current === next ? current : next);
+    }
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
   });
   useEffect(() => { if (chosen) dialog.current?.focus(); }, [chosen?.key]);
   useEffect(() => { if (selected && !chosen) setSelected(null); }, [selected, chosen]);
@@ -103,32 +127,31 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
         <button type="button" className="secondary" aria-label="Poprzedni tydzień" disabled={!shownWeek} onClick={() => shownWeek && go(shiftWeek(shownWeek, -1))}>‹</button>
         <button type="button" className="secondary" aria-label="Następny tydzień" disabled={!shownWeek} onClick={() => shownWeek && go(shiftWeek(shownWeek, 1))}>›</button>
         <button type="button" className="secondary" disabled={!today || (!!shownWeek && !!today && weekStartOf(today) === shownWeek)} onClick={() => go(null)}>Dziś</button>
-        <label className="calendar-date">Przejdź do dnia<input type="date" value={shownWeek ?? ''} min="1970-01-05"
-          onChange={event => { if (validCalendarDate(event.target.value)) go(weekStartOf(event.target.value)); }} /></label>
+        <input type="date" className="calendar-date" aria-label="Przejdź do dnia" title="Przejdź do dnia" value={shownWeek ?? ''} min="1970-01-05"
+          onChange={event => { if (validCalendarDate(event.target.value)) go(weekStartOf(event.target.value)); }} />
       </div>
-      <div className="calendar-heading">
-        <h2>{view ? weekLabel(view.from, view.through) : 'Tydzień'}</h2>
-        <p><span>Suma tygodnia</span> <strong className="calendar-week-total" aria-live="off">{view ? duration(view.weekSeconds) : '—'}</strong></p>
-      </div>
-    </div>
-    <div className="selectors calendar-filters" role="group" aria-label="Filtry kalendarza">
-      <label>Klient<select value={scope.clientId ?? ''} onChange={event => changeScope('clientId', event.target.value)}>
+      <h2 className="calendar-range">{view ? weekLabel(view.from, view.through) : 'Tydzień'}</h2>
+      <div className="calendar-filters" role="group" aria-label="Filtry kalendarza">
+      <select aria-label="Klient" title="Klient" value={scope.clientId ?? ''} onChange={event => changeScope('clientId', event.target.value)}>
         <option value="">Wszyscy klienci</option>
         {catalog.clients.map(item => <option key={item.id} value={item.id}>{clientLabelById.get(String(item.id)) ?? item.name}{item.archived ? ' (archiwum)' : ''}</option>)}
-      </select></label>
-      <label>Projekt<select value={scope.projectId ?? ''} disabled={!resolved.client} onChange={event => changeScope('projectId', event.target.value)}>
-        <option value="">{resolved.client ? 'Wszystkie projekty' : 'Najpierw wybierz klienta'}</option>
+      </select>
+      <select aria-label="Projekt" title="Projekt" value={scope.projectId ?? ''} disabled={!resolved.client} onChange={event => changeScope('projectId', event.target.value)}>
+        <option value="">{resolved.client ? 'Wszystkie projekty' : 'Projekt: najpierw klient'}</option>
         {projectChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.archived ? ' (archiwum)' : ''}</option>)}
-      </select></label>
-      <label>Zadanie<select value={scope.taskId ?? ''} disabled={!resolved.project} onChange={event => changeScope('taskId', event.target.value)}>
-        <option value="">{resolved.project ? 'Wszystkie zadania i wpisy bez zadania' : 'Najpierw wybierz projekt'}</option>
+      </select>
+      <select aria-label="Zadanie" title="Zadanie" value={scope.taskId ?? ''} disabled={!resolved.project} onChange={event => changeScope('taskId', event.target.value)}>
+        <option value="">{resolved.project ? 'Wszystkie zadania' : 'Zadanie: najpierw projekt'}</option>
         {taskChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.archived ? ' (archiwum)' : ''}</option>)}
-      </select></label>
-      <label>Rozliczalność<select value={billable} onChange={event => setBillable(event.target.value as CalendarBillable)}>
-        <option value="all">Wszystkie wpisy</option><option value="billable">Tylko rozliczalne</option><option value="nonbillable">Tylko nierozliczalne</option>
-      </select></label>
+      </select>
+      <select aria-label="Rozliczalność" title="Rozliczalność" value={billable} onChange={event => setBillable(event.target.value as CalendarBillable)}>
+        <option value="all">Rozliczalne i nie</option><option value="billable">Tylko rozliczalne</option><option value="nonbillable">Tylko nierozliczalne</option>
+      </select>
+      </div>
+      <p className="calendar-total"><span>{filtered ? 'Suma (filtry)' : 'Suma'}</span> <strong className="calendar-week-total" aria-live="off">{view ? duration(view.weekSeconds) : '—'}</strong>
+        <button type="button" className="secondary calendar-info" aria-label="Jak liczone są sumy" aria-expanded={noteOpen} aria-controls="calendar-scope-note" title={scopeNote(filtered, zone)} onClick={() => setNoteOpen(open => !open)}><span aria-hidden="true">i</span></button></p>
     </div>
-    <p className="helper calendar-scope-note">{filtered ? 'Sumy dotyczą wybranych filtrów, tak jak w raporcie z tymi samymi filtrami.' : 'Sumy dla wszystkich klientów, tak jak w raporcie. Czas w strefie raportu'}{zone ? ` (${zone}).` : '.'}{' '}Kalendarz tylko pokazuje wpisy; edycja jest w Historii.</p>
+    {noteOpen && <p id="calendar-scope-note" role="note" className="helper calendar-scope-note">{scopeNote(filtered, zone)}</p>}
     {scopeNotice && <p role="status" className="helper">{scopeNotice}</p>}
     {resolved.problem && <p role="alert" className="alert error">{resolved.problem} Wybierz inny filtr.</p>}
     {!loaded ? <p role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie w widoku Timer.</p>
@@ -142,7 +165,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
         {view.pendingPeriodCount > 0 && <p role="status" className="alert">Uśpienie do rozstrzygnięcia ({view.pendingPeriodCount}) <strong>{duration(view.pendingSeconds)}</strong> jest zakreskowane i nie wlicza się do sum.</p>}
         {view.unverifiedActive && <p role="status" className="alert">Aktywny pomiar wymaga weryfikacji. Jest zakreskowany i nie wlicza się do sum.</p>}
         <div className="calendar-grid">
-          <div className="calendar-body" ref={body} tabIndex={-1}>
+          <div className="calendar-body" ref={body} tabIndex={-1} style={gridHeight ? { height: gridHeight } : undefined}>
           <div className="calendar-head" aria-hidden="true">
             <span />
             {view.days.map(day => <span key={day.date} className={day.isToday ? 'calendar-day-head is-today' : 'calendar-day-head'}>
