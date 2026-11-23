@@ -57,12 +57,19 @@ W polu `Dowody` zapisuj:
 - Fizyczny przycisk USB nie jest warunkiem Must MVP. Konfigurowalny globalny skrót — jest.
 - Rozbudowany kalendarz/raporty V1.1 i dark mode nie stają się Must MVP przez otwarcie PR.
 
-## Rejestr rozbieżności do rozstrzygnięcia
+## Rejestr rozbieżności (stan 23.11.2026)
 
 - **Notion D8/D9**: bezpośrednie karty mają `Zrobione / Zatwierdzone`; SQL z 23.11 zwrócił `Do decyzji`. Nie nadpisuj decyzji na podstawie SQL — najpierw potwierdź odczyt, a rozbieżność zgłoś.
-- **QA-01**: dawne sekcje o NSIS są dokumentacją historycznej fazy D11; nadrzędna jest finalna decyzja o MSIX/Store. Zachowaj historię, dodaj wyraźne oznaczenie.
-- **DEV-24/25/31**: w backlogu są zablokowane, a kod powstaje w PR #63–#65. Oddziel stan rozpoczętej implementacji od bramki integracji i niezależnego odbioru.
-- **README/CLAUDE**: historyczne snapshoty przeniesione do archiwum; nowy README i instrukcje agentów prowadzą do tego rejestru.
+- **QA-01 — oznaczenie wykonane**: dodano na początku karty jednoznaczny zapis, że finalna D11 MSIX/Store zastępuje historyczne NSIS. Formalne testy Windows 11 pozostają otwarte; historycznych treści nie usuwano.
+- **DEV-24/25/31 — uzgodnione**: statusy tych kart zmieniono na `W realizacji` z dowodami dokładnych SHA i CI odpowiednio PR #63/#65/#64. Integracja i niezależny QA nadal są zablokowane; nie przenosić kart do `Zrobione` bez odbioru.
+- **README/CLAUDE — zmiany przygotowane, nie scalone**: nowe wersje i archiwum istnieją w [Draft PR #66](https://github.com/maniczko/TrackerMaster/pull/66), natomiast `main` ma wcześniejszą wersję do czasu zgody na scalenie.
+
+## Otwarty dług związany z jakością metadanych
+
+- Migawka Notion 23.11.2026: 15/15 kart `Do weryfikacji` nie ma wpisu w polu `Recenzent`; 2/5 kart `Zrobione` również. Brak wpisu nie dowodzi braku wykonanej recenzji — należy odszukać źródłowy dowód, uzupełnić prawdziwą osobę albo jawnie oznaczyć `nieustalony`; **nie wpisywać fikcyjnych recenzentów**.
+- 24/24 kart `Zablokowane` nie mają pola `Agent prowadzący`; 22/24 nie mają pola `Dowody`. Zanim zmienisz status, sprawdź kod, PR i poprzedniki, zapisz następny wykonalny krok oraz realny bloker. Brak dowodu pozostaje brakiem, nie `PASS`.
+- Rozbieżność D8/D9 SQL wobec bezpośredniego odczytu Notion pozostaje otwarta; na czas diagnostyki do raportów decyzji korzystaj z bezpośrednich kart.
+- Nazwiska właścicieli/recenzentów oraz wynik QA wymagają rzeczywistego potwierdzenia; aktualizacja statusu na podstawie samego istnienia PR może oznaczać tylko `W realizacji`.
 
 ## Raport okresowy
 
