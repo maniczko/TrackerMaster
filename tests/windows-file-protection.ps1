@@ -390,14 +390,20 @@ param([string] $Root)
 $ErrorActionPreference = 'Stop'
 trap { Set-Content -LiteralPath (Join-Path $Root 'error.txt') -Value ($_ | Out-String) -Encoding utf8; exit 1 }
 $root = $Root
-# Start-Process -Credential passes the parent environment; use this token's own known folders.
+# Start-Process -Credential passes the parent environment, and known folders expand
+# %USERPROFILE% from it. Take this account's own profile from the registry instead.
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($identity.User.Value)"
+$profilePath = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty -LiteralPath $profileKey).ProfileImagePath)
 $env:USERNAME = $identity.Name.Split('\')[-1]
-$env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
-$env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
-$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+$env:USERPROFILE = $profilePath
+$env:HOMEDRIVE = Split-Path -Qualifier $profilePath
+$env:HOMEPATH = Split-Path -NoQualifier $profilePath
+$env:APPDATA = Join-Path $profilePath 'AppData\Roaming'
+$env:LOCALAPPDATA = Join-Path $profilePath 'AppData\Local'
 $env:TEMP = $env:TMP = Join-Path $env:LOCALAPPDATA 'Temp'
-[void] (New-Item -ItemType Directory -Force -Path $env:TEMP)
+foreach ($folder in $env:APPDATA, $env:TEMP) { [void] (New-Item -ItemType Directory -Force -Path $folder) }
+if ([Environment]::GetFolderPath('ApplicationData') -ne $env:APPDATA) { throw "Known folder ApplicationData still resolves to $([Environment]::GetFolderPath('ApplicationData'))." }
 $reads = foreach ($target in Get-Content -LiteralPath (Join-Path $root 'targets.txt')) {
     $result = try {
         if ([IO.Directory]::Exists($target)) { [void] [IO.Directory]::GetFileSystemEntries($target) } else { [void] [IO.File]::ReadAllBytes($target) }
