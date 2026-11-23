@@ -89,7 +89,7 @@ jobs:
   windows-application:
     needs: build
     runs-on: windows-2025
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -101,6 +101,11 @@ jobs:
           path: src-tauri/target/release
       - name: Verify isolated Windows application and CSV
         run: node tests/windows-application.mjs
+      - name: Verify file protection and second-account isolation (DEV-14)
+        # Collect DEV-14 evidence even when an earlier E2E step failed; the job still fails.
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./tests/windows-file-protection.ps1 -Mode Unpackaged
       - name: Save UI layout screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -128,3 +133,6 @@ jobs:
           ./packaging/msix/Test-TestMsixLifecycle.ps1
           -InitialPackage ./msix-lifecycle-input/TrackerMaster-test-x64.msix
           -UpdatedPackage ./msix-lifecycle-input/TrackerMaster-test-update-x64.msix
+      - name: Verify packaged file protection (DEV-14)
+        shell: pwsh
+        run: ./tests/windows-file-protection.ps1 -Mode Packaged
