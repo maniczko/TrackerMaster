@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { watch } from 'node:fs';
-import { access, mkdir, mkdtemp, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { closeSync, existsSync, openSync, watch, writeSync } from 'node:fs';
+import { access, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, stat, statfs, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -346,7 +346,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -1544,6 +1544,278 @@ async function verifyDraftAfterWriteFailure(cdp, sessionId, pending) {
   console.log(`PASS: T26 retry saved exactly one correction of entry #${pending.editId} and removed its draft`);
 }
 
+// PTT-36 / T27: a full disk under the database, on the synthetic CI test profile only.
+// A small fixed VHD is attached for this phase; the test profile directory becomes a
+// junction to a folder on it (the app resolves its data directory through Windows, so it
+// cannot be redirected by an environment variable). `pl.tracker.personal` is never used.
+const testProfile = join(process.env.APPDATA, 'pl.tracker.personal.testonly');
+const diskFull = {
+  sizeMb: 32,
+  firstDescription: 'PTT-36 T27 pomiar przy pełnym dysku',
+  secondDescription: 'PTT-36 T27 przełączenie po zwolnieniu miejsca',
+  editDescription: 'PTT-36 T27 korekta przy pełnym dysku',
+};
+let testDisk;
+
+function diskpart(lines) {
+  const script = join(temp, `diskpart-${Date.now()}.txt`);
+  return writeFile(script, lines.join('\r\n') + '\r\n', 'ascii').then(() =>
+    execFileSync('diskpart.exe', ['/s', script], { stdio: 'pipe', windowsHide: true }).toString());
+}
+
+async function mountTestDisk() {
+  const letter = ['T', 'R', 'Q', 'P', 'O', 'N'].find(candidate => !existsSync(`${candidate}:\\`));
+  assert.ok(letter, 'no free drive letter for the test disk');
+  const file = join(process.env.RUNNER_TEMP, `trackermaster-disk-full-${Date.now()}.vhdx`);
+  const disk = { file, letter, root: `${letter}:\\`, attached: false, profileMoved: false };
+  try {
+    await diskpart([
+      `create vdisk file="${file}" maximum=${diskFull.sizeMb} type=fixed`,
+      `select vdisk file="${file}"`, 'attach vdisk',
+    ]);
+    disk.attached = true;
+    await diskpart([
+      `select vdisk file="${file}"`, 'create partition primary',
+      'format fs=ntfs quick label=TMFULL', `assign letter=${letter}`,
+    ]);
+    await waitFor('test disk is mounted', () => existsSync(disk.root));
+  } catch (error) {
+    await releaseTestDisk(disk).catch(cleanup => console.log(`T27 cleanup after mount failure: ${cleanup.message}`));
+    throw new Error(`BLOCKED: could not attach a test VHD on this runner (${error.stderr?.toString() || error.stdout?.toString() || error.message})`);
+  }
+  console.log(`T27: attached a ${diskFull.sizeMb} MB test VHD as ${disk.root}`);
+  return disk;
+}
+
+// Copy the test profile onto the disk (without old backups, which the app does not need
+// to run) and replace the profile directory with a junction to it.
+async function moveProfileToDisk(disk) {
+  const target = join(disk.root, 'profile');
+  await cp(testProfile, target, { recursive: true, filter: source => !source.startsWith(join(testProfile, 'backups')) });
+  await rename(testProfile, `${testProfile}.before-disk-full`);
+  disk.profileMoved = true;
+  await symlink(target, testProfile, 'junction');
+  assert.ok((await lstat(testProfile)).isSymbolicLink(), 'test profile is not a junction to the test disk');
+  await access(testDb);
+}
+
+async function releaseTestDisk(disk) {
+  if (!disk) return;
+  if (disk.profileMoved) {
+    const link = await lstat(testProfile).catch(() => null);
+    if (link?.isSymbolicLink()) await rmdir(testProfile); // removes the junction only
+    if (!existsSync(testProfile)) await rename(`${testProfile}.before-disk-full`, testProfile);
+    disk.profileMoved = false;
+  }
+  await rm(join(disk.root, 'filler.bin'), { force: true }).catch(() => {});
+  if (disk.attached) {
+    await diskpart([`select vdisk file="${disk.file}"`, 'detach vdisk']);
+    disk.attached = false;
+  }
+  await rm(disk.file, { force: true });
+  assert.equal(existsSync(disk.file), false, 'test VHD file was not removed');
+  console.log('T27: detached and removed the test VHD and restored the test profile directory');
+}
+
+async function freeBytes(disk) {
+  const info = await statfs(disk.root);
+  return Number(info.bavail) * Number(info.bsize);
+}
+
+// Fill the volume until even a 512-byte write fails with ENOSPC.
+async function fillTestDisk(disk) {
+  const handle = openSync(join(disk.root, 'filler.bin'), 'a');
+  try {
+    for (const size of [1024 * 1024, 64 * 1024, 4096, 512]) {
+      const chunk = Buffer.alloc(size);
+      for (;;) {
+        try { writeSync(handle, chunk); }
+        catch (error) { if (error.code === 'ENOSPC') break; throw error; }
+      }
+    }
+  } finally { closeSync(handle); }
+  const free = await freeBytes(disk);
+  assert.ok(free < 4096, `test disk still has ${free} free bytes`);
+  return free;
+}
+
+async function emptyTestDisk(disk) {
+  await rm(join(disk.root, 'filler.bin'), { force: true });
+  const free = await freeBytes(disk);
+  assert.ok(free > 1024 * 1024, `test disk did not regain space (${free} bytes)`);
+}
+
+async function verifyDiskFull(cdp, sessionId, disk) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  assert.ok((await lstat(testProfile)).isSymbolicLink(), 'the app must run with its test profile on the test disk');
+  const timer = '[aria-label="Pomiar czasu"]';
+  const markStale = `document.querySelectorAll('[role="alert"]').forEach(node => { node.dataset.ptt36Stale = '1'; })`;
+  const failureShown = `[...document.querySelectorAll('[role="alert"]')].some(node => !node.dataset.ptt36Stale && node.textContent.includes('Nie udało się potwierdzić operacji') && node.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych'))`;
+  const successShown = message => `[...document.querySelectorAll('[role="status"]')].some(node => node.textContent.includes(${JSON.stringify(message)}))`;
+  const activeId = () => evaluate(`window.__TAURI_INTERNALS__.invoke('get_snapshot').then(s => s.active ? { id: s.active.id, recovered: s.active.recovered, uncertain: s.active.uncertain, description: s.active.description } : null)`);
+  const running = `Boolean(document.querySelector(${JSON.stringify(`${timer} .status.running`)}))`;
+  const idle = `!document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}) && !document.querySelector(${JSON.stringify(`${timer} .status.running`)})`;
+  const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
+  const click = selector => evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
+  const projects = (() => {
+    const db = new DatabaseSync(testDb, { readOnly: true });
+    try { return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row })); }
+    finally { db.close(); }
+  })();
+  const first = projects.find(item => item.client === primaryClient);
+  const second = projects.find(item => item.client === secondClient);
+  assert.ok(first && second && first.id !== second.id);
+
+  const before = writeFailureState();
+  assert.ok(before.entries.every(entry => entry.ended_at), 'no timer may run before T27');
+  await evaluate(`window.__TAURI_INTERNALS__.invoke('start_project_timer', { projectId: ${first.id}, taskId: null, expectedActiveId: null, description: ${JSON.stringify(diskFull.firstDescription)} })`);
+  await waitFor('T27 timer is running', () => evaluate(running));
+  const started = await activeId();
+  assert.ok(started && !started.recovered && !started.uncertain && started.description === diskFull.firstDescription);
+  await delay(3_000);
+  const runningState = writeFailureState();
+
+  // Stop and Switch with no free space on the database volume.
+  let free = await fillTestDisk(disk);
+  try {
+    console.log(`T27: database volume filled (${free} bytes free)`);
+    await waitFor('Stop is enabled on a full disk', () => evaluate(enabledButton(`${timer} .timer-stop button`)));
+    await evaluate(markStale);
+    await click(`${timer} .timer-stop button`);
+    await waitFor('Stop failure on a full disk is reported', () => evaluate(failureShown));
+    assert.equal(await evaluate(successShown('Pomiar zatrzymany.')), false, 'Stop reported success on a full disk');
+    await waitFor('timer still running after Stop on a full disk', () => evaluate(running));
+    assert.deepEqual(await activeId(), started);
+    assert.deepEqual(writeFailureState(), runningState, 'Stop on a full disk changed the database');
+    console.log('PASS: T27 Stop on a full disk reported the error, kept the same timer and changed nothing');
+
+    await evaluate(`(() => {
+      document.querySelector(${JSON.stringify(`${timer} details.timer-lists`)}).open = true;
+      const client = document.querySelectorAll(${JSON.stringify(`${timer} .timer-lists select`)})[0];
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(client, ${JSON.stringify(String(second.clientId))});
+      client.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor('second client projects listed', () => evaluate(`[...document.querySelectorAll(${JSON.stringify(`${timer} .timer-lists select`)})[1].options].some(option => option.value === ${JSON.stringify(String(second.id))})`));
+    await evaluate(`(() => {
+      const project = document.querySelectorAll(${JSON.stringify(`${timer} .timer-lists select`)})[1];
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(project, ${JSON.stringify(String(second.id))});
+      project.dispatchEvent(new Event('change', { bubbles: true }));
+      const description = document.querySelector(${JSON.stringify(`${timer} .timer-description input`)});
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(description, ${JSON.stringify(diskFull.secondDescription)});
+      description.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`);
+    await waitFor('Switch is enabled on a full disk', () => evaluate(enabledButton(`${timer} .timer-start button`)));
+    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-start button`)}).textContent.includes('Przełącz zadanie')`), true);
+    await evaluate(markStale);
+    await click(`${timer} .timer-start button`);
+    await waitFor('Switch failure on a full disk is reported', () => evaluate(failureShown));
+    assert.equal(await evaluate(successShown('Przełączono zadanie.')), false, 'Switch reported success on a full disk');
+    await waitFor('timer still running after Switch on a full disk', () => evaluate(running));
+    assert.deepEqual(await activeId(), started);
+    assert.deepEqual(writeFailureState(), runningState, 'Switch on a full disk changed the database');
+    console.log('PASS: T27 Switch on a full disk reported the error, kept the same timer and changed nothing');
+  } finally { await emptyTestDisk(disk); }
+
+  // One retry of each with space available again.
+  await waitFor('Switch enabled for retry after freeing space', () => evaluate(enabledButton(`${timer} .timer-start button`)));
+  await click(`${timer} .timer-start button`);
+  await waitFor('Switch retry succeeded', () => evaluate(successShown('Przełączono zadanie.')));
+  const switched = await activeId();
+  assert.ok(switched && switched.id !== started.id && switched.description === diskFull.secondDescription);
+  await delay(2_000);
+  await waitFor('Stop enabled for retry after freeing space', () => evaluate(enabledButton(`${timer} .timer-stop button`)));
+  await click(`${timer} .timer-stop button`);
+  await waitFor('Stop retry succeeded', () => evaluate(successShown('Pomiar zatrzymany.')));
+  await waitFor('timer stopped after retry', () => evaluate(idle));
+  assert.equal(await activeId(), null);
+  const after = writeFailureState();
+  assert.equal(after.entries.length, before.entries.length + 2, 'retry created a duplicate or lost an entry');
+  assert.deepEqual(after.entries.slice(0, before.entries.length), before.entries, 'retry changed earlier entries');
+  const [firstEntry, secondEntry] = after.entries.slice(before.entries.length);
+  assert.equal(firstEntry.id, started.id);
+  assert.equal(secondEntry.id, switched.id);
+  assert.equal(after.entries.filter(entry => entry.description === diskFull.firstDescription).length, 1);
+  assert.equal(after.entries.filter(entry => entry.description === diskFull.secondDescription).length, 1);
+  // Exact to the millisecond: the start is unchanged and the switch boundary is shared.
+  assert.equal(firstEntry.started_at, runningState.entries.at(-1).started_at);
+  assert.equal(secondEntry.started_at, firstEntry.ended_at);
+  assert.equal(firstEntry.project_id, first.id);
+  assert.equal(secondEntry.project_id, second.id);
+  for (const entry of [firstEntry, secondEntry]) {
+    assert.equal(entry.duration_seconds, Math.floor((Date.parse(entry.ended_at) - Date.parse(entry.started_at)) / 1000), `entry #${entry.id} duration matches its interval`);
+    assert.equal(entry.manually_resolved, 0);
+  }
+  assert.equal(after.revisions, before.revisions);
+  console.log(`PASS: T27 one retry after freeing space saved one switch and one stop (#${firstEntry.id} ${firstEntry.duration_seconds} s, #${secondEntry.id} ${secondEntry.duration_seconds} s) without duplicates`);
+
+  // Correction of an entry's end. The local draft is written before the disk is filled,
+  // so the failure is the database write, not the draft file.
+  const target = after.entries[0];
+  await waitFor('entry editor opens for the T27 correction', async () => {
+    if (await evaluate(`Boolean(document.querySelector('#entry-draft-description'))`)) return true;
+    await chooseFromEntryMenu(cdp, sessionId, evaluate, target.description, 'Popraw wpis:', 'mouse');
+    return false;
+  });
+  assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), target.description, 'the editor opened a different entry');
+  const targetEnd = await evaluate(`(() => {
+    const field = document.querySelectorAll('[aria-label="Edycja wpisu"] input[type="datetime-local"]')[1];
+    const date = new Date(field.value);
+    date.setSeconds(date.getSeconds() - 1);
+    const pad = value => String(value).padStart(2, '0');
+    const value = [date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join('-') + 'T' + [date.getHours(), date.getMinutes(), date.getSeconds()].map(pad).join(':');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, value);
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    const description = document.querySelector('#entry-draft-description');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(description, ${JSON.stringify(diskFull.editDescription)});
+    description.dispatchEvent(new Event('input', { bubbles: true }));
+    return date.toISOString();
+  })()`);
+  assert.ok(Date.parse(targetEnd) > Date.parse(target.started_at), 'the corrected end must stay after the start');
+  const draftPath = join(testProfile, 'entry-drafts', `entry-${target.id}.json`);
+  await waitFor('T27 correction draft saved locally', async () => {
+    try { return JSON.parse(await readFile(draftPath, 'utf8')).fields.description === diskFull.editDescription; }
+    catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return false; throw error; }
+  });
+  const submit = `document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]')`;
+  await waitFor('correction can be saved', () => evaluate(`(el => Boolean(el && !el.disabled))(${submit})`));
+  free = await fillTestDisk(disk);
+  try {
+    console.log(`T27: database volume filled again (${free} bytes free)`);
+    await evaluate(markStale);
+    await evaluate(`${submit}.click()`);
+    await waitFor('correction failure on a full disk is reported', () => evaluate(`[...document.querySelectorAll('[role="alert"]')].some(node => !node.dataset.ptt36Stale && node.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych'))`));
+    assert.equal(await evaluate(successShown('Zmiany wpisu zostały zapisane.')), false, 'correction reported success on a full disk');
+    assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), diskFull.editDescription);
+    assert.deepEqual(writeFailureState(), after, 'correction on a full disk changed the database');
+    assert.equal(JSON.parse(await readFile(draftPath, 'utf8')).fields.description, diskFull.editDescription);
+    console.log('PASS: T27 correction on a full disk reported the error, kept the editor and its draft, and changed nothing');
+  } finally { await emptyTestDisk(disk); }
+
+  await waitFor('correction can be saved after freeing space', () => evaluate(`(el => Boolean(el && !el.disabled))(${submit})`));
+  await evaluate(`${submit}.click()`);
+  await waitFor('correction retry saved', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]') && [...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(diskFull.editDescription)}))`))
+    .catch(async error => {
+      const alerts = await evaluate(`[...document.querySelectorAll('[role="alert"]')].map(node => node.textContent.trim())`);
+      throw new Error(`${error.message}; alerts: ${JSON.stringify(alerts)}`);
+    });
+  const saved = writeFailureState();
+  const entry = saved.entries.find(item => item.id === target.id);
+  assert.equal(saved.entries.length, after.entries.length, 'the correction retry created or lost an entry');
+  assert.deepEqual(saved.entries.filter(item => item.id !== target.id), after.entries.filter(item => item.id !== target.id), 'the correction changed another entry');
+  assert.equal(entry.description, diskFull.editDescription);
+  assert.equal(entry.started_at, target.started_at, 'the unchanged start moved (it keeps its exact milliseconds)');
+  assert.equal(Date.parse(entry.ended_at), Date.parse(targetEnd));
+  assert.equal(entry.duration_seconds, Math.floor((Date.parse(entry.ended_at) - Date.parse(entry.started_at)) / 1000));
+  assert.equal(saved.revisions, after.revisions + 1, 'retry saved the time correction more than once');
+  assert.equal(saved.descriptionRevisions, after.descriptionRevisions + 1, 'retry saved the description more than once');
+  await assert.rejects(stat(draftPath), { code: 'ENOENT' });
+  console.log(`PASS: T27 one retry after freeing space saved exactly one correction of entry #${target.id}`);
+}
+
 async function verifyDuplicateClientChoices(cdp, sessionId) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
@@ -1668,7 +1940,7 @@ async function runWindow(port, phase, recovery) {
       await captureReportDetail(cdp, sessionId, phase === 'initial' ? 'selected-client' : 'restored-scope');
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -1723,6 +1995,7 @@ async function runWindow(port, phase, recovery) {
     }
     if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
+    if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -1840,6 +2113,17 @@ try {
   await runWindow(port, 'write-failure', recovery);
   await waitForWindowClosed(port);
   await runWindow(port, 'write-failure-reopen', recovery);
+  // PTT-36 / T27: Stop, Switch and correction with the database volume full, then one retry.
+  await waitForWindowClosed(port);
+  testDisk = await mountTestDisk();
+  try {
+    await moveProfileToDisk(testDisk);
+    await runWindow(port, 'disk-full', recovery);
+  } finally {
+    // runWindow has already ended the app process; the disk is released even after a failure.
+    await waitForWindowClosed(port).catch(error => console.log(`T27 cleanup: ${error.message}`));
+    await releaseTestDisk(testDisk);
+  }
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);
