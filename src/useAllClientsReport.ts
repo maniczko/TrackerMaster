@@ -14,7 +14,24 @@ export const ALL_CLIENTS_REPORT_INTERVAL_MS = 60_000;
  * closed-report card, the totals next to the timer and the History day groups. It reads again on a
  * new revision (every confirmed change, #34), when the window gets focus, and every 60 s otherwise.
  */
-export function useAllClientsReport(loaded: boolean, revision: number): AllClientsReport {
+/**
+ * Short signature of what the main window snapshot shows (entries and the active timer). The App adds it to
+ * the read's revision, so a change made outside this window's own actions (mini timer, global shortcut,
+ * another process) is read again on the next snapshot refresh (2.5 s) instead of after up to 60 s. PR #63:
+ * the calendar showed a week without entries created that way for longer than the E2E's 30 s wait.
+ */
+export function snapshotSignature(entries: readonly SignatureEntry[], active: SignatureEntry | null): string {
+  let hash = 2166136261;
+  const text = JSON.stringify([active && signatureFields(active), entries.map(signatureFields)]);
+  for (let index = 0; index < text.length; index++) hash = Math.imul(hash ^ text.charCodeAt(index), 16777619) >>> 0;
+  return `${entries.length}:${hash.toString(36)}`;
+}
+type SignatureEntry = { id: number | string; project_id: number | string; task_id: number | string | null; started_at: string; ended_at: string | null;
+  duration_seconds?: number | null; billable: boolean; description: string; recovered?: boolean; uncertain?: boolean; has_sleep?: boolean };
+const signatureFields = (entry: SignatureEntry) => [entry.id, entry.project_id, entry.task_id, entry.started_at, entry.ended_at, entry.duration_seconds ?? null,
+  entry.billable, entry.description, !!entry.recovered, !!entry.uncertain, !!entry.has_sleep];
+
+export function useAllClientsReport(loaded: boolean, revision: number | string): AllClientsReport {
   const [read, setRead] = useState<AllClientsReport['read']>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {

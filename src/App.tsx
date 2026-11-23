@@ -19,7 +19,7 @@ import { mainAction, selectionFor, selectionKey, startBlocked } from './timerCho
 import { historyDays, liveTimerTotals, timerTotals, totalsBaseData } from './reportDayModel';
 import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
-import { useAllClientsReport } from './useAllClientsReport';
+import { snapshotSignature, useAllClientsReport } from './useAllClientsReport';
 import CalendarWeek from './CalendarWeek';
 import './miniTimer.css';
 
@@ -147,7 +147,10 @@ export default function App() {
   const recent = useMemo(() => recentChoices(choices, data.entries), [choices, data.entries]);
   const catalog = useMemo(() => ({ clients: data.clients, projects: data.projects, tasks: data.tasks }), [data.clients, data.projects, data.tasks]);
   // Day/week totals and History day groups come from the report's own calculation (all clients).
-  const allClients = useAllClientsReport(loaded, reportRevision);
+  // Read again after every confirmed change (reportRevision) and whenever the snapshot shows other data,
+  // e.g. a start or stop from the mini timer; the open report itself still follows reportRevision only.
+  const shownData = useMemo(() => snapshotSignature(data.entries, data.active), [data.entries, data.active]);
+  const allClients = useAllClientsReport(loaded, `${reportRevision}|${shownData}`);
   // Timer or calendar (DEV-24). Only what is shown changes: the timer, its state and any open edit stay mounted.
   const [view, setView] = useState<'timer' | 'calendar'>(() => { try { return window.localStorage.getItem('trackermaster.view.v1') === 'calendar' ? 'calendar' : 'timer'; } catch { return 'timer'; } });
   const showView = (next: 'timer' | 'calendar') => { setView(next); try { window.localStorage.setItem('trackermaster.view.v1', next); } catch { /* convenience only */ } };

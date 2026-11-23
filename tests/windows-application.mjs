@@ -908,7 +908,13 @@ async function verifyCalendar(cdp, sessionId) {
       blocks: root.querySelectorAll('.calendar-block').length,
       labels: [...root.querySelectorAll('.calendar-block')].map(node => node.getAttribute('aria-label')) };
   })()`;
-  const week = await waitFor('fixture week shown', async () => { const value = await evaluate(read); return value.heading === calendarFixture.heading && value.blocks > 0 ? value : null; });
+  // The entries above were created outside the window's own actions; the shared report read follows the
+  // snapshot (2.5 s), so the week is complete well within the wait. The last state is logged on a timeout.
+  let lastWeek = null;
+  const week = await waitFor('fixture week shown', async () => {
+    lastWeek = await evaluate(read);
+    return lastWeek.heading === calendarFixture.heading && lastWeek.blocks === calendarFixture.blocks ? lastWeek : null;
+  }).catch(error => { throw new Error(`${error.message}; last calendar state: ${JSON.stringify(lastWeek)}`); });
   assert.deepEqual(week.days, calendarFixture.days, 'calendar day totals differ from the report for the fixture week');
   assert.equal(week.week, calendarFixture.week);
   assert.equal(week.blocks, calendarFixture.blocks, 'the midnight entry must give one block on each day');
