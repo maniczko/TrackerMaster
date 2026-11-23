@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { Snapshot } from '../src/App.tsx';
-import { activeContext, barContext, choicesFor, clockState, createRequestGate, descriptionCommand, durationText, pickerGroups, pickerKey, PROJECT_COLOURS, projectColour, readLegacyPin, recentChoices, toggleCommand } from '../src/miniTimerModel.ts';
+import { activeContext, barContext, choicesFor, clockState, createRequestGate, descriptionCommand, durationText, pickerGroups, pickerKey, PROJECT_COLOURS, projectColour, readLegacyPin, recentChoices, switchChoices, switchCommand, toggleCommand } from '../src/miniTimerModel.ts';
 import { clientLabels } from '../src/clientLabels.ts';
 
 const entry = { id: 9, task_id: '3', project_id: 2, started_at: '2026-11-17T09:00:00Z', ended_at: null, billable: true, description: 'Szkic' };
@@ -153,4 +153,29 @@ test('project colour is a stable decorative slot 1…8 for numeric and text IDs'
     assert.ok(Number.isInteger(slot) && slot >= 1 && slot <= 8);
     assert.equal(projectColour(id), slot);
   }
+});
+
+test('expanded mini timer: recent targets other than the running one switch atomically (D3), never for a timer under review', () => {
+  const many: Snapshot = {
+    ...snapshot,
+    projects: [...snapshot.projects, { id: 7, client_id: 1, name: 'Serwis', archived: false, billable: false }, { id: 8, client_id: 1, name: 'Szkolenia', archived: false, billable: true }],
+  };
+  const all = choicesFor(many);
+  const done = (project_id: number | string, task_id: number | string | null, id: number) => ({ ...entry, id, project_id, task_id, ended_at: '2026-11-17T10:00:00Z' });
+  const recent = recentChoices(all, [done(2, '3', 20), done(7, null, 19), done(2, null, 18), done(8, null, 17)]);
+  const running = { ...entry, id: 30 };
+  const quick = switchChoices(recent, running);
+  assert.deepEqual(quick.map(choice => choice.key), ['project:7', 'project:2', 'project:8'], 'the running task is left out; at most three');
+  assert.deepEqual(switchChoices(recent, running, 2).map(choice => choice.key), ['project:7', 'project:2']);
+  assert.deepEqual(switchChoices(recent, null), [], 'nothing to switch without a running timer');
+  const now = Date.parse('2026-11-18T12:00:00Z');
+  const mode = clockState({ ...many, active: running }, now).mode;
+  assert.equal(mode, 'running');
+  assert.deepEqual(switchCommand(mode, running, quick[0]), { name: 'start_project_timer', args: { projectId: 7, taskId: null, expectedActiveId: 30, description: '' } });
+  assert.equal(switchCommand(mode, running, all.find(choice => choice.key === 'task:3')), null, 'the running task is not started again');
+  assert.equal(switchCommand('recovered', { ...running, recovered: true }, quick[0]), null);
+  assert.equal(switchCommand('running', { ...running, uncertain: true }, quick[0]), null);
+  assert.equal(switchCommand('unavailable', running, quick[0]), null);
+  assert.equal(switchCommand('idle', null, quick[0]), null);
+  assert.equal(switchCommand(mode, running, undefined), null);
 });

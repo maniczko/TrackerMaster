@@ -37,3 +37,18 @@ export function startBlocked(state: {
       (taskId ? active.task_id !== null && String(active.task_id) === taskId : active.task_id === null)) return true;
   return false;
 }
+
+export type MainAction = { kind: 'stop' | 'start' | 'choose'; disabled: boolean };
+
+/**
+ * The one main action under the clock, in the same place in every state: Stop while a timer runs,
+ * otherwise Start. Without a chosen project Start is "choose": it stays clickable and leads to the
+ * project search instead of being a disabled button without an explanation. A Start with a project
+ * keeps the startBlocked rule; Stop stays disabled for a recovered timer (it needs its end time).
+ */
+export function mainAction(state: Parameters<typeof startBlocked>[0]): MainAction {
+  const { busy, loaded, projectId, active } = state;
+  if (active) return { kind: 'stop', disabled: busy || !loaded || !!active.recovered };
+  if (!projectId) return { kind: 'choose', disabled: busy || !loaded };
+  return { kind: 'start', disabled: startBlocked(state) };
+}

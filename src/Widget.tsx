@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Snapshot } from './App';
 import { MiniTimerTaskPicker, TimerIcon } from './MiniTimerPanel';
-import { activeContext, barContext, choicesFor, clockState, createRequestGate, descriptionCommand, projectPath, readLegacyPin, recentChoices, taskName, toggleCommand } from './miniTimerModel';
+import { activeContext, barContext, choicesFor, clockState, createActionSettle, createRequestGate, descriptionCommand, projectColour, projectPath, readLegacyPin, recentChoices, switchChoices, switchCommand, taskName, toggleCommand } from './miniTimerModel';
 import type { DescriptionDraft } from './miniTimerModel';
 import { defaultShortcut, matchesShortcut, shortcutLabel } from './shortcut';
 import './miniTimer.css';
@@ -30,6 +30,8 @@ export default function Widget() {
   const [panelPending, setPanelPending] = useState(false);
   const [details, setDetails] = useState(false);
   const gate = useRef(createRequestGate()).current;
+  // The round toggle (and the shortcut) and quick switching change meaning in place: no second action right after one.
+  const settle = useRef(createActionSettle()).current;
   const connecting = useRef(false);
   const search = useRef<HTMLInputElement>(null);
   const description = useRef<HTMLTextAreaElement>(null);
@@ -88,6 +90,8 @@ export default function Widget() {
   const conflict = dirtyEdit && edit !== null && active?.description !== edit.expected;
   const command = toggleCommand(clock.mode, active, choice, draft);
   const controlsLocked = !data || busy || verify || clock.mode === 'recovered' || clock.mode === 'unavailable';
+  // Two rows fill the space above "Rozliczalny" in the 440×390 panel without scrolling.
+  const quickSwitch = useMemo(() => switchChoices(recent, active, 2), [recent, active]);
   const shortcutChoice = active ? choices.find(item => String(item.project.id) === String(active.project_id) && (item.task === null ? active.task_id === null : String(item.task.id) === String(active.task_id))) : choice;
   const shortcutProjectId = shortcutChoice?.project.id;
   const shortcutTaskId = shortcutChoice?.task?.id;
@@ -118,7 +122,7 @@ export default function Widget() {
       landed?.();
       if (nextSnapshot) { setData(next); setNow(Date.now()); }
       else if (!await refresh(true)) { setNotice('Zapis potwierdzony. Ponów odczyt.'); return; }
-      setNotice(name === 'widget_project_start' ? '' : 'Zapisano.');
+      setNotice(name === 'widget_project_start' ? '' : name === 'start_project_timer' ? 'Przełączono.' : 'Zapisano.');
     } catch {
       setVerify(true);
       await refresh(true);
@@ -154,7 +158,9 @@ export default function Widget() {
       else void setPanel(true);
       return;
     }
-    void write(command.name, command.args, true, command.name === 'widget_project_start' ? () => setDraft('') : undefined);
+    if (!settle.allows(Date.now())) return;
+    settle.mark(Date.now());
+    void write(command.name, command.args, true, command.name === 'widget_project_start' ? () => setDraft('') : undefined).finally(() => settle.mark(Date.now()));
   };
   useEffect(() => {
     if (open) {
@@ -203,6 +209,12 @@ export default function Widget() {
     if (change && !controlsLocked) void write(change.name, change.args, false, () => setEdit(null));
   };
   const cancelEdit = () => setEdit(null);
+  const switchTo = (item: (typeof quickSwitch)[number]) => {
+    const change = switchCommand(clock.mode, active, item);
+    if (!change || controlsLocked || dirtyEdit || !settle.allows(Date.now())) return;
+    settle.mark(Date.now());
+    void write(change.name, change.args, true).finally(() => settle.mark(Date.now()));
+  };
   const selectedChoice = (key: string) => {
     if (gate.writing || controlsLocked || active || !choices.some(item => item.key === key)) return;
     setSelected(key);
@@ -270,6 +282,12 @@ export default function Widget() {
           {!conflict && <button type="button" className="qp-save" disabled={controlsLocked} onClick={saveDescription}>Zapisz opis</button>}
           {conflict && <button type="button" className="qp-save" disabled={controlsLocked} onClick={() => setEdit(edit!.value === active!.description ? null : { ...edit!, expected: active!.description })}>Użyj aktualnego opisu jako podstawy</button>}
           <button type="button" className="qp-text-button" disabled={busy} onClick={cancelEdit}>Odrzuć szkic</button>
+        </div>}
+        {quickSwitch.length > 0 && <div className="qp-recent" role="group" aria-labelledby="qp-recent-label">
+          <span id="qp-recent-label" className="qp-field-label">Ostatnio używane</span>
+          {quickSwitch.map(item => <button key={item.key} type="button" className="qp-recent-item" title={`Przełącz na: ${taskName(item)} — ${projectPath(item)}`} aria-label={`Przełącz na: ${taskName(item)} — ${projectPath(item)}`} aria-disabled={controlsLocked || dirtyEdit || clock.mode !== 'running'} onClick={() => switchTo(item)}>
+            <span className="qp-dot" data-project-colour={projectColour(item.project.id)} aria-hidden="true" /><span className="qp-recent-name">{taskName(item)} <small>· {projectPath(item)}</small></span>
+          </button>)}
         </div>}
         {active && <label className="qp-billing"><input type="checkbox" role="switch" className="qp-switch" checked={active.billable} disabled={controlsLocked} onChange={event => {
           if (!controlsLocked) void write('set_entry_billable', { entryId: Number(active.id), expected: active.billable, billable: event.target.checked }, false);

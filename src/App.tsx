@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
 import ShortcutSettings from './ShortcutSettings';
-import SleepPending from './SleepPending';
+import { SleepNote, SleepPendingList, SleepReadError, usePendingSleep } from './SleepPending';
 import EntryDraftEditor from './EntryDraftEditor';
 import type { EntryDraftEditorHandle } from './EntryDraftEditor';
 import { localInputRange, localRangeProblem, parseLocalDate } from './localDateTime';
@@ -14,8 +14,8 @@ import EntryMenu from './EntryMenu';
 import { entryTimeRange } from './historyFormat';
 import { defaultShortcut, shortcutLabel } from './shortcut';
 import { MiniTimerTaskPicker } from './MiniTimerPanel';
-import { choicesFor, createRequestGate, recentChoices } from './miniTimerModel';
-import { selectionFor, selectionKey, startBlocked } from './timerChoice';
+import { choicesFor, createActionSettle, createRequestGate, recentChoices } from './miniTimerModel';
+import { mainAction, selectionFor, selectionKey, startBlocked } from './timerChoice';
 import { historyDays, liveTimerTotals, timerTotals, totalsBaseData } from './reportDayModel';
 import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
@@ -165,6 +165,31 @@ export default function App() {
   // One write at a time: a fast double click cannot send a second start before the first returns.
   const writes = useRef(createRequestGate()).current;
   const startDisabled = startBlocked({ busy, loaded, projectId, taskId, client: selectedClient, project: selectedProject, task: selectedTask, active: data.active });
+  const main = mainAction({ busy, loaded, projectId, taskId, client: selectedClient, project: selectedProject, task: selectedTask, active: data.active });
+  // Start and Stop are one button that changes meaning in place: after either, a second click is ignored for a moment.
+  const mainSettle = useRef(createActionSettle()).current;
+  const sleep = usePendingSleep(loaded, async () => {
+    setReportRevision(version => version + 1);
+    await refresh();
+  });
+  function startTimer() {
+    return execute(async () => { await invoke('start_project_timer', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, expectedActiveId: data.active ? Number(data.active.id) : null, description: timerDescription }); setTimerDescription(''); }, data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.');
+  }
+  function runMainAction() {
+    if (main.disabled) return;
+    if (main.kind === 'choose') {
+      // Like the mini timer: Start without a project leads to the project search.
+      if (needsStructure) openStructure();
+      else { pickerInput.current?.focus(); pickerInput.current?.scrollIntoView({ block: 'nearest' }); }
+      return;
+    }
+    // Double click in either direction: Stop → Start must not start a timer, Start → Stop must not end it.
+    if (!mainSettle.allows(Date.now())) return;
+    mainSettle.mark(Date.now());
+    const settled = () => mainSettle.mark(Date.now());
+    if (main.kind === 'stop') void execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.').finally(settled);
+    else void startTimer().finally(settled);
+  }
   function chooseTimerTarget(key: string) {
     const next = selectionFor(choices, key);
     if (!next) return;
@@ -299,19 +324,24 @@ export default function App() {
       <div className="heading"><div><h1>Rejestracja czasu</h1><p className="subtitle">Wybierz projekt i skup się na pracy. Resztą zajmie się licznik.</p></div><div className="date">{new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())}</div></div>
       {error && <div role="alert" className="alert error">{error}</div>}
       {!loaded && <div role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie przed wykonaniem kolejnej operacji. <button type="button" disabled={busy} onClick={retryRefresh}>Ponów odczyt</button></div>}
-      {loaded && data.active?.uncertain && !data.active.recovered && <div role="alert" className="alert pending"><strong>Nie można wiarygodnie wyświetlić czasu pomiaru.</strong> Przyczyną mogło być uśpienie komputera, pominięte zdarzenie zasilania lub zmiana zegara. {data.active.has_sleep ? 'Jeśli na liście okresów uśpienia brakuje czasu wybudzenia, najpierw go uzupełnij. ' : ''}Następnie zatrzymaj pomiar: jeśli czasu nie da się potwierdzić, aplikacja nie zapisze końca i poprosi o faktyczny czas zakończenia.{' '}
-        <button type="button" disabled={busy} onClick={() => void execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.')}>Zatrzymaj i rozlicz</button></div>}
-      {loaded && data.active?.recovered && <div role="alert" className="alert pending"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto: {formatDate(data.active.started_at)}. Podaj faktyczny czas zakończenia. {data.active.has_sleep ? 'Jeśli skończyłeś pracę przed uśpieniem komputera, wpisz tę godzinę — późniejsze okresy uśpienia nie będą liczone. Okres uśpienia, który trwał w chwili zakończenia, zostanie przycięty do tej godziny i pozostanie do Twojej decyzji. Pozostały czas między początkiem a wskazanym końcem, także niezarejestrowane przerwy, zostanie zaliczony jako praca.' : 'Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.'}
-        <form noValidate onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
+      {/* One compact review banner (UIQ-01): title and one sentence, the end-time form, the sleep note with the
+          only button to the list, and the full rule under "Dlaczego?". The timer card stays visible at 1280×720. */}
+      {loaded && data.active?.uncertain && !data.active.recovered && <div role="alert" className="alert pending timer-review">
+        <p className="timer-review-lead"><strong>Nie można wiarygodnie wyświetlić czasu pomiaru.</strong> {data.active.has_sleep ? 'Uzupełnij brakujące czasy wybudzenia, a potem zatrzymaj pomiar przyciskiem pod licznikiem.' : 'Zatrzymaj pomiar przyciskiem pod licznikiem, aby go rozliczyć.'}</p>
+        <SleepNote sleep={sleep} />
+        <details className="timer-review-why"><summary>Dlaczego?</summary><p>Przyczyną mogło być uśpienie komputera, pominięte zdarzenie zasilania lub zmiana zegara. {data.active.has_sleep ? 'Jeśli na liście okresów uśpienia brakuje czasu wybudzenia, najpierw go uzupełnij. ' : ''}Następnie zatrzymaj pomiar: jeśli czasu nie da się potwierdzić, aplikacja nie zapisze końca i poprosi o faktyczny czas zakończenia.</p></details></div>}
+      {loaded && data.active?.recovered && <div role="alert" className="alert pending timer-review">
+        <p className="timer-review-lead"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto {formatDate(data.active.started_at)} — podaj faktyczny czas zakończenia. {data.active.has_sleep ? 'Czas do tej godziny zostanie zaliczony jako praca, z wyjątkiem okresów uśpienia, o których zdecydujesz.' : 'Cały czas do tej godziny, także przerwy, zostanie zaliczony jako praca.'}</p>
+        <form noValidate className="timer-review-form" onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
           <label>Data i godzina zakończenia <input type="datetime-local" step="1" required min={recoveryLimits.min} max={recoveryLimits.max} aria-invalid={recoveryProblem !== null} aria-describedby={recoveryProblem ? 'recovery-end-problem' : undefined} value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
           <button type="submit" className="primary" disabled={busy || !loaded || !recoveryEnd || recoveryProblem === 'after' || recoveryProblem === 'invalid'}>Zapisz zakończenie</button>
           {recoveryProblem && <p id="recovery-end-problem" className="field-problem" role="status">{recoveryHints[recoveryProblem]}</p>}
-        </form></div>}
+        </form>
+        <SleepNote sleep={sleep} />
+        <details className="timer-review-why"><summary>Dlaczego?</summary><p>{data.active.has_sleep ? 'Jeśli praca zakończyła się przed uśpieniem komputera, wpisz tę godzinę — późniejsze okresy uśpienia nie będą liczone. Okres uśpienia, który trwał w chwili zakończenia, zostanie przycięty do tej godziny i pozostanie do Twojej decyzji. Pozostały czas między początkiem a wskazanym końcem, także niezarejestrowane przerwy, zostanie zaliczony jako praca.' : 'Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.'}</p></details></div>}
+      {loaded && !data.active?.recovered && !data.active?.uncertain && sleep.items.length > 0 && <div role="status" className="alert timer-review"><SleepNote sleep={sleep} /></div>}
+      <SleepReadError sleep={sleep} />
       {notice && <div role="status" className="alert success">{notice}</div>}
-      <SleepPending loaded={loaded} onResolved={async () => {
-        setReportRevision(version => version + 1);
-        await refresh();
-      }} />
       <section className="timer card" aria-label="Pomiar czasu">
         <div className="timer-layout">
           <div className="timer-now">
@@ -320,23 +350,24 @@ export default function App() {
             ? <div className="clock clock-unknown" role="img" aria-label={loaded ? 'Czas do weryfikacji' : 'Czas nieznany'} aria-live="off"><span>—</span><span className="clock-sep">:</span><span>—</span><span className="clock-sep">:</span><span>—</span></div>
             : <div className="clock" aria-live="off">{formatDuration(displayElapsed)}</div>}<p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered || data.active?.uncertain ? 'Pomiar wymaga weryfikacji' : data.active ? 'Czas zapisze się przy zatrzymaniu' : 'Wybierz projekt lub zadanie, aby rozpocząć'}</p>
           <p className="timer-totals" aria-label="Suma czasu, wszyscy klienci">{totals ? totals.text : 'Dziś — · Tydzień —'}{totals?.needsReview && <span className="timer-totals-note"> · raport zawiera uwagi</span>}</p>
-          {loaded && data.active && <div className="actions timer-stop">
-            <button type="button" className="primary" disabled={busy || data.active.recovered} onClick={() => execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.')}>
-              <span aria-hidden="true">■</span> Zatrzymaj
+          {/* The main action: one place and size for Start (Deep Teal) and Stop (coral). */}
+          <div className={`actions timer-main ${main.kind === 'stop' ? 'timer-stop' : 'timer-start'}`}>
+            <button type="button" className="primary" disabled={main.disabled} aria-describedby={main.kind === 'choose' ? 'timer-main-hint' : undefined} onClick={runMainAction}>
+              <span aria-hidden="true">{main.kind === 'stop' ? '■' : '▶'}</span> {main.kind === 'stop' ? 'Zatrzymaj' : 'Rozpocznij'}
             </button>
-          </div>}
-          {loaded && data.active && !data.active.recovered && !data.active.uncertain && shortcutHint}
+          </div>
+          {main.kind === 'choose' && <p id="timer-main-hint" className="helper timer-main-hint">{needsStructure ? 'Najpierw dodaj klienta i projekt.' : 'Najpierw wybierz projekt lub zadanie.'}</p>}
+          {(!data.active || (loaded && !data.active.recovered && !data.active.uncertain)) && shortcutHint}
           {loaded && data.active && <div className="active-info"><span>AKTYWNY POMIAR</span><strong>{data.active.task_id === null ? 'Bez zadania' : activeTask?.name || 'Nieznane zadanie'}</strong><small>{activeClient ? clientLabelById.get(String(activeClient.id)) : '—'} / {activeProject?.name || '—'}</small><small>{data.active.description || 'Bez opisu'}</small><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe({ id: data.active!.id, expected: data.active!.description, value: data.active!.description })}>Zmień opis</button></div>}
           </div>
           <div className="timer-setup">
           {needsStructure && <p className="alert">Aby rozpocząć pomiar, dodaj najpierw klienta i projekt. <button type="button" className="secondary" onClick={openStructure}>Dodaj klienta i projekt</button></p>}
           {/* Toggl-like bar: description and Start/Switch stay at the top, above the picker results (UIQ-01: visible without scrolling). */}
           <div className="timer-bar">
-            <label className="timer-description">Opis nowego pomiaru (opcjonalnie)<input ref={timerDescriptionInput} value={timerDescription} maxLength={2000} disabled={busy || !loaded} onChange={e => setTimerDescription(e.target.value)} placeholder="Nad czym pracujesz?" /></label>
-            <div className="actions timer-start"><button type="button" className={data.active ? 'secondary' : 'primary'} disabled={startDisabled} onClick={() => execute(async () => { await invoke('start_project_timer', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, expectedActiveId: data.active ? Number(data.active.id) : null, description: timerDescription }); setTimerDescription(''); }, data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.')}><span aria-hidden="true">▶</span> {data.active ? 'Przełącz zadanie' : 'Rozpocznij pomiar'}</button></div>
+            <label className="timer-description">Opis nowego pomiaru (opcjonalnie)<input ref={timerDescriptionInput} value={timerDescription} maxLength={2000} disabled={busy || !loaded} onChange={e => setTimerDescription(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && !data.active) { e.preventDefault(); runMainAction(); } }} placeholder="Nad czym pracujesz?" /></label>
+            {data.active && <div className="actions timer-start timer-switch"><button type="button" className="secondary" disabled={startDisabled} title={startDisabled && loaded && !busy && !data.active.recovered ? 'Wybierz inny projekt lub zadanie, aby przełączyć pomiar.' : undefined} onClick={() => void startTimer()}><span aria-hidden="true">⇄</span> Przełącz zadanie</button></div>}
           </div>
           <p className="timer-target" aria-live="polite">{selectedProject ? <>Wybrano: <strong>{selectedTask ? selectedTask.name : 'Bez zadania'}</strong> · {selectedClient ? clientLabelById.get(String(selectedClient.id)) : '—'} / {selectedProject.name}</> : 'Wybierz projekt lub zadanie poniżej.'}</p>
-          {!data.active && shortcutHint}
           <div className="timer-picker"><MiniTimerTaskPicker emptyHint="Najpierw dodaj klienta i projekt w sekcji „Dane i ustawienia” poniżej, w tym oknie." input={pickerInput} choices={choices} recent={recent} selected={selectionKey(projectId, taskId)}
             disabled={busy || !loaded || !!data.active?.recovered} onSelect={chooseTimerTarget} /></div>
           <details className="timer-lists"><summary>Wybierz z list: klient, projekt, zadanie</summary>
@@ -359,6 +390,7 @@ export default function App() {
           </div>
         </div>
       </section>
+      <SleepPendingList sleep={sleep} />
       {describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
       <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} summary={allClients} hasUnsavedEdit={hasUnsavedReportEdit}
         onEditEntry={entryId => entryEditor.current?.openEntry(entryId, 'start')}

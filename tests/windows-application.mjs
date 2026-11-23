@@ -42,7 +42,9 @@ const inspectMainLayout = `(() => {
   const timer = document.querySelector('[aria-label="Pomiar czasu"]');
   const action = timer?.querySelector('.timer-stop button') ?? timer?.querySelector('.timer-start button');
   const box = action?.getBoundingClientRect();
+  const area = element => { const rect = element?.getBoundingClientRect(); return rect ? { top: Math.round(rect.top), bottom: Math.round(rect.bottom) } : null; };
   return { scrollWidth: root.scrollWidth, clientWidth: root.clientWidth, scrollY: window.scrollY,
+    card: area(timer), clock: area(timer?.querySelector('.clock')),
     action: box ? { text: action.textContent.trim(), top: Math.round(box.top), bottom: Math.round(box.bottom),
       left: Math.round(box.left), right: Math.round(box.right), height: Math.round(box.height) } : null };
 })()`;
@@ -143,7 +145,7 @@ async function captureSection(cdp, sessionId, selector, ready, name) {
 }
 const historyByDayReady = `Boolean(document.querySelector('section.history tr.history-day .history-day-total'))`;
 const reportCardReady = `(() => { const values = [...document.querySelectorAll('.report-glance dd')]; return values.length === 3 && values.every(node => /^\\d{2,}:\\d{2}:\\d{2}$/.test(node.textContent.trim())); })()`;
-async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = true } = {}) {
+async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = true, requireTimerCard = false } = {}) {
   const evaluate = async expression => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
@@ -165,6 +167,13 @@ async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = t
         assert.ok(layout.action.top >= 0 && layout.action.bottom <= height && layout.action.left >= 0 && layout.action.right <= width,
           `${state} ${width}x${height}: Start/Stop is not visible without scrolling`);
         assert.ok(layout.action.height >= 40, `${state}: Start/Stop is lower than 40px`);
+      }
+      if (requireTimerCard) {
+        // Package 3: the review banner is compact, so the timer card and its clock stay in view without scrolling.
+        assert.equal(layout.scrollY, 0);
+        assert.ok(layout.card && layout.clock, `${state}: the timer card or its clock is missing`);
+        assert.ok(layout.card.top >= 0 && layout.card.top < height && layout.clock.top >= layout.card.top && layout.clock.bottom <= height,
+          `${state} ${width}x${height}: the timer card and its clock are not visible without scrolling (${JSON.stringify(layout)})`);
       }
       await saveScreenshot(cdp, sessionId, `main-${state}-${width}x${height}`);
     } finally {
@@ -361,14 +370,40 @@ async function exercisePage(data, phase) {
           ?.getAttribute('aria-label') === `${taskName ?? 'Bez zadania'} — ${client} / ${data.project}`);
       }
       await setValue(`${timer} .timer-description input`, description, 'input');
+      // Package 3: one main action under the clock; Start (idle) and Stop (running) share its place and size.
+      const mainBox = () => {
+        const card = pick(timer)?.getBoundingClientRect();
+        const box = pick(`${timer} .timer-main button`)?.getBoundingClientRect();
+        return card && box ? [box.left - card.left, box.top - card.top, box.width, box.height].map(Math.round).join(',') : null;
+      };
+      const idleBox = first ? mainBox() : null;
+      if (first && (!idleBox || !pick(`${timer} .timer-main.timer-start button`))) fail('The main Start action is missing under the clock');
       if (first) {
         // A fast double click must send one start: the second click finds the request gate closed.
         const start = await until('start enabled', () => enabled(pick(`${timer} .timer-start button`)));
         start.click(); start.click();
       } else await click('start timer', () => pick(`${timer} .timer-start button`));
       await waitForMeasurement();
+      if (first) {
+        const runningBox = mainBox();
+        if (!pick(`${timer} .timer-main.timer-stop button`) || runningBox !== idleBox) fail(`The main action moved or changed size between idle and running: ${idleBox} -> ${runningBox}`);
+        console.log(`UI_LAYOUT main-action idle=${idleBox} running=${runningBox}`);
+      }
       if ([...document.querySelectorAll('[role="alert"]')].some(node => node.textContent.includes('Nie udało się potwierdzić operacji'))) fail('A double click sent a second start');
-      await click('stop timer', () => pick(`${timer} .timer-stop button`));
+      if (first) {
+        // Package 3: Start and Stop are one button. A double click on Stop must not start a new timer: the second
+        // click lands right after the button turned back into Start (quiet period from the end of the write).
+        const stop = await until('stop enabled', () => enabled(pick(`${timer} .timer-main.timer-stop button`)));
+        stop.click();
+        const restart = await until('main action back to Start', () => enabled(pick(`${timer} .timer-main.timer-start button`)));
+        restart.click();
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const entryRows = () => [...document.querySelectorAll('section.history tbody tr')].filter(row => row.textContent.includes(description) && row.querySelector('.entry-menu-trigger'));
+        await until('completed entry in History', () => historyRow(description));
+        if (pick(`${timer} .status.running`) || pick(`${timer} .timer-main.timer-stop button`) || entryRows().length !== 1) {
+          fail(`A double click on Stop started a new timer (running: ${Boolean(pick(`${timer} .status.running`))}, entries: ${entryRows().length})`);
+        }
+      } else await click('stop timer', () => pick(`${timer} .timer-stop button`));
       await until('completed entry in History', () => historyRow(description));
       if (first) {
         await until('day and week totals next to the timer', () => /^Dziś \d+ (h \d+ )?min · Tydzień \d+ (h \d+ )?min/.test(pick(`${timer} .timer-totals`)?.textContent ?? ''));
@@ -1584,7 +1619,7 @@ async function runWindow(port, phase, recovery) {
       console.log('PASS: Start without a project opens the picker and leaves the timer stopped');
     }
     if (phase === 'initial') await captureMainLayout(cdp, sessionId, 'empty');
-    if (phase === 'recover') await captureMainLayout(cdp, sessionId, 'recovered', { requireTimerAction: false });
+    if (phase === 'recover') await captureMainLayout(cdp, sessionId, 'recovered', { requireTimerAction: false, requireTimerCard: true });
     if (phase === 'initial') await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: csvDirectory, eventsEnabled: true });
     const input = { primaryClient, secondClient, project, task, primaryDescription, secondDescription, interruptedDescription, recovery };
     const result = await cdp.send('Runtime.evaluate', {

@@ -152,6 +152,22 @@ export function descriptionCommand(active: Entry | null, draft: DescriptionDraft
   return { name: 'set_entry_description', args: { entryId: Number(active.id), expected: draft.expected, description: draft.value } };
 }
 
+/** Recently used targets other than the running one: quick switching in the expanded mini timer. */
+export function switchChoices(recent: Choice[], active: Entry | null, limit = 3): Choice[] {
+  if (!active) return [];
+  const current = keyOf(active);
+  return recent.filter(choice => choice.key !== current).slice(0, limit);
+}
+
+/**
+ * D3, the same command as "Przełącz zadanie" in the main window: one atomic switch that names the running
+ * entry, so a timer changed elsewhere is not ended. Only a running, resolved timer can be switched.
+ */
+export function switchCommand(mode: ReturnType<typeof clockState>['mode'], active: Entry | null, choice: Choice | undefined) {
+  if (mode !== 'running' || !active || active.recovered || active.uncertain || !choice || choice.key === keyOf(active)) return null;
+  return { name: 'start_project_timer', args: { projectId: Number(choice.project.id), taskId: choice.task ? Number(choice.task.id) : null, expectedActiveId: Number(active.id), description: '' } };
+}
+
 export function createRequestGate() {
   let writing = false;
   let read = 0;
@@ -161,6 +177,21 @@ export function createRequestGate() {
     endWrite() { writing = false; },
     beginRead() { return ++read; },
     isCurrent(ticket: number) { return ticket === read; },
+  };
+}
+
+/**
+ * Quiet period for a control that changes meaning in place: Start ↔ Stop on one button, the mini timer's
+ * round toggle (also the shortcut) and quick switching. It is marked at the click and again when the write
+ * ends, so the second click of a double click does nothing in either direction: a Stop does not start a new
+ * timer, a Start does not stop it, a switch does not switch back.
+ */
+export const ACTION_SETTLE_MS = 700;
+export function createActionSettle(settleMs = ACTION_SETTLE_MS) {
+  let last = Number.NEGATIVE_INFINITY;
+  return {
+    mark(now: number) { last = Math.max(last, now); },
+    allows(now: number) { return now - last >= settleMs; },
   };
 }
 
