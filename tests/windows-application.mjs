@@ -48,6 +48,21 @@ const inspectMainLayout = `(() => {
     action: box ? { text: action.textContent.trim(), top: Math.round(box.top), bottom: Math.round(box.bottom),
       left: Math.round(box.left), right: Math.round(box.right), height: Math.round(box.height) } : null };
 })()`;
+// UIQ-05 / WCAG 2.5.8: the project search is a 40 px field and every checkbox in the timer card has a target of
+// at least 24×24 (the control or the label that wraps it). Collapsed settings are opened only for the measurement.
+const inspectControlSizes = `(() => {
+  const timer = document.querySelector('[aria-label="Pomiar czasu"]');
+  const closed = [...(timer?.querySelectorAll('details:not([open])') ?? [])];
+  closed.forEach(item => { item.open = true; });
+  try {
+    const size = element => { const rect = element.getBoundingClientRect(); return { width: Math.round(rect.width), height: Math.round(rect.height) }; };
+    const frame = timer?.querySelector('.timer-picker .qp-search');
+    const field = frame?.querySelector('input');
+    const checkboxes = [...(timer?.querySelectorAll('input[type="checkbox"]') ?? [])].filter(item => item.getClientRects().length)
+      .map(item => ({ name: (item.getAttribute('aria-label') || item.closest('label')?.textContent || '').trim().slice(0, 40), box: size(item), target: size(item.closest('label') ?? item) }));
+    return { search: frame && field ? { frame: size(frame).height, field: size(field).height } : null, checkboxes };
+  } finally { closed.forEach(item => { item.open = false; }); }
+})()`;
 // Detailed report with the saved client filter and reporting time zone (UIQ evidence; observation only).
 async function captureReportDetail(cdp, sessionId, state) {
   const evaluate = async expression => {
@@ -176,6 +191,16 @@ async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = t
           `${state} ${width}x${height}: the timer card and its clock are not visible without scrolling (${JSON.stringify(layout)})`);
       }
       await saveScreenshot(cdp, sessionId, `main-${state}-${width}x${height}`);
+      if (width === 1280) {
+        const controls = await evaluate(inspectControlSizes);
+        console.log(`UI_LAYOUT controls-${state} ${width}x${height} ${JSON.stringify(controls)}`);
+        assert.ok(controls.search, `${state}: the project search is missing`);
+        assert.ok(controls.search.frame >= 40 && controls.search.field >= 40, `${state}: the project search is lower than 40px (${JSON.stringify(controls.search)})`);
+        assert.ok(controls.checkboxes.length > 0, `${state}: no checkbox measured in the timer card`);
+        for (const item of controls.checkboxes) {
+          assert.ok(item.target.width >= 24 && item.target.height >= 24, `${state}: checkbox "${item.name}" has a target below 24×24 (${JSON.stringify(item)})`);
+        }
+      }
     } finally {
       await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
     }
@@ -602,6 +627,10 @@ async function verifyMiniTimer(cdp, mainSession) {
   await evaluate(widget, `document.querySelector('[aria-label="Rozwiń panel"]').click()`);
   await waitFor('mini timer opens the focused project search', () => evaluate(widget,
     `document.activeElement === document.querySelector('[role="combobox"]')`));
+  // UIQ-05: the same 40 px search field in the expanded mini timer (440×390).
+  const widgetSearch = await evaluate(widget, `(() => { const size = element => Math.round(element.getBoundingClientRect().height); return { frame: size(document.querySelector('.qp-search')), field: size(document.querySelector('.qp-search input')) }; })()`);
+  console.log(`UI_LAYOUT widget-search ${JSON.stringify(widgetSearch)}`);
+  assert.ok(widgetSearch.frame >= 40 && widgetSearch.field >= 40, `mini timer search is lower than 40px: ${JSON.stringify(widgetSearch)}`);
   await evaluate(widget, `(() => {
     const input = document.activeElement;
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(secondClient)});
@@ -1116,6 +1145,10 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   assert.ok(review.text.includes(primaryDescription) && review.text.includes(text));
   assert.equal(review.checked, 0);
   assert.equal(review.transferDisabled, true);
+  // UIQ-05 / WCAG 2.5.8: the field checkboxes have no visible text; the label around each one is a 32×32 target.
+  const reviewTargets = await evaluate(`[...document.querySelectorAll('.entry-draft-review input[type="checkbox"]')].map(item => { const rect = (item.closest('label') ?? item).getBoundingClientRect(); return [Math.round(rect.width), Math.round(rect.height)]; })`);
+  console.log(`UI_LAYOUT draft-review-checkboxes ${JSON.stringify(reviewTargets)}`);
+  assert.ok(reviewTargets.length > 0 && reviewTargets.every(([width, height]) => width >= 24 && height >= 24), `draft review checkbox targets below 24×24: ${JSON.stringify(reviewTargets)}`);
   await evaluate(`document.querySelector('.entry-draft-review input[aria-label="Przenieś pole Opis"]').click()`);
   await evaluate(`[...document.querySelectorAll('.entry-draft-review button')].find(item => item.textContent.trim() === 'Przenieś wybrane pola').click()`);
   await waitFor('selected draft field restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));

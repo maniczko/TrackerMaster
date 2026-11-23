@@ -511,7 +511,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
             <th scope="row">{fieldLabels[field]}</th>
             {review.currentFields && <td>{review.currentFields[field] || '—'}</td>}
             <td>{review.draft.fields[field] || '—'}</td>
-            {review.currentFields && <td><input
+            {review.currentFields && <td><label className="check-target"><input
               type="checkbox"
               aria-label={`Przenieś pole ${fieldLabels[field]}`}
               disabled={working || review.currentFields[field] === review.draft.fields[field]}
@@ -520,7 +520,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
                 const selected = event.target.checked ? [...review.selected, field] : review.selected.filter(value => value !== field);
                 setReview({ ...review, selected });
               }}
-            /></td>}
+            /></label></td>}
           </tr>)}</tbody>
         </table></div>
         <div className="actions">
