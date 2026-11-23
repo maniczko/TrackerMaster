@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+         xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
+         IgnorableNamespaces="uap uap10 rescap desktop6 virtualization">
+  <!-- TEST-ONLY identity: the workflow substitutes exact Partner Center fields for Store candidates. -->
+  <Identity Name="TrackerMaster.TestOnly"
+            Publisher="CN=TrackerMaster-TestOnly, OID.2.25.311729368913984317654407730594956997722=1"
+            Version="0.1.0.0" ProcessorArchitecture="x64"/>
+  <Properties>
+    <DisplayName>TrackerMaster</DisplayName>
+    <PublisherDisplayName>TrackerMaster Test</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <!-- Windows 10 fallback: persist AppData; Windows 11 uses the narrower exclusion below. -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+    <!-- Keep the isolated SQLite profile outside uninstall-cleaned MSIX virtualization. -->
+    <virtualization:FileSystemWriteVirtualization>
+      <virtualization:ExcludedDirectories>
+        <virtualization:ExcludedDirectory>$(KnownFolder:RoamingAppData)\pl.tracker.personal.testonly</virtualization:ExcludedDirectory>
+      </virtualization:ExcludedDirectories>
+    </virtualization:FileSystemWriteVirtualization>
+  </Properties>
+  <Resources>
+    <Resource Language="pl-PL"/>
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0"/>
+  </Dependencies>
+  <Applications>
+    <Application Id="TrackerMaster" Executable="tracker-master.exe"
+                 uap10:RuntimeBehavior="packagedClassicApp" uap10:TrustLevel="mediumIL">
+      <uap:VisualElements DisplayName="TrackerMaster"
+                          Description="TrackerMaster - isolated private test build"
+                          BackgroundColor="transparent"
+                          Square150x150Logo="Assets\Square150x150Logo.png"
+                          Square44x44Logo="Assets\Square44x44Logo.png"/>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust"/>
+    <rescap:Capability Name="unvirtualizedResources"/>
+  </Capabilities>
+</Package>
