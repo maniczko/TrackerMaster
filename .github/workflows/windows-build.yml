@@ -101,6 +101,24 @@ jobs:
           path: src-tauri/target/release
       - name: Verify isolated Windows application and CSV
         run: node tests/windows-application.mjs
+      - name: Release the PTT-36 T27 test disk if a run was interrupted
+        # The E2E detaches its VHD and restores the test profile in `finally`; this only
+        # covers a killed process. It touches nothing but the T27 VHD and the test profile.
+        if: always()
+        shell: pwsh
+        run: |
+          $profile = Join-Path $env:APPDATA 'pl.tracker.personal.testonly'
+          $item = Get-Item -LiteralPath $profile -Force -ErrorAction SilentlyContinue
+          if ($item -and $item.LinkType -eq 'Junction') {
+            [System.IO.Directory]::Delete($profile)
+            Rename-Item -LiteralPath "$profile.before-disk-full" -NewName 'pl.tracker.personal.testonly'
+            Write-Host 'Restored the test profile directory after an interrupted T27 run.'
+          }
+          Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Filter 'trackermaster-disk-full-*.vhdx' -ErrorAction SilentlyContinue | ForEach-Object {
+            Dismount-DiskImage -ImagePath $_.FullName -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -LiteralPath $_.FullName -Force
+            Write-Host "Released leftover test disk $($_.Name)."
+          }
       - name: Verify file protection and second-account isolation (DEV-14)
         # Collect DEV-14 evidence even when an earlier E2E step failed; the job still fails.
         if: ${{ !cancelled() }}
