@@ -14,8 +14,8 @@ import EntryMenu from './EntryMenu';
 import { entryTimeRange } from './historyFormat';
 import { defaultShortcut, shortcutLabel } from './shortcut';
 import { MiniTimerTaskPicker } from './MiniTimerPanel';
-import { choicesFor, createRequestGate, recentChoices } from './miniTimerModel';
-import { mainAction, mainActionSettled, selectionFor, selectionKey, startBlocked } from './timerChoice';
+import { choicesFor, createActionSettle, createRequestGate, recentChoices } from './miniTimerModel';
+import { mainAction, selectionFor, selectionKey, startBlocked } from './timerChoice';
 import { historyDays, liveTimerTotals, timerTotals, totalsBaseData } from './reportDayModel';
 import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
@@ -166,7 +166,8 @@ export default function App() {
   const writes = useRef(createRequestGate()).current;
   const startDisabled = startBlocked({ busy, loaded, projectId, taskId, client: selectedClient, project: selectedProject, task: selectedTask, active: data.active });
   const main = mainAction({ busy, loaded, projectId, taskId, client: selectedClient, project: selectedProject, task: selectedTask, active: data.active });
-  const startClickAt = useRef(0);
+  // Start and Stop are one button that changes meaning in place: after either, a second click is ignored for a moment.
+  const mainSettle = useRef(createActionSettle()).current;
   const sleep = usePendingSleep(loaded, async () => {
     setReportRevision(version => version + 1);
     await refresh();
@@ -176,18 +177,18 @@ export default function App() {
   }
   function runMainAction() {
     if (main.disabled) return;
-    if (main.kind === 'stop') {
-      // Stop sits where Start was: the second click of a double click on Start must not stop the new timer.
-      if (!mainActionSettled(startClickAt.current, Date.now())) return;
-      void execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.');
-    } else if (main.kind === 'choose') {
+    if (main.kind === 'choose') {
       // Like the mini timer: Start without a project leads to the project search.
       if (needsStructure) openStructure();
       else { pickerInput.current?.focus(); pickerInput.current?.scrollIntoView({ block: 'nearest' }); }
-    } else {
-      startClickAt.current = Date.now();
-      void startTimer();
+      return;
     }
+    // Double click in either direction: Stop → Start must not start a timer, Start → Stop must not end it.
+    if (!mainSettle.allows(Date.now())) return;
+    mainSettle.mark(Date.now());
+    const settled = () => mainSettle.mark(Date.now());
+    if (main.kind === 'stop') void execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.').finally(settled);
+    else void startTimer().finally(settled);
   }
   function chooseTimerTarget(key: string) {
     const next = selectionFor(choices, key);
@@ -330,7 +331,7 @@ export default function App() {
         <SleepNote sleep={sleep} />
         <details className="timer-review-why"><summary>Dlaczego?</summary><p>Przyczyną mogło być uśpienie komputera, pominięte zdarzenie zasilania lub zmiana zegara. {data.active.has_sleep ? 'Jeśli na liście okresów uśpienia brakuje czasu wybudzenia, najpierw go uzupełnij. ' : ''}Następnie zatrzymaj pomiar: jeśli czasu nie da się potwierdzić, aplikacja nie zapisze końca i poprosi o faktyczny czas zakończenia.</p></details></div>}
       {loaded && data.active?.recovered && <div role="alert" className="alert pending timer-review">
-        <p className="timer-review-lead"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto {formatDate(data.active.started_at)} — podaj faktyczny czas zakończenia.</p>
+        <p className="timer-review-lead"><strong>Pomiar wymaga weryfikacji.</strong> Rozpoczęto {formatDate(data.active.started_at)} — podaj faktyczny czas zakończenia. {data.active.has_sleep ? 'Czas do tej godziny zostanie zaliczony jako praca, z wyjątkiem okresów uśpienia, o których zdecydujesz.' : 'Cały czas do tej godziny, także przerwy, zostanie zaliczony jako praca.'}</p>
         <form noValidate className="timer-review-form" onSubmit={e => { e.preventDefault(); const end = parseLocalDate(recoveryEnd); if (!end) { setError('Sprawdź datę i godzinę zakończenia. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } execute(() => invoke('recover_timer', { endedAt: end.toISOString(), expectedActiveId: Number(data.active!.id) }), 'Przerwany pomiar zapisano z ręcznie wskazanym zakończeniem.'); }}>
           <label>Data i godzina zakończenia <input type="datetime-local" step="1" required min={recoveryLimits.min} max={recoveryLimits.max} aria-invalid={recoveryProblem !== null} aria-describedby={recoveryProblem ? 'recovery-end-problem' : undefined} value={recoveryEnd} onChange={e => setRecoveryEnd(e.target.value)} /></label>{' '}
           <button type="submit" className="primary" disabled={busy || !loaded || !recoveryEnd || recoveryProblem === 'after' || recoveryProblem === 'invalid'}>Zapisz zakończenie</button>

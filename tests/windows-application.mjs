@@ -390,7 +390,20 @@ async function exercisePage(data, phase) {
         console.log(`UI_LAYOUT main-action idle=${idleBox} running=${runningBox}`);
       }
       if ([...document.querySelectorAll('[role="alert"]')].some(node => node.textContent.includes('Nie udało się potwierdzić operacji'))) fail('A double click sent a second start');
-      await click('stop timer', () => pick(`${timer} .timer-stop button`));
+      if (first) {
+        // Package 3: Start and Stop are one button. A double click on Stop must not start a new timer: the second
+        // click lands right after the button turned back into Start (quiet period from the end of the write).
+        const stop = await until('stop enabled', () => enabled(pick(`${timer} .timer-main.timer-stop button`)));
+        stop.click();
+        const restart = await until('main action back to Start', () => enabled(pick(`${timer} .timer-main.timer-start button`)));
+        restart.click();
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const entryRows = () => [...document.querySelectorAll('section.history tbody tr')].filter(row => row.textContent.includes(description) && row.querySelector('.entry-menu-trigger'));
+        await until('completed entry in History', () => historyRow(description));
+        if (pick(`${timer} .status.running`) || pick(`${timer} .timer-main.timer-stop button`) || entryRows().length !== 1) {
+          fail(`A double click on Stop started a new timer (running: ${Boolean(pick(`${timer} .status.running`))}, entries: ${entryRows().length})`);
+        }
+      } else await click('stop timer', () => pick(`${timer} .timer-stop button`));
       await until('completed entry in History', () => historyRow(description));
       if (first) {
         await until('day and week totals next to the timer', () => /^Dziś \d+ (h \d+ )?min · Tydzień \d+ (h \d+ )?min/.test(pick(`${timer} .timer-totals`)?.textContent ?? ''));

@@ -52,9 +52,3 @@ export function mainAction(state: Parameters<typeof startBlocked>[0]): MainActio
   if (!projectId) return { kind: 'choose', disabled: busy || !loaded };
   return { kind: 'start', disabled: startBlocked(state) };
 }
-
-/** A Stop that lands this soon after a Start click from the same button is the second half of a double click. */
-export const MAIN_ACTION_SETTLE_MS = 700;
-export function mainActionSettled(lastStartClick: number, now: number, settleMs = MAIN_ACTION_SETTLE_MS): boolean {
-  return now - lastStartClick >= settleMs;
-}

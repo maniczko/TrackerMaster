@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Snapshot } from './App';
 import { MiniTimerTaskPicker, TimerIcon } from './MiniTimerPanel';
-import { activeContext, barContext, choicesFor, clockState, createRequestGate, descriptionCommand, projectColour, projectPath, readLegacyPin, recentChoices, switchChoices, switchCommand, taskName, toggleCommand } from './miniTimerModel';
+import { activeContext, barContext, choicesFor, clockState, createActionSettle, createRequestGate, descriptionCommand, projectColour, projectPath, readLegacyPin, recentChoices, switchChoices, switchCommand, taskName, toggleCommand } from './miniTimerModel';
 import type { DescriptionDraft } from './miniTimerModel';
 import { defaultShortcut, matchesShortcut, shortcutLabel } from './shortcut';
 import './miniTimer.css';
@@ -30,6 +30,8 @@ export default function Widget() {
   const [panelPending, setPanelPending] = useState(false);
   const [details, setDetails] = useState(false);
   const gate = useRef(createRequestGate()).current;
+  // The round toggle (and the shortcut) and quick switching change meaning in place: no second action right after one.
+  const settle = useRef(createActionSettle()).current;
   const connecting = useRef(false);
   const search = useRef<HTMLInputElement>(null);
   const description = useRef<HTMLTextAreaElement>(null);
@@ -156,7 +158,9 @@ export default function Widget() {
       else void setPanel(true);
       return;
     }
-    void write(command.name, command.args, true, command.name === 'widget_project_start' ? () => setDraft('') : undefined);
+    if (!settle.allows(Date.now())) return;
+    settle.mark(Date.now());
+    void write(command.name, command.args, true, command.name === 'widget_project_start' ? () => setDraft('') : undefined).finally(() => settle.mark(Date.now()));
   };
   useEffect(() => {
     if (open) {
@@ -207,7 +211,9 @@ export default function Widget() {
   const cancelEdit = () => setEdit(null);
   const switchTo = (item: (typeof quickSwitch)[number]) => {
     const change = switchCommand(clock.mode, active, item);
-    if (change && !controlsLocked && !dirtyEdit) void write(change.name, change.args, true);
+    if (!change || controlsLocked || dirtyEdit || !settle.allows(Date.now())) return;
+    settle.mark(Date.now());
+    void write(change.name, change.args, true).finally(() => settle.mark(Date.now()));
   };
   const selectedChoice = (key: string) => {
     if (gate.writing || controlsLocked || active || !choices.some(item => item.key === key)) return;

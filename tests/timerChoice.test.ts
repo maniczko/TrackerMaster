@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Snapshot } from '../src/App.tsx';
-import { choicesFor, createRequestGate, recentChoices } from '../src/miniTimerModel.ts';
-import { MAIN_ACTION_SETTLE_MS, mainAction, mainActionSettled, selectionFor, selectionKey, startBlocked } from '../src/timerChoice.ts';
+import { ACTION_SETTLE_MS, choicesFor, createActionSettle, createRequestGate, recentChoices } from '../src/miniTimerModel.ts';
+import { mainAction, selectionFor, selectionKey, startBlocked } from '../src/timerChoice.ts';
 
 // Synthetic data only. The main window uses the mini timer's own choice model.
 const snapshot: Snapshot = {
@@ -92,14 +92,39 @@ test('main action: Stop while running, Start with a project, otherwise it leads 
   assert.deepEqual(mainAction({ ...base, busy: true, active: running }), { kind: 'stop', disabled: true });
 });
 
-test('a Stop right after Start from the same button is ignored (double click), a later one is not', () => {
-  const start = 1_000_000;
-  assert.equal(mainActionSettled(start, start + 120), false);
-  assert.equal(mainActionSettled(start, start + MAIN_ACTION_SETTLE_MS - 1), false);
-  assert.equal(mainActionSettled(start, start + MAIN_ACTION_SETTLE_MS), true);
-  assert.equal(mainActionSettled(0, start), true, 'no Start click in this window');
-  // The start itself is still guarded by the write gate: the second click of a double click sends nothing.
+test('double click on the main action does nothing in either direction (Stop → Start, Start → Stop), counted from the end of the write', async () => {
+  // Stop → quick Start: the Stop write ends at 80 ms and the button is "Rozpocznij" again; the second click lands at 150 ms.
+  const stop = createActionSettle();
+  assert.equal(stop.allows(1_000), true);
+  stop.mark(1_000);                         // click: Stop
+  stop.mark(1_080);                         // the write ended, the button now says Rozpocznij
+  assert.equal(stop.allows(1_150), false, 'the second click of a double click on Stop must not start a timer');
+  assert.equal(stop.allows(1_080 + ACTION_SETTLE_MS - 1), false, 'the quiet period runs from the end of the write');
+  assert.equal(stop.allows(1_080 + ACTION_SETTLE_MS), true, 'a deliberate Start later works');
+  // A slow write: the quiet period still starts when it ends, not at the click.
+  const slow = createActionSettle();
+  slow.mark(0); slow.mark(2_000);
+  assert.equal(slow.allows(ACTION_SETTLE_MS + 10), false);
+  assert.equal(slow.allows(2_000 + ACTION_SETTLE_MS), true);
+  // Start → quick Stop, the same rule.
+  const start = createActionSettle();
+  start.mark(5_000); start.mark(5_060);
+  assert.equal(start.allows(5_200), false, 'the second click of a double click on Start must not stop the new timer');
+  // The start itself is also guarded by the write gate: a synchronous second click sends nothing.
   const gate = createRequestGate();
   assert.equal(gate.beginWrite(), true);
   assert.equal(gate.beginWrite(), false);
+  // Wiring: both windows check and mark the guard for every action that changes meaning in place.
+  const { readFileSync } = await import('node:fs');
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const widget = readFileSync(new URL('../src/Widget.tsx', import.meta.url), 'utf8');
+  const run = app.match(/function runMainAction\(\) \{([\s\S]*?)\r?\n  \}\r?\n/);
+  assert.ok(run, 'App must define runMainAction()');
+  const body = run[1];
+  assert.ok(body.indexOf('mainSettle.allows(Date.now())') < body.indexOf("invoke('stop_timer'") && body.indexOf('mainSettle.allows(Date.now())') < body.indexOf('startTimer()'),
+    'Stop and Start are both behind the guard');
+  assert.match(body, /'Pomiar zatrzymany\.'\)\.finally\(settled\)/, 'Stop marks the guard when its write ends');
+  assert.match(body, /startTimer\(\)\.finally\(settled\)/, 'Start marks the guard when its write ends');
+  assert.equal(widget.match(/settle\.allows\(Date\.now\(\)\)/g)?.length, 2, 'the round toggle (and shortcut) and quick switching are guarded');
+  assert.equal(widget.match(/\.finally\(\(\) => settle\.mark\(Date\.now\(\)\)\)/g)?.length, 2);
 });

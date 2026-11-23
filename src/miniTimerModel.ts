@@ -180,6 +180,21 @@ export function createRequestGate() {
   };
 }
 
+/**
+ * Quiet period for a control that changes meaning in place: Start ↔ Stop on one button, the mini timer's
+ * round toggle (also the shortcut) and quick switching. It is marked at the click and again when the write
+ * ends, so the second click of a double click does nothing in either direction: a Stop does not start a new
+ * timer, a Start does not stop it, a switch does not switch back.
+ */
+export const ACTION_SETTLE_MS = 700;
+export function createActionSettle(settleMs = ACTION_SETTLE_MS) {
+  let last = Number.NEGATIVE_INFINITY;
+  return {
+    mark(now: number) { last = Math.max(last, now); },
+    allows(now: number) { return now - last >= settleMs; },
+  };
+}
+
 export function readLegacyPin(storage?: Pick<Storage, 'getItem'>): boolean | null {
   try {
     const saved = (storage ?? localStorage).getItem('widget-on-top');
