@@ -1248,7 +1248,10 @@ const writeFailure = {
   firstDescription: 'PTT-36 pomiar przy awarii zapisu',
   secondDescription: 'PTT-36 przełączenie po awarii',
   editDescription: 'PTT-36 korekta przy awarii zapisu',
-  editEntryDescription: 'Korekta zapisana przy zamknięciu',
+  // The corrected entry is the one started by the switch: its start is the exact
+  // millisecond end of the previous entry, so a correction of only its end must not
+  // move that shared boundary (CI run 45062958698 hit this by chance on an older entry).
+  editEntryDescription: 'PTT-36 przełączenie po awarii',
 };
 
 function writeFailureState() {
@@ -1373,7 +1376,8 @@ async function verifyWriteFailure(cdp, sessionId) {
   await waitFor('Switch retry succeeded', () => evaluate(successShown('Przełączono zadanie.')));
   const switched = await activeId();
   assert.ok(switched && switched.id !== started.id && switched.description === writeFailure.secondDescription);
-  await delay(2_000);
+  // Long enough that the later correction (end minus one second) stays after its start.
+  await delay(3_000);
   await waitFor('Stop enabled for retry', () => evaluate(enabledButton(`${timer} .timer-stop button`)));
   await evaluate(`document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}).click()`);
   await waitFor('Stop retry succeeded', () => evaluate(successShown('Pomiar zatrzymany.')));
@@ -1494,7 +1498,12 @@ async function verifyDraftAfterWriteFailure(cdp, sessionId, pending) {
   assert.equal(saved.entries.length, pending.after.entries.length);
   assert.equal(entry.description, writeFailure.editDescription);
   assert.equal(Date.parse(entry.ended_at), Date.parse(pending.targetEnd));
-  assert.equal(entry.started_at.slice(0, 19), pending.original.started_at.slice(0, 19));
+  // The start was not edited: it keeps its exact stored instant, still shared with the
+  // previous entry's end, so no time moved between the two entries.
+  assert.equal(entry.started_at, pending.original.started_at);
+  const previous = saved.entries.find(item => item.ended_at === pending.original.started_at);
+  assert.ok(previous && previous.id !== entry.id, 'the corrected entry no longer shares its start with the previous entry');
+  assert.deepEqual(previous, pending.after.entries.find(item => item.id === previous.id));
   assert.equal(entry.duration_seconds, Math.floor((Date.parse(entry.ended_at) - Date.parse(entry.started_at)) / 1000));
   assert.equal(saved.revisions, pending.after.revisions + 1, 'retry saved the time correction more than once');
   assert.equal(saved.descriptionRevisions, pending.after.descriptionRevisions + 1, 'retry saved the description more than once');
