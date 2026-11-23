@@ -1136,6 +1136,17 @@ fn update_entry_time(db: &rusqlite::Transaction<'_>, entry_id: i64, expected_sta
     let (old_start, old_end, old_seconds) = previous.ok_or("Nie znaleziono zakończonego wpisu.")?;
     ensure_no_sleep_periods(db, entry_id)?;
     if old_start != expected_start || old_end != expected_end { return Err("Wpis zmienił się w innym oknie. Odśwież dane przed korektą.".into()); }
+    // The editor works in whole seconds, while recorded boundaries keep milliseconds
+    // (a switch shares one exact boundary between two entries). A submitted boundary
+    // equal to the stored one truncated to the second was not changed by the user:
+    // keep the stored instant, so correcting only the end cannot move the start
+    // into the previous entry (a false overlap) and no time is shifted silently.
+    let unchanged = |submitted: DateTime<Utc>, stored: &str| -> Cmd<DateTime<Utc>> {
+        let stored = DateTime::parse_from_rfc3339(stored).map_err(|_| "Niepoprawny zapis czasu w bazie.")?.with_timezone(&Utc);
+        Ok(if stored.timestamp() == submitted.timestamp() { stored } else { submitted })
+    };
+    let (start, end) = (unchanged(start, &old_start)?, unchanged(end, &old_end)?);
+    if end <= start { return Err("Koniec musi być późniejszy od początku.".into()); }
     ensure_no_overlap(db, start, end, Some(entry_id))?;
     let new_start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
     let new_end = end.to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -2987,6 +2998,48 @@ mod tests {
         assert_eq!(s.entries[0].duration_seconds, 1800);
         assert!(s.entries[0].manually_resolved);
         assert!(resolve_recovered(&mut tracker, "2026-01-01T10:30:00Z", current).is_err());
+    }
+
+
+    // PTT-36 / T26 regression (CI run 45062958698): a switch leaves two entries sharing one
+    // boundary with milliseconds. The editor submits whole seconds, so correcting only the
+    // end of the second entry used to move its start back into the first one and was
+    // refused as an overlap. An unchanged boundary must keep its exact stored instant.
+    #[test]
+    fn correcting_only_the_end_keeps_a_millisecond_start_shared_with_the_previous_entry() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'A'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'P');
+            INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES
+              (1,1,'2026-01-01T10:00:00.000Z','2026-01-01T10:00:05.500Z',5),
+              (2,1,'2026-01-01T10:00:05.500Z','2026-01-01T10:00:15.250Z',9),
+              (3,1,'2026-01-01T10:00:15.250Z','2026-01-01T10:00:20.000Z',4);").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let current = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+        let stored = |tracker: &Tracker, id: i64| tracker.db.query_row("SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=?1", [id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))).unwrap();
+        let revisions = |tracker: &Tracker| tracker.db.query_row("SELECT COUNT(*) FROM entry_revisions", [], |r| r.get::<_, i64>(0)).unwrap();
+
+        // Only the end changes (10:00:15.250 -> 10:00:14); the start is shown and sent as 10:00:05.
+        correct_entry(&mut tracker, 2, "2026-01-01T10:00:05.500Z", "2026-01-01T10:00:15.250Z", "2026-01-01T10:00:05Z", "2026-01-01T10:00:14Z", current).unwrap();
+        assert_eq!(stored(&tracker, 2), ("2026-01-01T10:00:05.500Z".into(), "2026-01-01T10:00:14.000Z".into(), 8));
+        assert_eq!(stored(&tracker, 1), ("2026-01-01T10:00:00.000Z".into(), "2026-01-01T10:00:05.500Z".into(), 5));
+        assert_eq!(revisions(&tracker), 1);
+        let (before_start, after_start): (String, String) = tracker.db.query_row("SELECT before_start,after_start FROM entry_revisions WHERE entry_id=2", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(before_start, after_start, "the unchanged start must not be recorded as moved");
+
+        // Resubmitting the same whole-second values is a no-op: no second revision.
+        correct_entry(&mut tracker, 2, "2026-01-01T10:00:05.500Z", "2026-01-01T10:00:14.000Z", "2026-01-01T10:00:05Z", "2026-01-01T10:00:14Z", current).unwrap();
+        assert_eq!(revisions(&tracker), 1);
+
+        // A start actually moved into the previous entry is still a real overlap.
+        assert!(correct_entry(&mut tracker, 2, "2026-01-01T10:00:05.500Z", "2026-01-01T10:00:14.000Z", "2026-01-01T10:00:04Z", "2026-01-01T10:00:14Z", current).is_err());
+        // Correcting the first entry's start only keeps its millisecond end, shared with entry 2.
+        correct_entry(&mut tracker, 1, "2026-01-01T10:00:00.000Z", "2026-01-01T10:00:05.500Z", "2026-01-01T10:00:01Z", "2026-01-01T10:00:05Z", current).unwrap();
+        assert_eq!(stored(&tracker, 1), ("2026-01-01T10:00:01.000Z".into(), "2026-01-01T10:00:05.500Z".into(), 4));
+        // Extending the end to the next whole second would overlap entry 3 and is refused.
+        assert!(correct_entry(&mut tracker, 2, "2026-01-01T10:00:05.500Z", "2026-01-01T10:00:14.000Z", "2026-01-01T10:00:05Z", "2026-01-01T10:00:16Z", current).is_err());
+        assert_eq!(stored(&tracker, 2), ("2026-01-01T10:00:05.500Z".into(), "2026-01-01T10:00:14.000Z".into(), 8));
+        assert_eq!(revisions(&tracker), 2);
     }
 
     #[test]
