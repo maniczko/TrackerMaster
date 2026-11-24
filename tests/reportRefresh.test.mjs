@@ -80,3 +80,16 @@ test('the shortcut hint is hidden while the timer awaits verification (Stop disa
   assert.match(app, /\{\(!data\.active \|\| \(loaded && !data\.active\.recovered && !data\.active\.uncertain\)\) && shortcutHint\}/);
   assert.equal(app.match(/&& shortcutHint\}/g)?.length, 1);
 });
+
+// PR #63: data changed outside this window's own actions (mini timer, shortcut, another process) is read again
+// on the next snapshot refresh, so the calendar, History days and the report card never wait 60 s for it.
+test('the shared all-clients read follows the snapshot, without resetting the open report', () => {
+  const hook = readFileSync(new URL('../src/useAllClientsReport.ts', import.meta.url), 'utf8');
+  assert.match(app, /const shownData = useMemo\(\(\) => snapshotSignature\(data\.entries, data\.active\), \[data\.entries, data\.active\]\);/);
+  assert.match(app, /useAllClientsReport\(loaded, `\$\{reportRevision\}\|\$\{shownData\}`\)/);
+  assert.match(app, /<Report\b[^>]*\brevision=\{reportRevision\}/, 'the open report keeps its own revision');
+  assert.match(hook, /export function snapshotSignature\(/);
+  for (const field of ['entry.ended_at', 'entry.duration_seconds', 'entry.billable', 'entry.description', 'entry.recovered', 'entry.uncertain']) {
+    assert.ok(hook.includes(field), `the signature must include ${field}`);
+  }
+});

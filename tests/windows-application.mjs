@@ -346,7 +346,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -858,6 +858,122 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     assert.ok(rows[4].ended_at && rows[4].duration_seconds >= 5);
   } finally { stoppedDb.close(); }
   console.log('PASS: failed Switch and Stop showed errors, preserved the running entry, and succeeded once on retry');
+}
+
+// DEV-24/27/28/29 (calendar package A). Fixed entries in the DST week 23–29.03.2026 of a dedicated client,
+// so no assertion depends on the runner's clock. Expected totals follow TECH-09 in Europe/Warsaw and are
+// the report's own figures for the same entries (tests/calendarModel.test.ts, "E2E fixture week").
+const calendarFixture = {
+  client: 'Klient kalendarza E2E', project: 'Tydzień ze zmianą czasu',
+  entries: [
+    ['2026-03-23T08:00:00Z', '2026-03-23T09:30:00Z', 'Kalendarz: poniedziałek rano'],
+    ['2026-03-23T22:50:00Z', '2026-03-23T23:10:00Z', 'Kalendarz: przez północ'],
+    ['2026-03-29T00:30:00Z', '2026-03-29T01:30:00Z', 'Kalendarz: zmiana czasu'],
+  ],
+  heading: '23–29 marca 2026', nextHeading: '30 marca – 5 kwietnia 2026',
+  days: ['01:40:00', '00:10:00', '00:00:00', '00:00:00', '00:00:00', '00:00:00', '01:00:00'], week: '02:50:00', blocks: 4,
+};
+async function verifyCalendar(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  assert.equal((await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } })).time_zone, 'Europe/Warsaw');
+  const clientId = await invoke('create_client', { name: calendarFixture.client });
+  const projectId = await invoke('create_project', { clientId, name: calendarFixture.project });
+  for (const [startedAt, endedAt, description] of calendarFixture.entries) {
+    await invoke('create_project_manual_entry', { projectId, taskId: null, startedAt, endedAt, description });
+  }
+  // A running timer must survive switching views (no stop, no second timer).
+  await invoke('start_project_timer', { projectId, taskId: null, expectedActiveId: null, description: 'Kalendarz: pomiar w tle' });
+  const active = () => invoke('get_snapshot').then(snapshot => snapshot.active && { id: snapshot.active.id, ended: snapshot.active.ended_at });
+  const running = await waitFor('timer running before the calendar', active);
+  await waitFor('main window shows the running timer', () => evaluate(`Boolean(document.querySelector('[aria-label="Pomiar czasu"] .status.running'))`));
+  const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${viewButton('Kalendarz')}.click()`);
+  await waitFor('calendar opens', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-week-total')) && document.querySelector('.timer-view').hidden`));
+  const setDate = value => evaluate(`(() => {
+    const input = document.querySelector('[aria-label="Kalendarz"] input[type="date"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(value)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  })()`);
+  await setDate('2026-03-25');
+  const read = `(() => {
+    const root = document.querySelector('[aria-label="Kalendarz"]');
+    return { heading: root.querySelector('.calendar-range')?.textContent, week: root.querySelector('.calendar-week-total')?.textContent,
+      days: [...root.querySelectorAll('.calendar-day-total')].map(node => node.textContent),
+      blocks: root.querySelectorAll('.calendar-block').length,
+      labels: [...root.querySelectorAll('.calendar-block')].map(node => node.getAttribute('aria-label')) };
+  })()`;
+  // The entries above were created outside the window's own actions; the shared report read follows the
+  // snapshot (2.5 s), so the week is complete well within the wait. The last state is logged on a timeout.
+  let lastWeek = null;
+  const week = await waitFor('fixture week shown', async () => {
+    lastWeek = await evaluate(read);
+    return lastWeek.heading === calendarFixture.heading && lastWeek.blocks === calendarFixture.blocks ? lastWeek : null;
+  }).catch(error => { throw new Error(`${error.message}; last calendar state: ${JSON.stringify(lastWeek)}`); });
+  assert.deepEqual(week.days, calendarFixture.days, 'calendar day totals differ from the report for the fixture week');
+  assert.equal(week.week, calendarFixture.week);
+  assert.equal(week.blocks, calendarFixture.blocks, 'the midnight entry must give one block on each day');
+  assert.ok(week.labels.some(label => label.includes('23:50–24:00')) && week.labels.some(label => label.includes('00:00–00:10')));
+  assert.ok(week.labels.some(label => label.includes('01:30–03:30')), 'the DST entry keeps its wall-clock range');
+  // UI_LAYOUT at 1280×720: blocks inside their day column, never covering each other, at least 24 px tall.
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false }, sessionId);
+  try {
+    await waitFor('calendar at 1280x720', () => evaluate('window.innerWidth === 1280 && window.innerHeight === 720'));
+    await evaluate(`document.querySelector('[aria-label="Kalendarz"] .calendar-block').scrollIntoView({ block: 'center' })`);
+    await delay(300);
+    const layout = await evaluate(`(() => {
+      const columns = [...document.querySelectorAll('.calendar-column')];
+      const blocks = columns.flatMap((column, day) => [...column.querySelectorAll('.calendar-block')].map(block => {
+        const box = block.getBoundingClientRect(); const area = column.getBoundingClientRect();
+        return { day, top: box.top, bottom: box.bottom, left: box.left, right: box.right, height: box.height,
+          inside: box.left >= area.left - 0.5 && box.right <= area.right + 0.5 };
+      }));
+      const overlaps = blocks.filter((a, i) => blocks.some((b, j) => j > i && a.day === b.day && a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5)).length;
+      window.scrollTo(0, 0);
+      const body = document.querySelector('.calendar-body'); const head = document.querySelector('.calendar-head');
+      const hour = document.querySelectorAll('.calendar-hours span')[2].getBoundingClientRect().top - document.querySelectorAll('.calendar-hours span')[1].getBoundingClientRect().top;
+      const visibleAxis = Math.min(body.getBoundingClientRect().bottom, window.innerHeight) - head.getBoundingClientRect().bottom;
+      return { count: blocks.length, minHeight: Math.min(...blocks.map(block => block.height)), allInside: blocks.every(block => block.inside), overlaps,
+        visibleAxis: Math.round(visibleAxis), visibleHours: Math.round(10 * visibleAxis / hour) / 10, headSticky: getComputedStyle(head).position,
+        scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
+    })()`);
+    console.log(`UI_LAYOUT calendar-week 1280x720 ${JSON.stringify(layout)}`);
+    assert.ok(layout.allInside && layout.overlaps === 0, 'calendar blocks leave their column or cover each other');
+    assert.ok(layout.minHeight >= 24, 'a calendar block is lower than 24 px');
+    assert.ok(layout.scrollWidth <= layout.clientWidth, 'the calendar page scrolls horizontally');
+    // PR #63 review: the grid fills the window; at least 8 hours of the axis are visible at 1280×720.
+    assert.ok(layout.visibleHours >= 8, `only ${layout.visibleHours} h of the calendar axis are visible at 1280x720`);
+    assert.equal(layout.headSticky, 'sticky');
+    await saveScreenshot(cdp, sessionId, 'calendar-week-1280x720');
+  } finally {
+    await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+  }
+  // Keyboard: Enter opens the details of a focused block, Escape closes them.
+  await evaluate(`document.querySelector('[aria-label="Kalendarz"] .calendar-block').focus()`);
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' }, sessionId);
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, sessionId);
+  await waitFor('block details open', () => evaluate(`Boolean(document.querySelector('.calendar-details'))`));
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }, sessionId);
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }, sessionId);
+  await waitFor('block details closed, focus back on the block', () => evaluate(`!document.querySelector('.calendar-details') && document.activeElement?.classList.contains('calendar-block')`));
+  // Week navigation.
+  await evaluate(`document.querySelector('[aria-label="Następny tydzień"]').click()`);
+  await waitFor('next week', async () => { const value = await evaluate(read); return value.heading === calendarFixture.nextHeading && value.week === '00:00:00' && value.blocks === 0; });
+  await evaluate(`document.querySelector('[aria-label="Poprzedni tydzień"]').click()`);
+  await waitFor('back to the fixture week', async () => { const value = await evaluate(read); return value.heading === calendarFixture.heading && value.week === calendarFixture.week; });
+  // Back to the timer: the same timer is still running; then it is stopped for the next phases.
+  assert.deepEqual(await active(), running, 'switching views stopped or replaced the timer');
+  await evaluate(`${viewButton('Timer')}.click()`);
+  await waitFor('timer view again with the same running timer', () => evaluate(`!document.querySelector('.timer-view').hidden && Boolean(document.querySelector('[aria-label="Pomiar czasu"] .status.running'))`));
+  assert.deepEqual(await active(), running, 'returning to the timer stopped or replaced the timer');
+  await invoke('stop_timer', { expectedActiveId: running.id });
+  await waitFor('calendar timer stopped', async () => (await active()) === null);
+  console.log('PASS: calendar week equals the report (midnight and DST), navigation and keyboard details, and the timer survives view changes');
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
@@ -2074,6 +2190,7 @@ async function runWindow(port, phase, recovery) {
       await verifyShortcutAfterRestart(cdp, sessionId);
       await verifyDuplicateClientChoices(cdp, sessionId);
     }
+    if (phase === 'calendar') await verifyCalendar(cdp, sessionId);
     if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
@@ -2189,6 +2306,9 @@ try {
   await waitForWindowClosed(port);
   await runWindow(port, 'hotkey-restart', recovery);
   assertBaselineHistory();
+  // DEV-24: calendar week with fixed entries (separate client), before PTT-36 adds its own entries.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'calendar', recovery);
   // PTT-36: T20 (Stop, Switch, correction with an unwritable database, then one retry) and
   // T26 (the unsaved correction survives a restart and is saved exactly once).
   await waitForWindowClosed(port);
