@@ -1,0 +1,16 @@
+{
+  "test": {
+    "name": "TrackerMaster.TestOnly",
+    "publisher": "CN=TrackerMaster-TestOnly, OID.2.25.311729368913984317654407730594956997722=1",
+    "publisherDisplayName": "TrackerMaster Test",
+    "displayName": "TrackerMaster Test",
+    "description": "TrackerMaster — test instalacji na danych fikcyjnych"
+  },
+  "store": {
+    "name": "vatlar.TrackerMaster",
+    "publisher": "CN=EBE2824B-F077-49B4-A180-73C366094CBA",
+    "publisherDisplayName": "vatlar",
+    "displayName": "TrackerMaster",
+    "description": "TrackerMaster — prywatna wersja testowa na danych fikcyjnych"
+  }
+}

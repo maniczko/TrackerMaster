@@ -1,0 +1,87 @@
+name: TrackerMaster Store MSIX candidate
+
+# D11 private Microsoft Store distribution, PR A. Builds the unsigned candidate with the Partner Center
+# identity from packaging/msix/identities.json. Only by hand and only on main, so every candidate can be tied
+# to a reviewed commit; pull requests build only the test identity (windows-build.yml). Nothing is signed,
+# uploaded to Partner Center or published here.
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: 'Four-part package version ending in .0, higher than every package already uploaded (e.g. 0.1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Unsigned Store candidate (not signed, not submitted)
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Require main
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -ne 'refs/heads/main') { throw 'The Store candidate is built only from main.' }
+      - uses: actions/checkout@v4
+      - name: Reject tracked SQLite data files
+        shell: pwsh
+        run: |
+          $databaseFiles = @(git ls-files | Where-Object { $_ -match '(?i)\.(?:db|sqlite3?)(?:-(?:wal|shm|journal)|\.partial)?$' })
+          if ($databaseFiles.Count -gt 0) {
+            $databaseFiles | ForEach-Object { Write-Host "Tracked database file: $_" }
+            throw 'Refusing to build a commit containing SQLite database files.'
+          }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Check Store manifest equals the tested manifest
+        shell: pwsh
+        run: ./packaging/msix/Test-MsixManifestParity.ps1
+      - name: Build isolated executable
+        env:
+          VITE_TRACKER_TEST_MODE: '1'
+        run: npm run tauri -- build --no-bundle --config src-tauri/tauri.isolated.conf.json
+      - name: Package the Store candidate
+        id: package
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          $version = $env:PACKAGE_VERSION
+          if ($version -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}\.0$') { throw 'Use a four-part version ending in .0, e.g. 0.1.0.0.' }
+          $file = "TrackerMaster-Store-candidate-$version-x64.msix"
+          New-Item -ItemType Directory -Path ./candidate | Out-Null
+          ./packaging/msix/New-TestMsix.ps1 -Variant Store -Version $version -Executable ./src-tauri/target/release/tracker-master.exe -Output "./candidate/$file" | Out-Null
+          $hash = (Get-FileHash -LiteralPath "./candidate/$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $identity = (Get-Content -Raw -Encoding UTF8 -LiteralPath ./packaging/msix/identities.json | ConvertFrom-Json).store
+          $record = @(
+            "source_sha=$env:GITHUB_SHA",
+            "source_ref=$env:GITHUB_REF",
+            "package_file=$file",
+            "package_version=$version",
+            "sha256=$hash",
+            "identity_name=$($identity.name)",
+            "identity_publisher=$($identity.publisher)",
+            "publisher_display_name=$($identity.publisherDisplayName)",
+            'data_profile=pl.tracker.personal.testonly',
+            'signed=no (Microsoft Store signs after certification)',
+            "run=$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          )
+          Set-Content -LiteralPath ./candidate/candidate.txt -Value $record -Encoding UTF8
+          $record | ForEach-Object { Write-Host $_ }
+          $record | ForEach-Object { "- ``$_``" } | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+          "artifact=TrackerMaster-Store-candidate-$version-src-$($env:GITHUB_SHA.Substring(0, 12))-sha256-$($hash.Substring(0, 16))" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding UTF8
+      - name: Save the unsigned Store candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 30
