@@ -16,6 +16,10 @@ mod instance_activation;
 // v14: sleep_periods allows 'auto_included' (D4 short sleep, sleep_periods.rs).
 const LATEST_SCHEMA_VERSION: i64 = 14;
 
+/// Build profile read by packaging/msix/New-TestMsix.ps1 (set by build.rs): "testonly" only for the
+/// isolated identifier with VITE_TRACKER_TEST_MODE=1; packaging refuses anything else.
+const BUILD_PROFILE_MARKER: &str = concat!("TRACKERMASTER_BUILD_PROFILE=", env!("TRACKER_BUILD_PROFILE"), ";");
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -1510,6 +1514,8 @@ fn request_quit(app: &tauri::AppHandle) {
 }
 
 fn main() {
+    // Keeps the build profile marker in the executable for the packaging check.
+    std::hint::black_box(BUILD_PROFILE_MARKER);
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| {
             if event.state() != ShortcutState::Pressed { return; }
@@ -3463,5 +3469,15 @@ mod tests {
         let period = sleep_periods::list_for_entry(&db, 2).unwrap().remove(0);
         assert_eq!((period.ended_ms, period.decision.as_str()), (Some(running + 90_000), "auto_included"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // MSIX packaging refuses a production build (New-TestMsix.ps1): cargo test builds without
+    // VITE_TRACKER_TEST_MODE and the isolated identifier, so the marker must say production.
+    #[test]
+    fn build_profile_marker_is_production_unless_isolated_test_build() {
+        assert!(matches!(BUILD_PROFILE_MARKER, "TRACKERMASTER_BUILD_PROFILE=production;" | "TRACKERMASTER_BUILD_PROFILE=testonly;"));
+        if option_env!("VITE_TRACKER_TEST_MODE") != Some("1") {
+            assert_eq!(BUILD_PROFILE_MARKER, "TRACKERMASTER_BUILD_PROFILE=production;");
+        }
     }
 }

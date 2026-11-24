@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- One manifest for both MSIX variants (D11). New-TestMsix.ps1 fills the @...@ values from identities.json
+     (test: installed and tested in CI; store: Partner Center candidate) and the version; nothing else differs. -->
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
          xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
          xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
          xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
          xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
          IgnorableNamespaces="uap uap10 rescap virtualization">
-  <Identity Name="TrackerMaster.TestOnly" Publisher="CN=TrackerMaster-TestOnly, OID.2.25.311729368913984317654407730594956997722=1" Version="0.1.0.0" ProcessorArchitecture="x64"/>
+  <Identity Name="@IdentityName@" Publisher="@Publisher@" Version="@Version@" ProcessorArchitecture="x64"/>
   <Properties>
-    <DisplayName>TrackerMaster Test</DisplayName>
-    <PublisherDisplayName>TrackerMaster Test</PublisherDisplayName>
+    <DisplayName>@DisplayName@</DisplayName>
+    <PublisherDisplayName>@PublisherDisplayName@</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <virtualization:FileSystemWriteVirtualization>
       <virtualization:ExcludedDirectories>
@@ -24,7 +26,7 @@
   </Dependencies>
   <Applications>
     <Application Id="TrackerMaster" Executable="tracker-master.exe" uap10:RuntimeBehavior="packagedClassicApp" uap10:TrustLevel="mediumIL">
-      <uap:VisualElements DisplayName="TrackerMaster Test" Description="TrackerMaster — test instalacji na danych fikcyjnych" BackgroundColor="transparent"
+      <uap:VisualElements DisplayName="@DisplayName@" Description="@Description@" BackgroundColor="transparent"
                           Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png"/>
     </Application>
   </Applications>
