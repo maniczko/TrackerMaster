@@ -3,6 +3,11 @@ import assert from 'node:assert/strict';
 import { defaultEnd, formProblem, keyboardRange, minuteAt, overlapping, slotStart, wallInstant, wallValue } from '../src/calendarEntry.ts';
 import type { FormInput } from '../src/calendarEntry.ts';
 import { draftRange } from '../src/entryDraft.ts';
+import { reportByDay } from '../src/reportTime.ts';
+import { makeReportView } from '../src/reportView.ts';
+import type { ActiveReportEntry } from '../src/reportView.ts';
+import { calendarWeek } from '../src/calendarModel.ts';
+import { allReportClients } from '../src/reportScope.ts';
 
 // DEV-26 (calendar package B). Synthetic data only; the reporting zone is Europe/Warsaw.
 const zone = 'Europe/Warsaw';
@@ -105,4 +110,27 @@ test('keyboard "+ Wpis": the last full half hour of today, or 09:00 on Monday of
   assert.equal(formProblem(base({ ...keyboardRange('2026-11-23', '2026-11-23', at('2026-11-23T12:07:00Z'), zone), nowMs: at('2026-11-23T12:07:00Z') })), null);
   assert.deepEqual(keyboardRange('2026-03-23', '2026-11-23', nowMs, zone), { start: '2026-03-23T09:00:00', end: '2026-03-23T09:30:00' });
   assert.equal(wallValue(at('2026-03-29T01:00:00Z'), zone), '2026-03-29T03:00:00');
+});
+
+test('a timer started under a second ago is a running block at once, not after the next report read (CI 45335156987)', () => {
+  // The report projects the running timer up to its read instant; 0.4 s gives 0 whole seconds.
+  const started = '2026-11-23T10:00:00.000Z', read = '2026-11-23T10:00:00.400Z';
+  const fresh = [{ id: 9, started_at: started, ended_at: read, duration_seconds: 0 }];
+  assert.deepEqual(reportByDay(fresh, '2026-11-23', '2026-11-29', zone).contributions,
+    [{ id: 9, days: [], seconds: 0, pendingSeconds: 0, hasPendingSleep: false }], 'a 0 s entry of the range, like a zero-length one');
+  assert.deepEqual(reportByDay([{ ...fresh[0], ended_at: started }], '2026-11-23', '2026-11-29', zone).contributions.map(item => item.id), [9]);
+  // Outside the range: still nothing.
+  assert.deepEqual(reportByDay(fresh, '2026-11-30', '2026-12-06', zone).contributions, []);
+  const catalog = { clients: [{ id: 1, name: 'Klient' }], projects: [{ id: 10, client_id: 1, name: 'Projekt' }], tasks: [] };
+  const active: ActiveReportEntry = { id: 9, task_id: null, project_id: 10, started_at: started, ended_at: read, duration_seconds: 0,
+    billable: true, description: 'Dopiero start', unresolved: false };
+  const snapshot = { id: 9, project_id: 10, task_id: null, started_at: started, description: 'Dopiero start', billable: true };
+  const now = at('2026-11-23T10:00:05.000Z');
+  const view = calendarWeek({ data: { entries: [], active, time_zone: zone }, catalog, filter: { scope: allReportClients, billable: 'all' },
+    weekStart: '2026-11-23', now, snapshotActive: snapshot, snapshotFresh: true })!;
+  const running = view.days[0].blocks.filter(block => block.running);
+  assert.equal(running.length, 1);
+  assert.equal(running[0].startMinute, 11 * 60, 'from the start of the timer (10:00 UTC = 11:00 in Warsaw)');
+  // The same data in the Report: one row, so the week total still equals the Report.
+  assert.deepEqual(makeReportView({ entries: [], active, time_zone: zone }, catalog, allReportClients, '2026-11-23', '2026-11-29').rows.map(row => row.source.id), [9]);
 });
