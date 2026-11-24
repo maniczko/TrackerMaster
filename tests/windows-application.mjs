@@ -15,6 +15,13 @@ assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 assert.ok(process.env.RUNNER_TEMP && process.env.APPDATA);
 const exe = resolve('src-tauri/target/release/tracker-master.exe');
 const testDb = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'tracker.sqlite3');
+// The running app reads the database every few seconds (rollback journal, no WAL). A commit needs the
+// readers' shared locks released, and node:sqlite waits 0 ms by default, so a test write that met an app
+// read failed with "database is locked" (main 91e2451, run 45233029351). Every test connection now waits
+// for such short locks like the app's own connections do (rusqlite default 5 s); a lock held longer is a
+// real failure. Tests that hold the write lock on purpose (holdWriteLock) are unaffected.
+const SQLITE_BUSY_WAIT_MS = 15_000;
+const openTestDb = (options = {}) => new DatabaseSync(testDb, { timeout: SQLITE_BUSY_WAIT_MS, ...options });
 const normalDb = join(process.env.APPDATA, 'pl.tracker.personal', 'tracker.sqlite3');
 await access(exe);
 await assert.rejects(stat(testDb), { code: 'ENOENT' });
@@ -94,6 +101,102 @@ async function captureReportDetail(cdp, sessionId, state) {
       await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
     }
   }
+}
+// Reports Summary (DEV-30/31, package R1) on the selected client and the wide fixed range of the first window:
+// final KPIs, the SVG chart driven by real keys, the legend and the client → project → task groups all equal
+// the Detailed contribution of the single entry. Layout at 1280/1920 and at 125% scaling, with screenshots.
+async function verifyReportSummary(cdp, sessionId, seconds) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const hms = value => [Math.floor(value / 3600), Math.floor(value % 3600 / 60), value % 60].map(part => String(part).padStart(2, '0')).join(':');
+  const report = '[aria-label="Raport czasu"]';
+  const tab = label => `[...document.querySelectorAll(${JSON.stringify(report + ' button')})].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${tab('Podsumowanie')}.click()`);
+  await waitFor('summary KPIs', () => evaluate(`document.querySelector('.report-kpis strong')?.textContent.trim() === ${JSON.stringify(hms(seconds))}`));
+  const kpi = await evaluate(`[...document.querySelectorAll('.report-kpis > div')].map(tile => ({
+    label: tile.querySelector('small').textContent.trim(), value: tile.querySelector('strong').textContent.trim(), note: tile.querySelectorAll('small')[1]?.textContent.trim() ?? '' }))`);
+  console.log(`REPORT_SUMMARY kpi ${JSON.stringify(kpi)}`);
+  assert.deepEqual(kpi.map(tile => tile.label), ['Łączny czas', 'Rozliczalny czas', '% rozliczalny', 'Średnio na dzień z pracą']);
+  // The fixture project is not billable by default (D12 billable B: false unless the project says otherwise).
+  assert.deepEqual([kpi[1].value, kpi[2].value], ['00:00:00', '0%']);
+  const workDays = Number(kpi[3].note.match(/^(\d+)/)?.[1]);
+  assert.ok(workDays === 1 || workDays === 2, `days with work: ${kpi[3].note}`);
+  assert.equal(kpi[3].value, hms(Math.floor(seconds / workDays)), 'average over days with work (D12 variant B)');
+  assert.equal(await evaluate(`Boolean(document.querySelector('.report-live'))`), false, 'no running or pending time in this window');
+
+  const chart = await evaluate(`(() => {
+    const bars = [...document.querySelectorAll('.report-chart-bar')];
+    return { caption: document.querySelector('.report-chart h3')?.textContent, bars: bars.length,
+      sum: bars.reduce((total, bar) => total + Number(bar.dataset.seconds), 0), tabbable: bars.filter(bar => bar.getAttribute('tabindex') === '0').length,
+      legend: [...document.querySelectorAll('.report-chart-legend li')].map(item => item.textContent) };
+  })()`);
+  console.log(`REPORT_SUMMARY chart ${JSON.stringify(chart)}`);
+  assert.equal(chart.caption, 'Czas według miesięcy', 'the 14-month range is shown by month');
+  assert.equal(chart.bars, 14);
+  assert.equal(chart.sum, seconds, 'chart buckets add up to the KPI total');
+  assert.equal(chart.tabbable, 1, 'one tab stop (roving focus)');
+  assert.equal(chart.legend.length, 1);
+  assert.ok(chart.legend[0].includes(project) && chart.legend[0].includes(primaryClient) && chart.legend[0].includes(hms(seconds)));
+  // Real keys through CDP: focus the bar with data, move left (tooltip follows), back right, Escape hides it.
+  await evaluate(`document.querySelector('.report-chart-bar[tabindex="0"]').focus()`);
+  const focused = () => evaluate(`({ from: document.activeElement?.dataset?.from ?? null, seconds: Number(document.activeElement?.dataset?.seconds ?? -1),
+    tooltip: document.querySelector('[role="tooltip"]')?.textContent ?? null,
+    described: Boolean(document.activeElement?.getAttribute('aria-describedby')) })`);
+  const start = await focused();
+  assert.equal(start.seconds, seconds);
+  assert.ok(start.described && start.tooltip.includes(`Łącznie ${hms(seconds)}`) && start.tooltip.includes(project), `tooltip: ${start.tooltip}`);
+  const press = async (key, code, windowsVirtualKeyCode) => {
+    for (const type of ['keyDown', 'keyUp']) await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode }, sessionId);
+  };
+  await press('ArrowLeft', 'ArrowLeft', 37);
+  const left = await waitFor('ArrowLeft moves the chart focus', async () => { const state = await focused(); return state.from !== start.from ? state : null; });
+  assert.ok(left.tooltip?.includes('Łącznie') && left.described, 'the tooltip follows the keyboard');
+  await press('ArrowRight', 'ArrowRight', 39);
+  await waitFor('ArrowRight returns to the bar with data', async () => (await focused()).from === start.from);
+  await press('Escape', 'Escape', 27);
+  await waitFor('Escape hides the tooltip', async () => (await focused()).tooltip === null);
+
+  const groupRows = () => evaluate(`[...document.querySelectorAll('.report-groups tbody tr')].map(row => ({ level: row.dataset.level,
+    name: row.querySelector('th').textContent.replace(/^[▾▸]/, '').trim(), time: row.cells[1].textContent.trim(), share: row.cells[2].textContent.trim() }))`);
+  const initial = await groupRows();
+  assert.deepEqual(initial, [{ level: 'client', name: primaryClient, time: hms(seconds), share: '100%' }, { level: 'project', name: project, time: hms(seconds), share: '100%' }]);
+  await evaluate(`[...document.querySelectorAll('.report-groups tbody tr[data-level="project"] button')][0].click()`);
+  await waitFor('task level expands', async () => (await groupRows()).length === 3);
+  assert.deepEqual((await groupRows())[2], { level: 'task', name: task, time: hms(seconds), share: '100%' });
+  assert.equal(await evaluate(`document.querySelector('.report-groups tbody tr[data-level="project"] button').getAttribute('aria-expanded')`), 'true');
+  assert.equal(await evaluate(`document.querySelector('.report-groups tfoot td').textContent.trim()`), hms(seconds));
+  console.log('PASS: Reports Summary KPIs, chart (keyboard tooltip), legend and client → project → task groups equal the Detailed entry');
+
+  await captureSection(cdp, sessionId, report, `Boolean(document.querySelector('.report-chart-bar'))`, 'report-summary');
+  // 125% Windows scaling of a 1280×720 window: 1024×576 CSS px at device scale 1.25.
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1024, height: 576, deviceScaleFactor: 1.25, mobile: false }, sessionId);
+  try {
+    await waitFor('125% scaling applied', () => evaluate('window.innerWidth === 1024 && window.devicePixelRatio === 1.25'));
+    await delay(300);
+    const box = await evaluate(`(() => {
+      const section = document.querySelector(${JSON.stringify(report)});
+      section.scrollIntoView({ block: 'start' });
+      const rect = section.getBoundingClientRect();
+      const kpis = [...document.querySelectorAll('.report-kpis > div')].map(tile => tile.getBoundingClientRect());
+      const overflowing = [...section.querySelectorAll('.report-kpis strong, .report-chart-legend li, .report-groups th')]
+        .filter(element => element.scrollWidth > element.clientWidth + 1).length;
+      return { x: Math.max(0, rect.left + window.scrollX), y: Math.max(0, rect.top + window.scrollY), width: Math.ceil(rect.width), height: Math.ceil(rect.height),
+        scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth, kpiTop: kpis.map(item => Math.round(item.top)), overflowing };
+    })()`);
+    console.log(`UI_LAYOUT report-summary-125pct 1024x576@1.25 ${JSON.stringify(box)}`);
+    assert.ok(box.scrollWidth <= box.clientWidth, 'report summary at 125%: the page scrolls horizontally');
+    assert.equal(box.overflowing, 0, 'report summary at 125%: text is clipped');
+    const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true,
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 } }, sessionId);
+    await writeFile(join(screenshotDirectory, 'report-summary-125pct-1024x576.png'), Buffer.from(data, 'base64'));
+  } finally {
+    await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+  }
+  await evaluate(`${tab('Szczegóły')}.click()`);
+  await waitFor('Detailed shown after the summary check', () => evaluate(`Boolean(document.querySelector('.report-detail tbody tr'))`));
 }
 // Mini timer bar: 48×48 Start/Stop in a fixed place, title/clock/action not overlapping or covered, no page overflow.
 const inspectCompactLayout = `(() => {
@@ -346,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -766,7 +869,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   };
   pressShortcut();
   await waitFor('first press starts measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running'`));
-  const activeDb = new DatabaseSync(testDb, { readOnly: true });
+  const activeDb = openTestDb({ readOnly: true });
   let entryId;
   try {
     const rows = activeDb.prepare(`SELECT e.id, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
@@ -797,7 +900,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(replacementDescription)});
     input.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  const switchDb = new DatabaseSync(testDb);
+  const switchDb = openTestDb();
   try {
     switchDb.exec("CREATE TRIGGER test_reject_timer_switch AFTER INSERT ON entry_descriptions BEGIN SELECT RAISE(FAIL, 'test switch write failure'); END");
     await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
@@ -816,7 +919,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   await waitFor('switch retry enabled', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-start button:not(:disabled)'))`));
   await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
   await waitFor('switch retry succeeds', () => evaluate(mainSession, `document.body.textContent.includes('Przełączono zadanie.')`));
-  const switchedDb = new DatabaseSync(testDb, { readOnly: true });
+  const switchedDb = openTestDb({ readOnly: true });
   try {
     const rows = switchedDb.prepare(`SELECT e.id, e.started_at, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
     assert.equal(rows.length, 5);
@@ -827,7 +930,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     entryId = rows[4].id;
   } finally { switchedDb.close(); }
   await waitFor('widget reflects the switched timer', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running' && document.querySelector('.qp-context')?.textContent.includes(${JSON.stringify(primaryClient)})`));
-  const failureDb = new DatabaseSync(testDb);
+  const failureDb = openTestDb();
   try {
     failureDb.exec("CREATE TRIGGER test_reject_timer_stop BEFORE UPDATE OF ended_at ON time_entries BEGIN SELECT RAISE(FAIL, 'test timer write failure'); END");
     await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button').click()`);
@@ -850,7 +953,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   })()`));
   pressShortcut();
   await waitFor('second press stops measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'idle'`));
-  const stoppedDb = new DatabaseSync(testDb, { readOnly: true });
+  const stoppedDb = openTestDb({ readOnly: true });
   try {
     const rows = stoppedDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
     assert.equal(rows.length, 5);
@@ -976,6 +1079,135 @@ async function verifyCalendar(cdp, sessionId) {
   console.log('PASS: calendar week equals the report (midnight and DST), navigation and keyboard details, and the timer survives view changes');
 }
 
+// DEV-25 / PTT-46 (calendar package C): the month grid. Fixed entries in October 2025 of a dedicated client,
+// so nothing depends on the runner's clock; expected figures are the report's own (reportByDay) for the same
+// entries in Europe/Warsaw (tests/calendarMonthModel.test.ts, "E2E fixture month").
+const calendarMonthFixture = {
+  client: 'Klient kalendarza miesięcznego E2E', project: 'Miesiąc z przełomami',
+  entries: [
+    ['2025-09-30T21:50:00Z', '2025-09-30T22:10:00Z', 'Miesiąc: przełom września 23:50–00:10'],
+    ['2025-10-01T08:00:00Z', '2025-10-01T09:30:00Z', 'Miesiąc: pierwszy dzień'],
+    ...[0, 15, 30, 45, 60].map((minutes, index) => {
+      const at = Date.parse('2025-10-15T07:00:00Z') + minutes * 60_000;
+      return [new Date(at).toISOString().replace('.000', ''), new Date(at + 10 * 60_000).toISOString().replace('.000', ''), `Miesiąc: krótki wpis ${index + 1}`];
+    }),
+    ['2025-10-25T23:00:00Z', '2025-10-26T01:00:00Z', 'Miesiąc: zmiana czasu'],
+    ['2025-10-31T22:50:00Z', '2025-10-31T23:10:00Z', 'Miesiąc: przełom października 23:50–00:10'],
+  ],
+  month: '2025-10', heading: 'październik 2025', rows: 5, total: '04:40:00',
+  cells: { '2025-09-30': '00:10', '2025-10-01': '01:40', '2025-10-15': '00:50', '2025-10-26': '02:00', '2025-10-31': '00:10', '2025-11-01': '00:10' },
+  outside: ['2025-09-30', '2025-11-01'], many: '2025-10-15', manyCount: 5, week: '13–19 października 2025', weekTotal: '00:50:00',
+};
+async function verifyCalendarMonth(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const press = async (key, code, keyCode, text) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode, ...(text ? { text } : {}) }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode }, sessionId);
+  };
+  assert.equal((await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } })).time_zone, 'Europe/Warsaw');
+  const clientId = await invoke('create_client', { name: calendarMonthFixture.client });
+  const projectId = await invoke('create_project', { clientId, name: calendarMonthFixture.project });
+  for (const [startedAt, endedAt, description] of calendarMonthFixture.entries) {
+    await invoke('create_project_manual_entry', { projectId, taskId: null, startedAt, endedAt, description });
+  }
+  const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  const modeButton = label => `[...document.querySelectorAll('.calendar-mode button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${viewButton('Kalendarz')}.click()`);
+  await waitFor('calendar opens', () => evaluate(`Boolean(${modeButton('Miesiąc')})`));
+  await evaluate(`${modeButton('Miesiąc')}.click()`);
+  await waitFor('month view opens', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-month-total')) && ${modeButton('Miesiąc')}.getAttribute('aria-pressed') === 'true'`));
+  await evaluate(`(() => {
+    const input = document.querySelector('[aria-label="Kalendarz"] input[type="month"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(calendarMonthFixture.month)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  })()`);
+  const read = `(() => {
+    const root = document.querySelector('[aria-label="Kalendarz"]');
+    const cells = Object.fromEntries([...root.querySelectorAll('.month-cell')].map(cell => [cell.dataset.date, {
+      total: cell.querySelector('.month-day-total')?.textContent ?? '', outside: cell.classList.contains('is-outside'),
+      shown: cell.querySelectorAll('.month-entry').length, more: cell.querySelector('.month-more')?.textContent ?? '',
+      label: cell.getAttribute('aria-label') }]));
+    return { heading: root.querySelector('.calendar-range')?.textContent, total: root.querySelector('.calendar-month-total')?.textContent,
+      rows: root.querySelectorAll('.month-row').length - 1, cells };
+  })()`;
+  // The entries were created outside the window's own actions; the shared report read follows the snapshot.
+  let last = null;
+  const month = await waitFor('fixture month shown', async () => {
+    last = await evaluate(read);
+    return last.heading === calendarMonthFixture.heading && last.total === calendarMonthFixture.total ? last : null;
+  }).catch(error => { throw new Error(`${error.message}; last month state: ${JSON.stringify(last && { heading: last.heading, total: last.total })}`); });
+  assert.equal(month.rows, calendarMonthFixture.rows, 'October 2025 is a 5-row month');
+  for (const [date, total] of Object.entries(calendarMonthFixture.cells)) {
+    assert.equal(month.cells[date]?.total, total, `cell ${date} differs from the report`);
+  }
+  for (const date of calendarMonthFixture.outside) assert.equal(month.cells[date].outside, true, `${date} must be styled as a neighbouring month`);
+  assert.equal(month.cells['2025-10-01'].outside, false);
+  // The neighbouring days' 00:10 are drawn but not added: the month total is the October days only.
+  assert.equal(month.cells[calendarMonthFixture.many].shown, 3);
+  assert.equal(month.cells[calendarMonthFixture.many].more, `+${calendarMonthFixture.manyCount - 3}`);
+  assert.ok(month.cells['2025-10-01'].label.includes('01:40:00'), 'the cell label carries the exact seconds');
+
+  // UI_LAYOUT: no cell content overflows, no horizontal page scroll, 40 px controls; 1280×720 and 125 % DPI.
+  for (const [name, metrics] of [['calendar-month-1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }],
+    ['calendar-month-1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
+    try {
+      await waitFor(`month at ${name}`, () => evaluate(`window.innerWidth === ${metrics.width} && window.innerHeight === ${metrics.height}`));
+      await delay(300);
+      const layout = await evaluate(`(() => {
+        const over = element => element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1;
+        const cells = [...document.querySelectorAll('.month-cell')];
+        const entries = [...document.querySelectorAll('.month-entry')];
+        const controls = [...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-toolbar button, [aria-label="Kalendarz"] .calendar-toolbar select, [aria-label="Kalendarz"] .calendar-toolbar input')];
+        const box = cells[0].getBoundingClientRect();
+        window.scrollTo(0, 0);
+        return { cells: cells.length, overflowingCells: cells.filter(over).map(cell => cell.dataset.date),
+          entriesOutside: entries.filter(entry => { const a = entry.getBoundingClientRect(), b = entry.closest('.month-cell').getBoundingClientRect(); return a.right > b.right + 0.5 || a.bottom > b.bottom + 0.5; }).length,
+          smallControls: controls.filter(control => control.getBoundingClientRect().height < 40).map(control => control.getAttribute('aria-label') || control.textContent.trim()),
+          cellWidth: Math.round(box.width), cellHeight: Math.round(box.height),
+          scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
+      })()`);
+      console.log(`UI_LAYOUT ${name} ${JSON.stringify(layout)}`);
+      assert.equal(layout.cells, calendarMonthFixture.rows * 7);
+      assert.deepEqual(layout.overflowingCells, [], 'a month cell overflows');
+      assert.equal(layout.entriesOutside, 0, 'an entry leaves its cell');
+      assert.deepEqual(layout.smallControls, [], 'a calendar control is lower than 40 px');
+      assert.ok(layout.scrollWidth <= layout.clientWidth, 'the month page scrolls horizontally');
+      await saveScreenshot(cdp, sessionId, name);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+
+  // Keyboard: arrows move between days, Enter opens the day's details, Escape closes them.
+  await evaluate(`document.querySelector('.month-cell[data-date="2025-10-14"]').focus()`);
+  await press('ArrowRight', 'ArrowRight', 39);
+  await waitFor('arrow moves to the next day', () => evaluate(`document.activeElement?.dataset.date === ${JSON.stringify(calendarMonthFixture.many)}`));
+  await press('Enter', 'Enter', 13, '\r');
+  await waitFor('day details open', () => evaluate(`document.querySelectorAll('.month-details li').length === ${calendarMonthFixture.manyCount}`));
+  assert.ok((await evaluate(`document.querySelector('.month-details-total')?.textContent`)).includes(calendarMonthFixture.weekTotal));
+  await press('Escape', 'Escape', 27);
+  await waitFor('day details closed, focus back on the day', () => evaluate(`!document.querySelector('.month-details') && document.activeElement?.dataset.date === ${JSON.stringify(calendarMonthFixture.many)}`));
+  // A day leads to its week, with the same total as the week view.
+  await press('Enter', 'Enter', 13, '\r');
+  await waitFor('day details open again', () => evaluate(`Boolean(document.querySelector('.month-details'))`));
+  await evaluate(`[...document.querySelectorAll('.month-details button')].find(button => button.textContent.trim() === 'Pokaż tydzień').click()`);
+  await waitFor('week of the chosen day', () => evaluate(`document.querySelector('.calendar-range')?.textContent === ${JSON.stringify(calendarMonthFixture.week)} && document.querySelector('.calendar-week-total')?.textContent === ${JSON.stringify(calendarMonthFixture.weekTotal)}`));
+  // Back to the month: it remembers October 2025; then the calendar is left in the week view for later runs.
+  await evaluate(`${modeButton('Miesiąc')}.click()`);
+  await waitFor('month remembered', () => evaluate(`document.querySelector('.calendar-range')?.textContent === ${JSON.stringify(calendarMonthFixture.heading)} && document.querySelector('.calendar-month-total')?.textContent === ${JSON.stringify(calendarMonthFixture.total)}`));
+  await evaluate(`${modeButton('Tydzień')}.click()`);
+  await evaluate(`${viewButton('Timer')}.click()`);
+  await waitFor('timer view again', () => evaluate(`!document.querySelector('.timer-view').hidden`));
+  console.log('PASS: calendar month equals the report (month ends, DST, neighbouring days not counted), +N, no overflow at 1280x720 and 125 %, keyboard and the way to the week');
+}
+
 // DEV-26 (calendar package B): add and edit time from the calendar. Its own client and a fixed past week
 // (9–15.03.2026, CET), so nothing depends on the runner's clock; Warsaw wall time = UTC + 1 h in that week.
 const calendarEntryFixture = {
@@ -984,7 +1216,7 @@ const calendarEntryFixture = {
   description: 'Kalendarz B: dodany kliknięciem',
 };
 function calendarEntryRows() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     return db.prepare(`SELECT e.id, e.started_at, e.ended_at, e.duration_seconds, COALESCE(d.description, '') AS description,
         EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) AS billable,
@@ -1203,7 +1435,7 @@ async function verifyRestoreRetry(cdp, sessionId) {
     await click('Przywróć kopię');
     await waitFor('restore failure displayed', () => evaluate(`document.body.textContent.includes('Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.')`));
     assert.equal(await evaluate(`document.querySelector(${JSON.stringify(section)} + ' input[type="checkbox"]')?.checked`), false);
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { assert.equal(db.prepare('SELECT COUNT(*) AS count FROM time_entries').get().count, 3); }
     finally { db.close(); }
     await unlink(backupDir);
@@ -1343,7 +1575,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
       try { return JSON.parse(await readFile(path, 'utf8')).fields.description === text; }
       catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return false; throw error; }
     });
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, primaryDescription); }
     finally { db.close(); }
     const window = await waitFor('main window while editing', () => inspectWindow('Find', primary.pid) || null);
@@ -1431,7 +1663,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('draft content restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`[...document.querySelectorAll('[aria-label="Edycja wpisu"] button')].find(button => button.textContent.trim() === 'Zachowaj szkic').click()`);
   await waitFor('restored draft put aside', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]')`));
-  const beforeConflict = new DatabaseSync(testDb, { readOnly: true });
+  const beforeConflict = openTestDb({ readOnly: true });
   let originalTimes;
   try {
     originalTimes = beforeConflict.prepare('SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=1').get();
@@ -1463,7 +1695,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('selected draft field restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
   await waitFor('draft applied once to history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(text)}))`));
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, text);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=1').get().count, 1);
@@ -1489,7 +1721,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('draft discard confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Odrzuć zmiany').click()`);
   await waitFor('discard hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
-  const unchanged = new DatabaseSync(testDb, { readOnly: true });
+  const unchanged = openTestDb({ readOnly: true });
   try {
     assert.equal(unchanged.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(unchanged.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1531,7 +1763,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('invalid edit stays open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Sprawdź daty i godziny')`));
   assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
   assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
-  const rejected = new DatabaseSync(testDb, { readOnly: true });
+  const rejected = openTestDb({ readOnly: true });
   try {
     assert.equal(rejected.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(rejected.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1543,7 +1775,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, ${JSON.stringify(originalEnd)});
     field.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  const injectedFailure = new DatabaseSync(testDb);
+  const injectedFailure = openTestDb();
   try {
     injectedFailure.exec("CREATE TRIGGER test_reject_revision BEFORE INSERT ON description_revisions BEGIN SELECT RAISE(FAIL, 'test write failure'); END");
   } finally { injectedFailure.close(); }
@@ -1553,7 +1785,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('SQLite error keeps the editor open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych')`));
   assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
   assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
-  const blocked = new DatabaseSync(testDb);
+  const blocked = openTestDb();
   try {
     assert.equal(blocked.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(blocked.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1561,7 +1793,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   } finally { blocked.close(); }
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
   await waitFor('save hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
-  const saved = new DatabaseSync(testDb, { readOnly: true });
+  const saved = openTestDb({ readOnly: true });
   try {
     assert.equal(saved.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, savedText);
     assert.equal(saved.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 1);
@@ -1597,7 +1829,7 @@ const writeFailure = {
 };
 
 function writeFailureState() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     return {
       entries: db.prepare(`SELECT e.id, e.project_id, e.task_id, e.started_at, e.ended_at, e.duration_seconds, e.manually_resolved,
@@ -1610,7 +1842,7 @@ function writeFailureState() {
 }
 
 function holdWriteLock() {
-  const lock = new DatabaseSync(testDb);
+  const lock = openTestDb();
   lock.exec('BEGIN IMMEDIATE');
   return { release() { try { lock.exec('ROLLBACK'); } finally { lock.close(); } } };
 }
@@ -1631,7 +1863,7 @@ async function verifyWriteFailure(cdp, sessionId) {
   const idle = `!document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}) && !document.querySelector(${JSON.stringify(`${timer} .status.running`)})`;
   const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
   const projects = (() => {
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try {
       return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row }));
     } finally { db.close(); }
@@ -1693,7 +1925,7 @@ async function verifyWriteFailure(cdp, sessionId) {
 
   // Switch failing inside its transaction: the previous entry is updated first, then the
   // insert of the new entry fails. The update must be rolled back with it.
-  const trigger = new DatabaseSync(testDb);
+  const trigger = openTestDb();
   try { trigger.exec("CREATE TRIGGER test_reject_switch BEFORE INSERT ON time_entries BEGIN SELECT RAISE(FAIL, 'test write failure'); END"); }
   finally { trigger.close(); }
   try {
@@ -1707,7 +1939,7 @@ async function verifyWriteFailure(cdp, sessionId) {
     assert.deepEqual(writeFailureState(), runningState, 'a failed insert left the previous entry closed (partial switch)');
     console.log('PASS: T20 Switch failing after the previous entry was closed rolled back completely');
   } finally {
-    const cleanup = new DatabaseSync(testDb);
+    const cleanup = openTestDb();
     try { cleanup.exec('DROP TRIGGER test_reject_switch'); } finally { cleanup.close(); }
   }
 
@@ -1971,7 +2203,7 @@ async function verifyDiskFull(cdp, sessionId, disk) {
   const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
   const click = selector => evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
   const projects = (() => {
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row })); }
     finally { db.close(); }
   })();
@@ -2131,7 +2363,7 @@ async function verifyDuplicateClientChoices(cdp, sessionId) {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
     return result.result.value;
   };
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   let primaryId, secondId, primaryMarker, secondMarker;
   try {
     primaryId = db.prepare('SELECT id FROM clients WHERE name=?').get(primaryClient).id;
@@ -2199,7 +2431,7 @@ async function verifyShortSleep(cdp, sessionId) {
   const description = 'D4 krótkie uśpienie';
   const start = Date.parse('2026-01-05T08:00:00.000Z');
   const minute = 60_000;
-  let db = new DatabaseSync(testDb, { readOnly: true });
+  let db = openTestDb({ readOnly: true });
   let project;
   try {
     // The packaged app migrated the test database to the current schema with 'auto_included'.
@@ -2210,9 +2442,11 @@ async function verifyShortSleep(cdp, sessionId) {
     assert.ok(project, 'an active project for the short-sleep entry');
   } finally { db.close(); }
   await invoke('create_project_manual_entry', { projectId: project.projectId, taskId: null, startedAt: new Date(start).toISOString(), endedAt: new Date(start + 60 * minute).toISOString(), description });
-  db = new DatabaseSync(testDb);
+  db = openTestDb();
   let entryId, ids;
   try {
+    // One write transaction (it waits for the app's short read locks): the app never sees a partial set.
+    db.exec('BEGIN IMMEDIATE');
     entryId = db.prepare('SELECT e.id FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE d.description=?').get(description).id;
     const record = (offset, length) => {
       const id = Number(db.prepare('INSERT INTO sleep_periods(entry_id,started_ms) VALUES(?,?)').run(entryId, start + offset).lastInsertRowid);
@@ -2226,7 +2460,11 @@ async function verifyShortSleep(cdp, sessionId) {
     assert.equal(rows[0].decided_ms, rows[0].ended_ms, 'the automatic decision is recorded at the observed resume');
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='auto_included', decided_ms=ended_ms WHERE id=?").run(ids.boundary), /CHECK/);
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='excluded', decided_ms=1 WHERE id=?").run(ids.short), /immutable/);
-  } finally { db.close(); }
+    db.exec('COMMIT');
+  } finally {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    db.close();
+  }
 
   // One note above the timer for the two questions; the short sleep is not among them.
   const note = () => evaluate(`document.querySelector('.sleep-note')?.textContent ?? ''`);
@@ -2328,6 +2566,7 @@ async function runWindow(port, phase, recovery) {
       assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
       console.log(`${phase}: report matched the selected client (${seconds} s)`);
       await captureReportDetail(cdp, sessionId, phase === 'initial' ? 'selected-client' : 'restored-scope');
+      if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
       if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
@@ -2384,6 +2623,7 @@ async function runWindow(port, phase, recovery) {
       await verifyDuplicateClientChoices(cdp, sessionId);
     }
     if (phase === 'calendar') await verifyCalendar(cdp, sessionId);
+    if (phase === 'calendar-month') await verifyCalendarMonth(cdp, sessionId);
     if (phase === 'calendar-entry') await verifyCalendarEntry(cdp, sessionId);
     if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
@@ -2420,7 +2660,7 @@ async function waitForWindowClosed(port) {
 }
 
 function readInterruptedTimer() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     const active = db.prepare(`SELECT e.id, e.started_at, e.duration_seconds, e.manually_resolved, d.description
       FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE e.ended_at IS NULL`).all();
@@ -2454,7 +2694,7 @@ registry('add', ['/t', 'REG_SZ', '/d', `--remote-debugging-port=${port} --remote
 let seconds, interrupted, recovery, pendingWriteFailure;
 // The history built by the phases above, checked before PTT-36 adds its own synthetic entries.
 function assertBaselineHistory() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
       t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id
@@ -2503,6 +2743,9 @@ try {
   // DEV-24: calendar week with fixed entries (separate client), before PTT-36 adds its own entries.
   await waitForWindowClosed(port);
   await runWindow(port, 'calendar', recovery);
+  // DEV-25: calendar month with fixed entries in October 2025 (separate client).
+  await waitForWindowClosed(port);
+  await runWindow(port, 'calendar-month', recovery);
   // DEV-26: add and edit from the calendar (own client, fixed past week), also before PTT-36.
   await waitForWindowClosed(port);
   await runWindow(port, 'calendar-entry', recovery);

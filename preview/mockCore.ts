@@ -10,6 +10,11 @@ const scenario = params.get('scenario') ?? 'running';
 const previewView = params.get('view');
 if (previewView === 'calendar' || previewView === 'timer') { try { localStorage.setItem('trackermaster.view.v1', previewView); localStorage.removeItem('trackermaster.calendar.v1'); } catch { /* ignore */ } }
 // ?week=YYYY-MM-DD opens the calendar on the week of that day.
+// ?calendar=month|week opens that calendar range; ?month=YYYY-MM a month (DEV-25, preview convenience).
+const previewMode = params.get('calendar');
+if (previewMode === 'month' || previewMode === 'week') { try { localStorage.setItem('trackermaster.calendar.mode.v1', previewMode); } catch { /* ignore */ } }
+const previewMonth = params.get('month');
+if (previewMonth && /^\d{4}-\d{2}$/.test(previewMonth)) { try { localStorage.setItem('trackermaster.calendar.v1', JSON.stringify({ month: previewMonth })); } catch { /* ignore */ } }
 const previewWeek = params.get('week');
 if (previewWeek && /^\d{4}-\d{2}-\d{2}$/.test(previewWeek)) { try { localStorage.setItem('trackermaster.calendar.v1', JSON.stringify({ week: previewWeek })); } catch { /* ignore */ } }
 const now = () => Date.now();
@@ -54,6 +59,27 @@ for (const day = new Date(weekMonday); day.setHours(0, 0, 0, 0), day.getTime() <
   entries.push({ id, task_id: 111, project_id: 11, started_at: iso(at(14)), ended_at: iso(at(15.5)), duration_seconds: sleep ? 4500 : 5400, billable: true,
     description: sleep ? 'Projekt graficzny — z uśpieniem do rozstrzygnięcia' : 'Projekt graficzny — iteracja', ...(sleep ? { sleep_periods: sleep } : {}) });
   entries.push({ id: weekId++, task_id: null, project_id: 12, started_at: iso(at(16)), ended_at: iso(at(16.75)), duration_seconds: 2700, billable: false, description: 'Wsparcie klienta' });
+}
+// Calendar month (DEV-25): mornings on the earlier days of this month and the previous one (outside the
+// week data above), five short entries on one day ("+N"), and 23:50–00:10 across the start of this month.
+let monthId = 200;
+for (let back = 8; back <= 45; back++) {
+  const day = new Date(midnight); day.setDate(day.getDate() - back); day.setHours(0, 0, 0, 0);
+  const at = (hours: number) => { const d = new Date(day); d.setHours(Math.floor(hours), Math.round((hours % 1) * 60), 0, 0); return d.getTime(); };
+  if (day.getDay() === 0) continue; // a free Sunday
+  const many = day.getDate() === 12;
+  const slots = many ? [8, 8.5, 9, 9.5, 10] : day.getDay() === 6 ? [9] : [8, 10.25];
+  for (const [index, hours] of slots.entries()) {
+    const length = many ? 0.4 : index === 0 ? 2 : 1.25;
+    entries.push({ id: monthId++, task_id: index % 2 ? null : 111, project_id: index % 2 ? 12 : 11, started_at: iso(at(hours)), ended_at: iso(at(hours + length)),
+      duration_seconds: Math.round(length * 3600), billable: index % 2 === 0, description: many ? `Krótki przegląd ${index + 1}` : index === 0 ? 'Projekt graficzny — szkice' : 'Wsparcie klienta — poprawki' });
+  }
+}
+{
+  const first = new Date(midnight); first.setDate(1);
+  if (first.getTime() < midnight - 7 * 24 * H) {
+    entries.push({ id: monthId++, task_id: 112, project_id: 11, started_at: iso(first.getTime() - 10 * M), ended_at: iso(first.getTime() + 10 * M), duration_seconds: 1200, billable: true, description: 'Przełom miesiąca 23:50–00:10' });
+  }
 }
 // ?scenario=empty: first run without clients, projects or entries.
 if (scenario === 'empty') { clients.length = 0; projects.length = 0; tasks.length = 0; entries.length = 0; }
