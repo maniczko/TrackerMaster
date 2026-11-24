@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import type { CalendarBillable, CalendarClockEntry, CalendarFilter } from './calendarModel';
-import { calendarMonth, hoursMinutes, monthLabel, monthOf, moveDay, shiftMonth, validCalendarMonth } from './calendarMonthModel';
+import { calendarMonth, hoursMinutes, liveMonth, monthLabel, monthOf, moveDay, shiftMonth, validCalendarMonth } from './calendarMonthModel';
 import type { MonthCell, MonthCellEntry } from './calendarMonthModel';
 import { formatDuration as duration } from './reportCsv';
 import { dateInZone } from './reportTime';
@@ -59,11 +59,23 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
 
   const resolved = useMemo(() => resolveReportScope(scope, catalog), [scope, catalog]);
   const filter: CalendarFilter = { scope, billable };
-  const view = useMemo(() => {
+  // Performance (PR #65 review): the whole month is counted only when the data, filters, month, date or the
+  // running entry's state change. Every second only the weeks the clock can change are counted again
+  // (liveMonth), and nothing at all without a running timer. `now` is read from a ref in the base on purpose.
+  const nowRef = useRef(now);
+  nowRef.current = now;
+  const entryState = snapshotActive ? `${snapshotActive.id}|${snapshotActive.project_id}|${snapshotActive.task_id}|${snapshotActive.started_at}|${snapshotActive.billable}|${snapshotActive.description}|${!!snapshotActive.recovered}|${!!snapshotActive.uncertain}` : '';
+  const stableActive = useMemo(() => snapshotActive, [entryState]);
+  const base = useMemo(() => {
     if (!report.read || !shownMonth || resolved.problem) return null;
-    try { return calendarMonth({ data: report.read.data, catalog, filter, month: shownMonth, now, snapshotActive, snapshotFresh }); }
+    try { return calendarMonth({ data: report.read.data, catalog, filter, month: shownMonth, now: nowRef.current, snapshotActive: stableActive, snapshotFresh: false }); }
     catch { return null; }
-  }, [report.read, catalog, scope, billable, shownMonth, now, snapshotActive, snapshotFresh, resolved.problem]);
+  }, [report.read, catalog, scope, billable, shownMonth, today, stableActive, resolved.problem]);
+  const view = useMemo(() => {
+    if (!base || !report.read) return base;
+    try { return liveMonth(base, { data: report.read.data, catalog, filter, month: base.month, now, snapshotActive: stableActive, snapshotFresh }); }
+    catch { return null; }
+  }, [base, report.read, catalog, scope, billable, now, stableActive, snapshotFresh]);
   const allCells = view ? view.weeks.flat() : [];
   const chosen = allCells.find(cell => cell.date === selected) ?? null;
   // One cell is in the tab order (roving focus): the focused day, else the selected day, today or the 1st.

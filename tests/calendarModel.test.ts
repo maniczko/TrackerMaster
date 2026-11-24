@@ -223,3 +223,21 @@ test('auto-included short sleep is work in the calendar and in the report', () =
   assert.deepEqual(view.days[2].blocks.map(block => [block.kind, pieceRange(block)]), [['work', '09:00–10:00']]);
   assert.equal(view.pendingPeriodCount, 0);
 });
+
+test('live time after a Sunday read still counts on Monday (PR #65): the next week gets its seconds', () => {
+  // Report read on Sunday 29.11 at 23:59:30 local; now Monday 30.11 at 00:00:40 local, fresh snapshot.
+  const start = '2026-11-29T22:30:00Z';
+  const active: ActiveReportEntry = { id: 9, task_id: null, project_id: 20, started_at: start, ended_at: '2026-11-29T22:59:30.000Z',
+    duration_seconds: 1770, billable: false, description: 'Na żywo', unresolved: false };
+  const data = { entries: [], active, time_zone: zone };
+  const snapshot: CalendarClockEntry = { id: 9, project_id: 20, task_id: null, started_at: start, description: 'Na żywo', billable: false };
+  const now = Date.parse('2026-11-29T23:00:40Z');
+  const sunday = week(data, '2026-11-23', now, { snapshotActive: snapshot, snapshotFresh: true });
+  const monday = week(data, '2026-11-30', now, { snapshotActive: snapshot, snapshotFresh: true });
+  assert.equal(sunday.days[6].seconds, 1800);
+  assert.equal(monday.days[0].seconds, 40);
+  assert.equal(monday.weekSeconds, 40);
+  assert.deepEqual(monday.days[0].blocks.map(block => [block.entryId, block.running, block.kind]), [[9, true, 'work']]);
+  // Not live (stale snapshot): nothing beyond the projection, so Monday stays empty.
+  assert.equal(week(data, '2026-11-30', now, { snapshotActive: snapshot, snapshotFresh: false }).weekSeconds, 0);
+});

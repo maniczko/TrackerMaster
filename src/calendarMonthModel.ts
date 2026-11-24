@@ -10,7 +10,7 @@ import { calendarData, calendarWeek, pieceRange, validCalendarDate, weekStartOf 
 import type { CalendarBlock, CalendarClockEntry, CalendarFilter, CalendarReportData, PieceKind } from './calendarModel.ts';
 import { makeReportView } from './reportView.ts';
 import type { ReportCatalog } from './reportScope.ts';
-import { validTimeZone } from './reportTime.ts';
+import { dateInZone, validTimeZone } from './reportTime.ts';
 
 /** At most this many entries are named in a cell; the rest is "+N". */
 export const MONTH_CELL_ENTRIES = 3;
@@ -120,6 +120,58 @@ export function calendarMonth(input: {
     excludedEntryIds: view.excludedEntryIds, missingRelations: view.missingRelations, overlapEntryIds: view.overlaps.entryIds,
     pendingPeriodCount: view.pendingPeriodCount, pendingSeconds: view.pendingSeconds, unverifiedActive,
   };
+}
+
+// ---------- Live clock without recounting the month every second ----------
+
+type MonthInput = Parameters<typeof calendarMonth>[0];
+
+/**
+ * Whether the running timer is counted live (DEV-29): only then do totals change with the clock. Same
+ * conditions as calendarWeek's live extension; when false, `calendarMonth` does not depend on `now`
+ * beyond the current date.
+ */
+export function monthIsLive(input: Pick<MonthInput, 'data' | 'snapshotActive' | 'snapshotFresh'>): boolean {
+  const { data, snapshotActive, snapshotFresh } = input;
+  return !!snapshotFresh && !!snapshotActive && !snapshotActive.recovered && !snapshotActive.uncertain &&
+    !!data.active && !data.active.unresolved && data.active.ended_at !== null && String(data.active.id) === String(snapshotActive.id);
+}
+
+/**
+ * The month for the current second from a `base` month computed once without the live clock
+ * (`calendarMonth` with `snapshotFresh: false`, memoised by data, filters, month, today's date and the
+ * running entry's state). Only the grid weeks the clock can change are counted again with
+ * calendarWeek: with a live timer, every week from the report's read (its projection end) to today,
+ * which differ right after Monday 00:00; with a timer to verify (drawn up to now, never counted), the
+ * week of today. Other cells and the month warnings are reused, so the result equals `calendarMonth`
+ * with the same input. Without a running timer the base is returned as is.
+ */
+export function liveMonth(base: CalendarMonth | null, input: MonthInput): CalendarMonth | null {
+  if (!base) return null;
+  const { data, catalog, filter, now, snapshotActive, snapshotFresh } = input;
+  const live = monthIsLive(input);
+  const unverified = !!snapshotActive?.recovered || !!snapshotActive?.uncertain || !!data.active?.unresolved;
+  if (!live && !unverified) return base;
+  const today = dateInZone(now, base.zone);
+  const readEnd = live ? Date.parse(data.active!.ended_at!) : NaN;
+  const first = Number.isFinite(readEnd) ? [dateInZone(readEnd, base.zone), today].sort()[0] : today;
+  const touched = new Set<string>();
+  for (let week = Temporal.PlainDate.from(weekStartOf(first)); week.toString() <= weekStartOf(today); week = week.add({ days: 7 })) touched.add(week.toString());
+  let changed = false;
+  const weeks = base.weeks.map(cells => {
+    if (!touched.has(cells[0].date)) return cells;
+    const week = calendarWeek({ data, catalog, filter, weekStart: cells[0].date, now, snapshotActive, snapshotFresh });
+    if (!week) return cells;
+    changed = true;
+    return week.days.map((day, index) => {
+      const entries = cellEntries(day.blocks);
+      return { ...cells[index], isToday: day.isToday, seconds: day.seconds, entries,
+        shown: entries.slice(0, MONTH_CELL_ENTRIES), more: Math.max(0, entries.length - MONTH_CELL_ENTRIES) };
+    });
+  });
+  if (!changed) return base;
+  const monthSeconds = weeks.flat().filter(cell => cell.inMonth).reduce((sum, cell) => sum + cell.seconds, 0);
+  return { ...base, weeks, monthSeconds };
 }
 
 /** Moves the keyboard focus in the grid: ±1 day (left/right), ±7 days (up/down), week start/end (Home/End). */

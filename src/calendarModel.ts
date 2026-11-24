@@ -211,7 +211,11 @@ export function calendarWeek(input: {
   type Raw = CalendarPiece & { running: boolean; source: { project_id: Id; task_id: Id | null; description: string; billable: boolean }; entryStartMs: number; entryEndMs: number | null; entrySeconds: number | null };
   const raw: Raw[] = [];
   const counted = view.active && !view.active.unresolved ? view.active : null;
-  for (const contribution of view.contributions) {
+  // The running timer is visited even when the report's projection ends before this week (read on
+  // Sunday before midnight, now Monday): its live time after the projection still belongs here (DEV-25).
+  const visit = view.contributions.map(contribution => contribution.id);
+  if (counted && !visit.includes(counted.id)) visit.push(counted.id);
+  for (const contribution of visit.map(id => ({ id }))) {
     const source = sources.get(String(contribution.id));
     if (!source || source.ended_at === null) continue;
     const startedMs = Date.parse(source.started_at);

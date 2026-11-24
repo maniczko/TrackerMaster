@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { calendarWeek } from '../src/calendarModel.ts';
 import type { CalendarClockEntry, CalendarFilter, CalendarReportData } from '../src/calendarModel.ts';
-import { calendarMonth, hoursMinutes, monthGrid, monthLabel, moveDay, shiftMonth, validCalendarMonth, MONTH_CELL_ENTRIES } from '../src/calendarMonthModel.ts';
+import { calendarMonth, hoursMinutes, liveMonth, monthGrid, monthIsLive, monthLabel, moveDay, shiftMonth, validCalendarMonth, MONTH_CELL_ENTRIES } from '../src/calendarMonthModel.ts';
 import { reportByDay } from '../src/reportTime.ts';
 import { makeReportView } from '../src/reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from '../src/reportView.ts';
@@ -207,4 +207,79 @@ test('E2E fixture month (tests/windows-application.mjs, calendar-month): figures
   assert.deepEqual([cell(view, '2025-10-15').shown.length, cell(view, '2025-10-15').more], [3, 2]);
   // "Pokaż tydzień" for 15.10: the week view of 13–19.10.2025 has the same 00:50:00.
   assert.equal(calendarWeek({ data, catalog, filter: all, weekStart: '2025-10-13', now: 0, snapshotActive: null, snapshotFresh: false })!.weekSeconds, 3000);
+});
+
+// PR #65 review: the view counts the whole month only when data, filters, month or date change, and every
+// second only the weeks the clock can change (liveMonth). The result must equal the full calculation.
+const base = (data: CalendarReportData, value: string, now: number, snapshotActive: CalendarClockEntry | null) =>
+  calendarMonth({ data, catalog, filter: all, month: value, now, snapshotActive, snapshotFresh: false });
+const full = (data: CalendarReportData, value: string, now: number, snapshotActive: CalendarClockEntry | null, snapshotFresh = true) =>
+  calendarMonth({ data, catalog, filter: all, month: value, now, snapshotActive, snapshotFresh });
+const tick = (memo: ReturnType<typeof calendarMonth>, data: CalendarReportData, value: string, now: number, snapshotActive: CalendarClockEntry | null, snapshotFresh = true) =>
+  liveMonth(memo, { data, catalog, filter: all, month: value, now, snapshotActive, snapshotFresh });
+
+test('live ticks on a memoised month equal the full calculation, also across Monday 00:00', () => {
+  const runningFrom = (start: string, read: string) => {
+    const active: ActiveReportEntry = { id: 9, task_id: null, project_id: 20, started_at: start, ended_at: read,
+      duration_seconds: Math.floor((Date.parse(read) - Date.parse(start)) / 1000), billable: false, description: 'Na żywo', unresolved: false };
+    const data = { entries: [entry(1, '2026-11-02T06:00:00Z', '2026-11-02T07:00:00Z'), entry(2, '2026-11-29T20:00:00Z', '2026-11-29T21:00:00Z')], active, time_zone: zone };
+    const snapshot: CalendarClockEntry = { id: 9, project_id: 20, task_id: null, started_at: start, description: 'Na żywo', billable: false };
+    return { data, snapshot };
+  };
+  // Mid-week: read at 09:00, ticks up to 30 minutes later.
+  const mid = runningFrom('2026-11-19T08:00:00Z', '2026-11-19T09:00:00.000Z');
+  const memo = base(mid.data, '2026-11', Date.parse('2026-11-19T09:00:00Z'), mid.snapshot);
+  for (const minutes of [0, 1, 7, 30]) {
+    const now = Date.parse('2026-11-19T09:00:00Z') + minutes * 60_000 + 437;
+    assert.deepEqual(tick(memo, mid.data, '2026-11', now, mid.snapshot), full(mid.data, '2026-11', now, mid.snapshot), `+${minutes} min`);
+  }
+  assert.ok(monthIsLive({ data: mid.data, snapshotActive: mid.snapshot, snapshotFresh: true }));
+  // Sunday 29.11 23:59:30 local read, Monday 30.11 00:00:40 now: two weeks change, the month total too.
+  const edge = runningFrom('2026-11-29T22:30:00Z', '2026-11-29T22:59:30.000Z');
+  const now = Date.parse('2026-11-29T23:00:40Z');
+  const memoEdge = base(edge.data, '2026-11', now, edge.snapshot);
+  const live = tick(memoEdge, edge.data, '2026-11', now, edge.snapshot)!;
+  assert.deepEqual(live, full(edge.data, '2026-11', now, edge.snapshot));
+  assert.equal(live.weeks.flat().find(cell => cell.date === '2026-11-29')!.seconds, 3600 + 1800);
+  assert.equal(live.weeks.flat().find(cell => cell.date === '2026-11-30')!.seconds, 40);
+  // A stale snapshot or no timer: the memoised month is returned as is (no work per second).
+  assert.equal(tick(memo, mid.data, '2026-11', Date.parse('2026-11-19T09:10:00Z'), mid.snapshot, false), memo);
+  const idle = { entries: mid.data.entries, active: null, time_zone: zone };
+  const idleMemo = base(idle, '2026-11', 0, null);
+  assert.equal(tick(idleMemo, idle, '2026-11', Date.parse('2026-11-19T09:10:00Z'), null), idleMemo);
+  // A timer to verify is drawn up to now in today's cell (range grows) and never counted.
+  const verify = { ...mid.snapshot, recovered: true };
+  const verifyMemo = base(mid.data, '2026-11', Date.parse('2026-11-19T09:00:00Z'), verify);
+  const later = Date.parse('2026-11-19T10:30:00Z');
+  assert.deepEqual(tick(verifyMemo, mid.data, '2026-11', later, verify), full(mid.data, '2026-11', later, verify));
+  assert.equal(tick(verifyMemo, mid.data, '2026-11', later, verify)!.monthSeconds, verifyMemo!.monthSeconds);
+});
+
+test('performance: 5000 entries, the per-second tick counts only the live weeks', () => {
+  // Synthetic history: about 7 entries per working day over two years, plus a running timer today.
+  const entries: CompletedReportEntry[] = [];
+  let id = 1;
+  for (let day = Date.parse('2024-12-02T00:00:00Z'); entries.length < 5000; day += 86_400_000) {
+    if ([0, 6].includes(new Date(day).getUTCDay())) continue;
+    for (let slot = 0; slot < 7 && entries.length < 5000; slot++) {
+      const start = day + (7 + slot) * 3_600_000;
+      entries.push(entry(id++, new Date(start).toISOString(), new Date(start + 45 * 60_000).toISOString(), { project_id: slot % 2 ? 20 : 10, billable: slot % 3 !== 0 }));
+    }
+  }
+  const last = Date.parse(entries[entries.length - 1].ended_at);
+  const start = new Date(last + 3_600_000).toISOString();
+  const read = last + 2 * 3_600_000;
+  const active: ActiveReportEntry = { id: 99_999, task_id: null, project_id: 10, started_at: start, ended_at: new Date(read).toISOString(),
+    duration_seconds: 3600, billable: true, description: 'Na żywo', unresolved: false };
+  const data = { entries, active, time_zone: zone };
+  const snapshot: CalendarClockEntry = { id: 99_999, project_id: 10, task_id: null, started_at: start, description: 'Na żywo', billable: true };
+  const value = new Date(read).toISOString().slice(0, 7);
+  const best = (run: () => unknown) => { let min = Infinity; for (let i = 0; i < 3; i++) { const t = performance.now(); run(); min = Math.min(min, performance.now() - t); } return min; };
+  let memo = base(data, value, read, snapshot);
+  const fullMs = best(() => { memo = base(data, value, read, snapshot); });
+  const tickMs = best(() => tick(memo, data, value, read + 5_000, snapshot));
+  console.log(`PERF calendar-month 5000 entries: full ${fullMs.toFixed(1)} ms, live tick ${tickMs.toFixed(1)} ms`);
+  assert.deepEqual(tick(memo, data, value, read + 5_000, snapshot), full(data, value, read + 5_000, snapshot));
+  // The tick counts 1 of 4–6 weeks; with timer noise it must still be well below a full count.
+  assert.ok(tickMs < fullMs * 0.6, `live tick ${tickMs.toFixed(1)} ms is not cheaper than the full month ${fullMs.toFixed(1)} ms`);
 });
