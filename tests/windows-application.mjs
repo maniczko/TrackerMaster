@@ -102,6 +102,102 @@ async function captureReportDetail(cdp, sessionId, state) {
     }
   }
 }
+// Reports Summary (DEV-30/31, package R1) on the selected client and the wide fixed range of the first window:
+// final KPIs, the SVG chart driven by real keys, the legend and the client → project → task groups all equal
+// the Detailed contribution of the single entry. Layout at 1280/1920 and at 125% scaling, with screenshots.
+async function verifyReportSummary(cdp, sessionId, seconds) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const hms = value => [Math.floor(value / 3600), Math.floor(value % 3600 / 60), value % 60].map(part => String(part).padStart(2, '0')).join(':');
+  const report = '[aria-label="Raport czasu"]';
+  const tab = label => `[...document.querySelectorAll(${JSON.stringify(report + ' button')})].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${tab('Podsumowanie')}.click()`);
+  await waitFor('summary KPIs', () => evaluate(`document.querySelector('.report-kpis strong')?.textContent.trim() === ${JSON.stringify(hms(seconds))}`));
+  const kpi = await evaluate(`[...document.querySelectorAll('.report-kpis > div')].map(tile => ({
+    label: tile.querySelector('small').textContent.trim(), value: tile.querySelector('strong').textContent.trim(), note: tile.querySelectorAll('small')[1]?.textContent.trim() ?? '' }))`);
+  console.log(`REPORT_SUMMARY kpi ${JSON.stringify(kpi)}`);
+  assert.deepEqual(kpi.map(tile => tile.label), ['Łączny czas', 'Rozliczalny czas', '% rozliczalny', 'Średnio na dzień z pracą']);
+  // The fixture project is not billable by default (D12 billable B: false unless the project says otherwise).
+  assert.deepEqual([kpi[1].value, kpi[2].value], ['00:00:00', '0%']);
+  const workDays = Number(kpi[3].note.match(/^(\d+)/)?.[1]);
+  assert.ok(workDays === 1 || workDays === 2, `days with work: ${kpi[3].note}`);
+  assert.equal(kpi[3].value, hms(Math.floor(seconds / workDays)), 'average over days with work (D12 variant B)');
+  assert.equal(await evaluate(`Boolean(document.querySelector('.report-live'))`), false, 'no running or pending time in this window');
+
+  const chart = await evaluate(`(() => {
+    const bars = [...document.querySelectorAll('.report-chart-bar')];
+    return { caption: document.querySelector('.report-chart h3')?.textContent, bars: bars.length,
+      sum: bars.reduce((total, bar) => total + Number(bar.dataset.seconds), 0), tabbable: bars.filter(bar => bar.getAttribute('tabindex') === '0').length,
+      legend: [...document.querySelectorAll('.report-chart-legend li')].map(item => item.textContent) };
+  })()`);
+  console.log(`REPORT_SUMMARY chart ${JSON.stringify(chart)}`);
+  assert.equal(chart.caption, 'Czas według miesięcy', 'the 14-month range is shown by month');
+  assert.equal(chart.bars, 14);
+  assert.equal(chart.sum, seconds, 'chart buckets add up to the KPI total');
+  assert.equal(chart.tabbable, 1, 'one tab stop (roving focus)');
+  assert.equal(chart.legend.length, 1);
+  assert.ok(chart.legend[0].includes(project) && chart.legend[0].includes(primaryClient) && chart.legend[0].includes(hms(seconds)));
+  // Real keys through CDP: focus the bar with data, move left (tooltip follows), back right, Escape hides it.
+  await evaluate(`document.querySelector('.report-chart-bar[tabindex="0"]').focus()`);
+  const focused = () => evaluate(`({ from: document.activeElement?.dataset?.from ?? null, seconds: Number(document.activeElement?.dataset?.seconds ?? -1),
+    tooltip: document.querySelector('[role="tooltip"]')?.textContent ?? null,
+    described: Boolean(document.activeElement?.getAttribute('aria-describedby')) })`);
+  const start = await focused();
+  assert.equal(start.seconds, seconds);
+  assert.ok(start.described && start.tooltip.includes(`Łącznie ${hms(seconds)}`) && start.tooltip.includes(project), `tooltip: ${start.tooltip}`);
+  const press = async (key, code, windowsVirtualKeyCode) => {
+    for (const type of ['keyDown', 'keyUp']) await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode }, sessionId);
+  };
+  await press('ArrowLeft', 'ArrowLeft', 37);
+  const left = await waitFor('ArrowLeft moves the chart focus', async () => { const state = await focused(); return state.from !== start.from ? state : null; });
+  assert.ok(left.tooltip?.includes('Łącznie') && left.described, 'the tooltip follows the keyboard');
+  await press('ArrowRight', 'ArrowRight', 39);
+  await waitFor('ArrowRight returns to the bar with data', async () => (await focused()).from === start.from);
+  await press('Escape', 'Escape', 27);
+  await waitFor('Escape hides the tooltip', async () => (await focused()).tooltip === null);
+
+  const groupRows = () => evaluate(`[...document.querySelectorAll('.report-groups tbody tr')].map(row => ({ level: row.dataset.level,
+    name: row.querySelector('th').textContent.replace(/^[▾▸]/, '').trim(), time: row.cells[1].textContent.trim(), share: row.cells[2].textContent.trim() }))`);
+  const initial = await groupRows();
+  assert.deepEqual(initial, [{ level: 'client', name: primaryClient, time: hms(seconds), share: '100%' }, { level: 'project', name: project, time: hms(seconds), share: '100%' }]);
+  await evaluate(`[...document.querySelectorAll('.report-groups tbody tr[data-level="project"] button')][0].click()`);
+  await waitFor('task level expands', async () => (await groupRows()).length === 3);
+  assert.deepEqual((await groupRows())[2], { level: 'task', name: task, time: hms(seconds), share: '100%' });
+  assert.equal(await evaluate(`document.querySelector('.report-groups tbody tr[data-level="project"] button').getAttribute('aria-expanded')`), 'true');
+  assert.equal(await evaluate(`document.querySelector('.report-groups tfoot td').textContent.trim()`), hms(seconds));
+  console.log('PASS: Reports Summary KPIs, chart (keyboard tooltip), legend and client → project → task groups equal the Detailed entry');
+
+  await captureSection(cdp, sessionId, report, `Boolean(document.querySelector('.report-chart-bar'))`, 'report-summary');
+  // 125% Windows scaling of a 1280×720 window: 1024×576 CSS px at device scale 1.25.
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1024, height: 576, deviceScaleFactor: 1.25, mobile: false }, sessionId);
+  try {
+    await waitFor('125% scaling applied', () => evaluate('window.innerWidth === 1024 && window.devicePixelRatio === 1.25'));
+    await delay(300);
+    const box = await evaluate(`(() => {
+      const section = document.querySelector(${JSON.stringify(report)});
+      section.scrollIntoView({ block: 'start' });
+      const rect = section.getBoundingClientRect();
+      const kpis = [...document.querySelectorAll('.report-kpis > div')].map(tile => tile.getBoundingClientRect());
+      const overflowing = [...section.querySelectorAll('.report-kpis strong, .report-chart-legend li, .report-groups th')]
+        .filter(element => element.scrollWidth > element.clientWidth + 1).length;
+      return { x: Math.max(0, rect.left + window.scrollX), y: Math.max(0, rect.top + window.scrollY), width: Math.ceil(rect.width), height: Math.ceil(rect.height),
+        scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth, kpiTop: kpis.map(item => Math.round(item.top)), overflowing };
+    })()`);
+    console.log(`UI_LAYOUT report-summary-125pct 1024x576@1.25 ${JSON.stringify(box)}`);
+    assert.ok(box.scrollWidth <= box.clientWidth, 'report summary at 125%: the page scrolls horizontally');
+    assert.equal(box.overflowing, 0, 'report summary at 125%: text is clipped');
+    const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true,
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 } }, sessionId);
+    await writeFile(join(screenshotDirectory, 'report-summary-125pct-1024x576.png'), Buffer.from(data, 'base64'));
+  } finally {
+    await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+  }
+  await evaluate(`${tab('Szczegóły')}.click()`);
+  await waitFor('Detailed shown after the summary check', () => evaluate(`Boolean(document.querySelector('.report-detail tbody tr'))`));
+}
 // Mini timer bar: 48×48 Start/Stop in a fixed place, title/clock/action not overlapping or covered, no page overflow.
 const inspectCompactLayout = `(() => {
   const box = selector => {
@@ -2148,6 +2244,7 @@ async function runWindow(port, phase, recovery) {
       assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
       console.log(`${phase}: report matched the selected client (${seconds} s)`);
       await captureReportDetail(cdp, sessionId, phase === 'initial' ? 'selected-client' : 'restored-scope');
+      if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
       if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);

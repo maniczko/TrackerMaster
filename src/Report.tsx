@@ -15,6 +15,8 @@ import { allReportClients, changeReportScope, resolveReportScope } from './repor
 import type { ReportCatalog, ReportScope } from './reportScope';
 import { clientLabels } from './clientLabels';
 import ReportGlance from './ReportGlance';
+import ReportSummary from './ReportSummary';
+import { entryRelations } from './reportSummaryModel';
 import type { AllClientsReport } from './useAllClientsReport';
 
 type Data = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
@@ -196,6 +198,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
   const projectArchived = clientArchived || resolved.project?.archived;
   const clientLabelById = useMemo(() => clientLabels(clients), [clients]);
   const selectedClientLabel = resolved.client ? clientLabelById.get(String(resolved.client.id)) : undefined;
+  const relations = useMemo(() => entryRelations([...(data?.entries ?? []), ...(data?.active ? [data.active] : [])]), [data]);
   const clientLabelByEntry = useMemo(() => {
     const projectOwners = new Map(projects.map(project => [String(project.id), String(project.client_id)]));
     const labels = new Map<number, string>();
@@ -315,14 +318,8 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
           <button type="button" className="secondary report-button" aria-pressed={tab === 'details'} onClick={() => setTab('details')}>Szczegóły</button>
         </div>
         {tab === 'summary' ? <>
-          <div className="report-summary">
-            <div><small>Zatwierdzony czas{incomplete ? ' · suma niepełna' : ''}</small><strong>{duration(view.finalizedSeconds)}</strong></div>
-            <div><small>Aktywny pomiar · orientacyjnie</small><strong>{duration(view.activeSeconds)}</strong></div>
-            <div><small>Czas pracy z aktywnym pomiarem</small><strong>{duration(view.liveSeconds)}</strong></div>
-            <div><small>Średnio na dzień z pracą</small><strong>{view.averageSeconds === null ? 'Brak danych' : duration(view.averageSeconds)}</strong></div>
-            <div><small>Czas rozliczalny</small><strong>{duration(view.billableSeconds)}</strong>
-              <small>{view.liveSeconds ? `${new Intl.NumberFormat('pl-PL', { maximumFractionDigits: 1 }).format(100 * view.billableSeconds / view.liveSeconds)}% czasu` : 'Brak danych'}</small></div>
-          </div>
+          <ReportSummary key={`summary:${viewKey}`} view={view} relations={relations} catalog={catalog} clientLabelById={clientLabelById}
+            from={range.from} through={range.through} incomplete={incomplete} />
           {view.liveDays.length === 0 ? <p className="muted">Brak czasu pracy w wybranym zakresie.</p> :
             <div className="table-wrap"><table><thead><tr><th scope="col">Dzień</th><th scope="col">Czas z aktywnym pomiarem</th></tr></thead>
               <tbody>{view.liveDays.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
