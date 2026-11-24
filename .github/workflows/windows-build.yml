@@ -86,6 +86,35 @@ jobs:
             TrackerMaster-test-update-x64.msix
           if-no-files-found: error
           retention-days: 7
+      # D11 Store variant: on a PR only the manifest is compared (no package with the Store identity is built
+      # here; the candidate comes from windows-msix-store.yml, workflow_dispatch on main).
+      - name: Check Store manifest equals the tested manifest
+        shell: pwsh
+        run: ./packaging/msix/Test-MsixManifestParity.ps1
+      # Runs last: it replaces the isolated executable in target/release (already saved above).
+      - name: Refuse to package a production build (MSIX isolation guard)
+        shell: pwsh
+        run: |
+          # Production identifier and no VITE_TRACKER_TEST_MODE. The build is never started, so the
+          # pl.tracker.personal profile is not touched.
+          npm run tauri -- build --no-bundle
+          if ($LASTEXITCODE -ne 0) { throw "Production build failed ($LASTEXITCODE)." }
+          $exe = './src-tauri/target/release/tracker-master.exe'
+          $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($exe))
+          if (!$text.Contains('TRACKERMASTER_BUILD_PROFILE=production;') -or $text.Contains('TRACKERMASTER_BUILD_PROFILE=testonly;')) {
+            throw 'The production build does not carry the production build profile marker.'
+          }
+          foreach ($variant in 'Test', 'Store') {
+            $output = "./production-must-fail-$variant.msix"
+            $refused = $null
+            try { ./packaging/msix/New-TestMsix.ps1 -Variant $variant -Executable $exe -Output $output | Out-Null }
+            catch { $refused = $_.Exception.Message }
+            if (!$refused -or $refused -notmatch 'not the isolated test build' -or (Test-Path -LiteralPath $output)) {
+              throw "Packaging a production build ($variant) did not fail on the isolation check: $refused"
+            }
+            Write-Host "PASS: $variant packaging refused the production build: $refused"
+          }
+          if (Test-Path -LiteralPath (Join-Path $env:APPDATA 'pl.tracker.personal')) { throw 'The pl.tracker.personal profile was touched.' }
   windows-application:
     needs: build
     runs-on: windows-2025
