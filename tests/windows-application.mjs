@@ -1020,14 +1020,18 @@ async function verifyCalendarEntry(cdp, sessionId) {
     return { heading: root.querySelector('.calendar-range')?.textContent, week: root.querySelector('.calendar-week-total')?.textContent,
       days: [...root.querySelectorAll('.calendar-day-total')].map(node => node.textContent), blocks: root.querySelectorAll('.calendar-block').length,
       note: root.querySelector('.calendar-entry-note')?.textContent ?? null }; })()`;
-  // A real mouse click at a wall-clock minute of a day column (the column is scrolled into view first).
+  // A real mouse click on an EMPTY slot at a wall-clock minute of a day column (scrolled into view first).
+  // The point must hit the column itself: a block there would open that entry instead of a new one.
   const clickSlot = async (date, minute) => {
     const point = await evaluate(`(() => {
       const body = document.querySelector('.calendar-body'); const column = document.querySelector('.calendar-column[data-date="${date}"]');
       body.scrollTop = Math.max(0, ${minute} * column.getBoundingClientRect().height / 1440 - 120);
       const box = column.getBoundingClientRect();
-      return { x: box.left + box.width / 2, y: box.top + ${minute} * box.height / 1440 };
+      const x = box.left + box.width / 2, y = box.top + ${minute} * box.height / 1440;
+      const hit = document.elementFromPoint(x, y);
+      return { x, y, hit: hit === column ? 'column' : hit?.closest('.calendar-block') ? 'block: ' + hit.closest('.calendar-block').getAttribute('aria-label') : String(hit?.className) };
     })()`);
+    assert.equal(point.hit, 'column', `the slot ${date} ${Math.floor(minute / 60)}:${String(minute % 60).padStart(2, '0')} is not empty`);
     for (const type of ['mousePressed', 'mouseReleased']) await cdp.send('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, button: 'left', clickCount: 1 }, sessionId);
   };
 
@@ -1093,11 +1097,20 @@ async function verifyCalendarEntry(cdp, sessionId) {
   assert.deepEqual({ ...added, id: 0 }, { id: 0, started_at: '2026-03-11T09:15:00.000Z', ended_at: '2026-03-11T09:45:00.000Z', duration_seconds: 1800,
     description: calendarEntryFixture.description, billable: 1, timeRevisions: 0, billingRevisions: 0, resolutions: 0 });
 
-  // 2. Overlap: a click at 09:20 on 10.03 gives 09:15–09:45 inside the existing 09:00–10:00; the form names it and saves nothing.
-  await clickSlot('2026-03-10', 9 * 60 + 20);
-  await waitFor('overlap is refused in the form', async () => (await evaluate(alertText)).includes('Ten czas nakłada się na istniejący pomiar'));
+  // 2. Overlap: a click on the EMPTY slot at 08:50 on 10.03 gives 08:45–09:15, which overlaps the existing 09:00–10:00.
+  // (CI run 45294267451 clicked at 09:20, i.e. on the existing block itself, which correctly opened its edit form.)
+  await clickSlot('2026-03-10', 8 * 60 + 50);
+  const readOverlap = `({ title: ${inDialog('h3')}?.textContent ?? null, start: ${inDialog('input[type="datetime-local"]')}?.value ?? null,
+    end: document.querySelectorAll(${JSON.stringify(`${dialog} input[type="datetime-local"]`)})[1]?.value ?? null, alerts: ${alertText} })`;
+  let overlap = null;
+  await waitFor('overlap is refused in the form', async () => { overlap = await evaluate(readOverlap); return overlap.alerts.includes('Ten czas nakłada się na istniejący pomiar'); })
+    .catch(error => { throw new Error(`${error.message}; dialog state: ${JSON.stringify(overlap)}`); });
+  assert.deepEqual({ ...overlap, alerts: undefined }, { title: 'Nowy wpis', start: '2026-03-10T08:45', end: '2026-03-10T09:15', alerts: undefined });
   await evaluate(`${inDialog('button[type="submit"]')}.click()`);
   await delay(500);
+  assert.equal((await evaluate(readOverlap)).title, 'Nowy wpis', 'a refused overlap must keep the form open');
+  // Escape from the description field: the dialog's own cancel, not a date picker's.
+  await evaluate(`${inDialog('textarea')}.focus()`);
   await key('Escape', 'Escape', 27);
   await waitFor('overlap dialog closed with Escape', () => evaluate(`!document.querySelector(${JSON.stringify(dialog)}) && document.activeElement?.classList.contains('calendar-add')`));
   assert.deepEqual(calendarEntryRows(), rows, 'a refused overlap changed the database');
