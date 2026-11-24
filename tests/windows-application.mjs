@@ -15,6 +15,13 @@ assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 assert.ok(process.env.RUNNER_TEMP && process.env.APPDATA);
 const exe = resolve('src-tauri/target/release/tracker-master.exe');
 const testDb = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'tracker.sqlite3');
+// The running app reads the database every few seconds (rollback journal, no WAL). A commit needs the
+// readers' shared locks released, and node:sqlite waits 0 ms by default, so a test write that met an app
+// read failed with "database is locked" (main 91e2451, run 45233029351). Every test connection now waits
+// for such short locks like the app's own connections do (rusqlite default 5 s); a lock held longer is a
+// real failure. Tests that hold the write lock on purpose (holdWriteLock) are unaffected.
+const SQLITE_BUSY_WAIT_MS = 15_000;
+const openTestDb = (options = {}) => new DatabaseSync(testDb, { timeout: SQLITE_BUSY_WAIT_MS, ...options });
 const normalDb = join(process.env.APPDATA, 'pl.tracker.personal', 'tracker.sqlite3');
 await access(exe);
 await assert.rejects(stat(testDb), { code: 'ENOENT' });
@@ -766,7 +773,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   };
   pressShortcut();
   await waitFor('first press starts measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running'`));
-  const activeDb = new DatabaseSync(testDb, { readOnly: true });
+  const activeDb = openTestDb({ readOnly: true });
   let entryId;
   try {
     const rows = activeDb.prepare(`SELECT e.id, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
@@ -797,7 +804,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(replacementDescription)});
     input.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  const switchDb = new DatabaseSync(testDb);
+  const switchDb = openTestDb();
   try {
     switchDb.exec("CREATE TRIGGER test_reject_timer_switch AFTER INSERT ON entry_descriptions BEGIN SELECT RAISE(FAIL, 'test switch write failure'); END");
     await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
@@ -816,7 +823,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   await waitFor('switch retry enabled', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-start button:not(:disabled)'))`));
   await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
   await waitFor('switch retry succeeds', () => evaluate(mainSession, `document.body.textContent.includes('Przełączono zadanie.')`));
-  const switchedDb = new DatabaseSync(testDb, { readOnly: true });
+  const switchedDb = openTestDb({ readOnly: true });
   try {
     const rows = switchedDb.prepare(`SELECT e.id, e.started_at, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
     assert.equal(rows.length, 5);
@@ -827,7 +834,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     entryId = rows[4].id;
   } finally { switchedDb.close(); }
   await waitFor('widget reflects the switched timer', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running' && document.querySelector('.qp-context')?.textContent.includes(${JSON.stringify(primaryClient)})`));
-  const failureDb = new DatabaseSync(testDb);
+  const failureDb = openTestDb();
   try {
     failureDb.exec("CREATE TRIGGER test_reject_timer_stop BEFORE UPDATE OF ended_at ON time_entries BEGIN SELECT RAISE(FAIL, 'test timer write failure'); END");
     await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button').click()`);
@@ -850,7 +857,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   })()`));
   pressShortcut();
   await waitFor('second press stops measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'idle'`));
-  const stoppedDb = new DatabaseSync(testDb, { readOnly: true });
+  const stoppedDb = openTestDb({ readOnly: true });
   try {
     const rows = stoppedDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
     assert.equal(rows.length, 5);
@@ -1010,7 +1017,7 @@ async function verifyRestoreRetry(cdp, sessionId) {
     await click('Przywróć kopię');
     await waitFor('restore failure displayed', () => evaluate(`document.body.textContent.includes('Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.')`));
     assert.equal(await evaluate(`document.querySelector(${JSON.stringify(section)} + ' input[type="checkbox"]')?.checked`), false);
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { assert.equal(db.prepare('SELECT COUNT(*) AS count FROM time_entries').get().count, 3); }
     finally { db.close(); }
     await unlink(backupDir);
@@ -1150,7 +1157,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
       try { return JSON.parse(await readFile(path, 'utf8')).fields.description === text; }
       catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return false; throw error; }
     });
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, primaryDescription); }
     finally { db.close(); }
     const window = await waitFor('main window while editing', () => inspectWindow('Find', primary.pid) || null);
@@ -1238,7 +1245,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('draft content restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`[...document.querySelectorAll('[aria-label="Edycja wpisu"] button')].find(button => button.textContent.trim() === 'Zachowaj szkic').click()`);
   await waitFor('restored draft put aside', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]')`));
-  const beforeConflict = new DatabaseSync(testDb, { readOnly: true });
+  const beforeConflict = openTestDb({ readOnly: true });
   let originalTimes;
   try {
     originalTimes = beforeConflict.prepare('SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=1').get();
@@ -1270,7 +1277,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('selected draft field restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
   await waitFor('draft applied once to history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(text)}))`));
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, text);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=1').get().count, 1);
@@ -1296,7 +1303,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('draft discard confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Odrzuć zmiany').click()`);
   await waitFor('discard hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
-  const unchanged = new DatabaseSync(testDb, { readOnly: true });
+  const unchanged = openTestDb({ readOnly: true });
   try {
     assert.equal(unchanged.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(unchanged.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1338,7 +1345,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('invalid edit stays open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Sprawdź daty i godziny')`));
   assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
   assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
-  const rejected = new DatabaseSync(testDb, { readOnly: true });
+  const rejected = openTestDb({ readOnly: true });
   try {
     assert.equal(rejected.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(rejected.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1350,7 +1357,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, ${JSON.stringify(originalEnd)});
     field.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  const injectedFailure = new DatabaseSync(testDb);
+  const injectedFailure = openTestDb();
   try {
     injectedFailure.exec("CREATE TRIGGER test_reject_revision BEFORE INSERT ON description_revisions BEGIN SELECT RAISE(FAIL, 'test write failure'); END");
   } finally { injectedFailure.close(); }
@@ -1360,7 +1367,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('SQLite error keeps the editor open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych')`));
   assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
   assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
-  const blocked = new DatabaseSync(testDb);
+  const blocked = openTestDb();
   try {
     assert.equal(blocked.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(blocked.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1368,7 +1375,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   } finally { blocked.close(); }
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
   await waitFor('save hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
-  const saved = new DatabaseSync(testDb, { readOnly: true });
+  const saved = openTestDb({ readOnly: true });
   try {
     assert.equal(saved.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, savedText);
     assert.equal(saved.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 1);
@@ -1404,7 +1411,7 @@ const writeFailure = {
 };
 
 function writeFailureState() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     return {
       entries: db.prepare(`SELECT e.id, e.project_id, e.task_id, e.started_at, e.ended_at, e.duration_seconds, e.manually_resolved,
@@ -1417,7 +1424,7 @@ function writeFailureState() {
 }
 
 function holdWriteLock() {
-  const lock = new DatabaseSync(testDb);
+  const lock = openTestDb();
   lock.exec('BEGIN IMMEDIATE');
   return { release() { try { lock.exec('ROLLBACK'); } finally { lock.close(); } } };
 }
@@ -1438,7 +1445,7 @@ async function verifyWriteFailure(cdp, sessionId) {
   const idle = `!document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}) && !document.querySelector(${JSON.stringify(`${timer} .status.running`)})`;
   const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
   const projects = (() => {
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try {
       return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row }));
     } finally { db.close(); }
@@ -1500,7 +1507,7 @@ async function verifyWriteFailure(cdp, sessionId) {
 
   // Switch failing inside its transaction: the previous entry is updated first, then the
   // insert of the new entry fails. The update must be rolled back with it.
-  const trigger = new DatabaseSync(testDb);
+  const trigger = openTestDb();
   try { trigger.exec("CREATE TRIGGER test_reject_switch BEFORE INSERT ON time_entries BEGIN SELECT RAISE(FAIL, 'test write failure'); END"); }
   finally { trigger.close(); }
   try {
@@ -1514,7 +1521,7 @@ async function verifyWriteFailure(cdp, sessionId) {
     assert.deepEqual(writeFailureState(), runningState, 'a failed insert left the previous entry closed (partial switch)');
     console.log('PASS: T20 Switch failing after the previous entry was closed rolled back completely');
   } finally {
-    const cleanup = new DatabaseSync(testDb);
+    const cleanup = openTestDb();
     try { cleanup.exec('DROP TRIGGER test_reject_switch'); } finally { cleanup.close(); }
   }
 
@@ -1778,7 +1785,7 @@ async function verifyDiskFull(cdp, sessionId, disk) {
   const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
   const click = selector => evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
   const projects = (() => {
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row })); }
     finally { db.close(); }
   })();
@@ -1938,7 +1945,7 @@ async function verifyDuplicateClientChoices(cdp, sessionId) {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
     return result.result.value;
   };
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   let primaryId, secondId, primaryMarker, secondMarker;
   try {
     primaryId = db.prepare('SELECT id FROM clients WHERE name=?').get(primaryClient).id;
@@ -2006,7 +2013,7 @@ async function verifyShortSleep(cdp, sessionId) {
   const description = 'D4 krótkie uśpienie';
   const start = Date.parse('2026-01-05T08:00:00.000Z');
   const minute = 60_000;
-  let db = new DatabaseSync(testDb, { readOnly: true });
+  let db = openTestDb({ readOnly: true });
   let project;
   try {
     // The packaged app migrated the test database to the current schema with 'auto_included'.
@@ -2017,9 +2024,11 @@ async function verifyShortSleep(cdp, sessionId) {
     assert.ok(project, 'an active project for the short-sleep entry');
   } finally { db.close(); }
   await invoke('create_project_manual_entry', { projectId: project.projectId, taskId: null, startedAt: new Date(start).toISOString(), endedAt: new Date(start + 60 * minute).toISOString(), description });
-  db = new DatabaseSync(testDb);
+  db = openTestDb();
   let entryId, ids;
   try {
+    // One write transaction (it waits for the app's short read locks): the app never sees a partial set.
+    db.exec('BEGIN IMMEDIATE');
     entryId = db.prepare('SELECT e.id FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE d.description=?').get(description).id;
     const record = (offset, length) => {
       const id = Number(db.prepare('INSERT INTO sleep_periods(entry_id,started_ms) VALUES(?,?)').run(entryId, start + offset).lastInsertRowid);
@@ -2033,7 +2042,11 @@ async function verifyShortSleep(cdp, sessionId) {
     assert.equal(rows[0].decided_ms, rows[0].ended_ms, 'the automatic decision is recorded at the observed resume');
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='auto_included', decided_ms=ended_ms WHERE id=?").run(ids.boundary), /CHECK/);
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='excluded', decided_ms=1 WHERE id=?").run(ids.short), /immutable/);
-  } finally { db.close(); }
+    db.exec('COMMIT');
+  } finally {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    db.close();
+  }
 
   // One note above the timer for the two questions; the short sleep is not among them.
   const note = () => evaluate(`document.querySelector('.sleep-note')?.textContent ?? ''`);
@@ -2226,7 +2239,7 @@ async function waitForWindowClosed(port) {
 }
 
 function readInterruptedTimer() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     const active = db.prepare(`SELECT e.id, e.started_at, e.duration_seconds, e.manually_resolved, d.description
       FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE e.ended_at IS NULL`).all();
@@ -2260,7 +2273,7 @@ registry('add', ['/t', 'REG_SZ', '/d', `--remote-debugging-port=${port} --remote
 let seconds, interrupted, recovery, pendingWriteFailure;
 // The history built by the phases above, checked before PTT-36 adds its own synthetic entries.
 function assertBaselineHistory() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
       t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id
