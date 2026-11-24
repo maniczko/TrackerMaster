@@ -15,6 +15,13 @@ assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 assert.ok(process.env.RUNNER_TEMP && process.env.APPDATA);
 const exe = resolve('src-tauri/target/release/tracker-master.exe');
 const testDb = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'tracker.sqlite3');
+// The running app reads the database every few seconds (rollback journal, no WAL). A commit needs the
+// readers' shared locks released, and node:sqlite waits 0 ms by default, so a test write that met an app
+// read failed with "database is locked" (main 91e2451, run 45233029351). Every test connection now waits
+// for such short locks like the app's own connections do (rusqlite default 5 s); a lock held longer is a
+// real failure. Tests that hold the write lock on purpose (holdWriteLock) are unaffected.
+const SQLITE_BUSY_WAIT_MS = 15_000;
+const openTestDb = (options = {}) => new DatabaseSync(testDb, { timeout: SQLITE_BUSY_WAIT_MS, ...options });
 const normalDb = join(process.env.APPDATA, 'pl.tracker.personal', 'tracker.sqlite3');
 await access(exe);
 await assert.rejects(stat(testDb), { code: 'ENOENT' });
@@ -94,6 +101,102 @@ async function captureReportDetail(cdp, sessionId, state) {
       await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
     }
   }
+}
+// Reports Summary (DEV-30/31, package R1) on the selected client and the wide fixed range of the first window:
+// final KPIs, the SVG chart driven by real keys, the legend and the client → project → task groups all equal
+// the Detailed contribution of the single entry. Layout at 1280/1920 and at 125% scaling, with screenshots.
+async function verifyReportSummary(cdp, sessionId, seconds) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const hms = value => [Math.floor(value / 3600), Math.floor(value % 3600 / 60), value % 60].map(part => String(part).padStart(2, '0')).join(':');
+  const report = '[aria-label="Raport czasu"]';
+  const tab = label => `[...document.querySelectorAll(${JSON.stringify(report + ' button')})].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${tab('Podsumowanie')}.click()`);
+  await waitFor('summary KPIs', () => evaluate(`document.querySelector('.report-kpis strong')?.textContent.trim() === ${JSON.stringify(hms(seconds))}`));
+  const kpi = await evaluate(`[...document.querySelectorAll('.report-kpis > div')].map(tile => ({
+    label: tile.querySelector('small').textContent.trim(), value: tile.querySelector('strong').textContent.trim(), note: tile.querySelectorAll('small')[1]?.textContent.trim() ?? '' }))`);
+  console.log(`REPORT_SUMMARY kpi ${JSON.stringify(kpi)}`);
+  assert.deepEqual(kpi.map(tile => tile.label), ['Łączny czas', 'Rozliczalny czas', '% rozliczalny', 'Średnio na dzień z pracą']);
+  // The fixture project is not billable by default (D12 billable B: false unless the project says otherwise).
+  assert.deepEqual([kpi[1].value, kpi[2].value], ['00:00:00', '0%']);
+  const workDays = Number(kpi[3].note.match(/^(\d+)/)?.[1]);
+  assert.ok(workDays === 1 || workDays === 2, `days with work: ${kpi[3].note}`);
+  assert.equal(kpi[3].value, hms(Math.floor(seconds / workDays)), 'average over days with work (D12 variant B)');
+  assert.equal(await evaluate(`Boolean(document.querySelector('.report-live'))`), false, 'no running or pending time in this window');
+
+  const chart = await evaluate(`(() => {
+    const bars = [...document.querySelectorAll('.report-chart-bar')];
+    return { caption: document.querySelector('.report-chart h3')?.textContent, bars: bars.length,
+      sum: bars.reduce((total, bar) => total + Number(bar.dataset.seconds), 0), tabbable: bars.filter(bar => bar.getAttribute('tabindex') === '0').length,
+      legend: [...document.querySelectorAll('.report-chart-legend li')].map(item => item.textContent) };
+  })()`);
+  console.log(`REPORT_SUMMARY chart ${JSON.stringify(chart)}`);
+  assert.equal(chart.caption, 'Czas według miesięcy', 'the 14-month range is shown by month');
+  assert.equal(chart.bars, 14);
+  assert.equal(chart.sum, seconds, 'chart buckets add up to the KPI total');
+  assert.equal(chart.tabbable, 1, 'one tab stop (roving focus)');
+  assert.equal(chart.legend.length, 1);
+  assert.ok(chart.legend[0].includes(project) && chart.legend[0].includes(primaryClient) && chart.legend[0].includes(hms(seconds)));
+  // Real keys through CDP: focus the bar with data, move left (tooltip follows), back right, Escape hides it.
+  await evaluate(`document.querySelector('.report-chart-bar[tabindex="0"]').focus()`);
+  const focused = () => evaluate(`({ from: document.activeElement?.dataset?.from ?? null, seconds: Number(document.activeElement?.dataset?.seconds ?? -1),
+    tooltip: document.querySelector('[role="tooltip"]')?.textContent ?? null,
+    described: Boolean(document.activeElement?.getAttribute('aria-describedby')) })`);
+  const start = await focused();
+  assert.equal(start.seconds, seconds);
+  assert.ok(start.described && start.tooltip.includes(`Łącznie ${hms(seconds)}`) && start.tooltip.includes(project), `tooltip: ${start.tooltip}`);
+  const press = async (key, code, windowsVirtualKeyCode) => {
+    for (const type of ['keyDown', 'keyUp']) await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode }, sessionId);
+  };
+  await press('ArrowLeft', 'ArrowLeft', 37);
+  const left = await waitFor('ArrowLeft moves the chart focus', async () => { const state = await focused(); return state.from !== start.from ? state : null; });
+  assert.ok(left.tooltip?.includes('Łącznie') && left.described, 'the tooltip follows the keyboard');
+  await press('ArrowRight', 'ArrowRight', 39);
+  await waitFor('ArrowRight returns to the bar with data', async () => (await focused()).from === start.from);
+  await press('Escape', 'Escape', 27);
+  await waitFor('Escape hides the tooltip', async () => (await focused()).tooltip === null);
+
+  const groupRows = () => evaluate(`[...document.querySelectorAll('.report-groups tbody tr')].map(row => ({ level: row.dataset.level,
+    name: row.querySelector('th').textContent.replace(/^[▾▸]/, '').trim(), time: row.cells[1].textContent.trim(), share: row.cells[2].textContent.trim() }))`);
+  const initial = await groupRows();
+  assert.deepEqual(initial, [{ level: 'client', name: primaryClient, time: hms(seconds), share: '100%' }, { level: 'project', name: project, time: hms(seconds), share: '100%' }]);
+  await evaluate(`[...document.querySelectorAll('.report-groups tbody tr[data-level="project"] button')][0].click()`);
+  await waitFor('task level expands', async () => (await groupRows()).length === 3);
+  assert.deepEqual((await groupRows())[2], { level: 'task', name: task, time: hms(seconds), share: '100%' });
+  assert.equal(await evaluate(`document.querySelector('.report-groups tbody tr[data-level="project"] button').getAttribute('aria-expanded')`), 'true');
+  assert.equal(await evaluate(`document.querySelector('.report-groups tfoot td').textContent.trim()`), hms(seconds));
+  console.log('PASS: Reports Summary KPIs, chart (keyboard tooltip), legend and client → project → task groups equal the Detailed entry');
+
+  await captureSection(cdp, sessionId, report, `Boolean(document.querySelector('.report-chart-bar'))`, 'report-summary');
+  // 125% Windows scaling of a 1280×720 window: 1024×576 CSS px at device scale 1.25.
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1024, height: 576, deviceScaleFactor: 1.25, mobile: false }, sessionId);
+  try {
+    await waitFor('125% scaling applied', () => evaluate('window.innerWidth === 1024 && window.devicePixelRatio === 1.25'));
+    await delay(300);
+    const box = await evaluate(`(() => {
+      const section = document.querySelector(${JSON.stringify(report)});
+      section.scrollIntoView({ block: 'start' });
+      const rect = section.getBoundingClientRect();
+      const kpis = [...document.querySelectorAll('.report-kpis > div')].map(tile => tile.getBoundingClientRect());
+      const overflowing = [...section.querySelectorAll('.report-kpis strong, .report-chart-legend li, .report-groups th')]
+        .filter(element => element.scrollWidth > element.clientWidth + 1).length;
+      return { x: Math.max(0, rect.left + window.scrollX), y: Math.max(0, rect.top + window.scrollY), width: Math.ceil(rect.width), height: Math.ceil(rect.height),
+        scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth, kpiTop: kpis.map(item => Math.round(item.top)), overflowing };
+    })()`);
+    console.log(`UI_LAYOUT report-summary-125pct 1024x576@1.25 ${JSON.stringify(box)}`);
+    assert.ok(box.scrollWidth <= box.clientWidth, 'report summary at 125%: the page scrolls horizontally');
+    assert.equal(box.overflowing, 0, 'report summary at 125%: text is clipped');
+    const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true,
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 } }, sessionId);
+    await writeFile(join(screenshotDirectory, 'report-summary-125pct-1024x576.png'), Buffer.from(data, 'base64'));
+  } finally {
+    await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+  }
+  await evaluate(`${tab('Szczegóły')}.click()`);
+  await waitFor('Detailed shown after the summary check', () => evaluate(`Boolean(document.querySelector('.report-detail tbody tr'))`));
 }
 // Mini timer bar: 48×48 Start/Stop in a fixed place, title/clock/action not overlapping or covered, no page overflow.
 const inspectCompactLayout = `(() => {
@@ -766,7 +869,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   };
   pressShortcut();
   await waitFor('first press starts measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running'`));
-  const activeDb = new DatabaseSync(testDb, { readOnly: true });
+  const activeDb = openTestDb({ readOnly: true });
   let entryId;
   try {
     const rows = activeDb.prepare(`SELECT e.id, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
@@ -797,7 +900,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(replacementDescription)});
     input.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  const switchDb = new DatabaseSync(testDb);
+  const switchDb = openTestDb();
   try {
     switchDb.exec("CREATE TRIGGER test_reject_timer_switch AFTER INSERT ON entry_descriptions BEGIN SELECT RAISE(FAIL, 'test switch write failure'); END");
     await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
@@ -816,7 +919,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   await waitFor('switch retry enabled', () => evaluate(mainSession, `Boolean(document.querySelector('[aria-label="Pomiar czasu"] .timer-start button:not(:disabled)'))`));
   await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
   await waitFor('switch retry succeeds', () => evaluate(mainSession, `document.body.textContent.includes('Przełączono zadanie.')`));
-  const switchedDb = new DatabaseSync(testDb, { readOnly: true });
+  const switchedDb = openTestDb({ readOnly: true });
   try {
     const rows = switchedDb.prepare(`SELECT e.id, e.started_at, e.ended_at, d.description FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id ORDER BY e.id`).all();
     assert.equal(rows.length, 5);
@@ -827,7 +930,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
     entryId = rows[4].id;
   } finally { switchedDb.close(); }
   await waitFor('widget reflects the switched timer', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'running' && document.querySelector('.qp-context')?.textContent.includes(${JSON.stringify(primaryClient)})`));
-  const failureDb = new DatabaseSync(testDb);
+  const failureDb = openTestDb();
   try {
     failureDb.exec("CREATE TRIGGER test_reject_timer_stop BEFORE UPDATE OF ended_at ON time_entries BEGIN SELECT RAISE(FAIL, 'test timer write failure'); END");
     await evaluate(mainSession, `document.querySelector('[aria-label="Pomiar czasu"] .timer-stop button').click()`);
@@ -850,7 +953,7 @@ async function verifyShortcutAfterRestart(cdp, mainSession) {
   })()`));
   pressShortcut();
   await waitFor('second press stops measurement after restart', () => evaluate(widget, `document.querySelector('.qp-mini')?.dataset.mode === 'idle'`));
-  const stoppedDb = new DatabaseSync(testDb, { readOnly: true });
+  const stoppedDb = openTestDb({ readOnly: true });
   try {
     const rows = stoppedDb.prepare('SELECT id, ended_at, duration_seconds FROM time_entries ORDER BY id').all();
     assert.equal(rows.length, 5);
@@ -1139,7 +1242,7 @@ async function verifyRestoreRetry(cdp, sessionId) {
     await click('Przywróć kopię');
     await waitFor('restore failure displayed', () => evaluate(`document.body.textContent.includes('Nie udało się przywrócić kopii. Sprawdź dane i kopie bezpieczeństwa przed ponowieniem.')`));
     assert.equal(await evaluate(`document.querySelector(${JSON.stringify(section)} + ' input[type="checkbox"]')?.checked`), false);
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { assert.equal(db.prepare('SELECT COUNT(*) AS count FROM time_entries').get().count, 3); }
     finally { db.close(); }
     await unlink(backupDir);
@@ -1279,7 +1382,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
       try { return JSON.parse(await readFile(path, 'utf8')).fields.description === text; }
       catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return false; throw error; }
     });
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, primaryDescription); }
     finally { db.close(); }
     const window = await waitFor('main window while editing', () => inspectWindow('Find', primary.pid) || null);
@@ -1367,7 +1470,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('draft content restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`[...document.querySelectorAll('[aria-label="Edycja wpisu"] button')].find(button => button.textContent.trim() === 'Zachowaj szkic').click()`);
   await waitFor('restored draft put aside', () => evaluate(`!document.querySelector('[aria-label="Edycja wpisu"]')`));
-  const beforeConflict = new DatabaseSync(testDb, { readOnly: true });
+  const beforeConflict = openTestDb({ readOnly: true });
   let originalTimes;
   try {
     originalTimes = beforeConflict.prepare('SELECT started_at,ended_at,duration_seconds FROM time_entries WHERE id=1').get();
@@ -1399,7 +1502,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('selected draft field restored', () => evaluate(`document.querySelector('#entry-draft-description')?.value === ${JSON.stringify(text)}`));
   await evaluate(`document.querySelector('[aria-label="Edycja wpisu"] button[type="submit"]').click()`);
   await waitFor('draft applied once to history', () => evaluate(`[...document.querySelectorAll('section.history tbody tr')].some(row => row.textContent.includes(${JSON.stringify(text)}))`));
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     assert.equal(db.prepare('SELECT description FROM entry_descriptions WHERE entry_id=1').get().description, text);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=1').get().count, 1);
@@ -1425,7 +1528,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('draft discard confirmation', () => evaluate(`Boolean(document.querySelector('dialog.entry-draft-dialog[open]'))`));
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Odrzuć zmiany').click()`);
   await waitFor('discard hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
-  const unchanged = new DatabaseSync(testDb, { readOnly: true });
+  const unchanged = openTestDb({ readOnly: true });
   try {
     assert.equal(unchanged.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(unchanged.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1467,7 +1570,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('invalid edit stays open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Sprawdź daty i godziny')`));
   assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
   assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
-  const rejected = new DatabaseSync(testDb, { readOnly: true });
+  const rejected = openTestDb({ readOnly: true });
   try {
     assert.equal(rejected.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(rejected.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1479,7 +1582,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, ${JSON.stringify(originalEnd)});
     field.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  const injectedFailure = new DatabaseSync(testDb);
+  const injectedFailure = openTestDb();
   try {
     injectedFailure.exec("CREATE TRIGGER test_reject_revision BEFORE INSERT ON description_revisions BEGIN SELECT RAISE(FAIL, 'test write failure'); END");
   } finally { injectedFailure.close(); }
@@ -1489,7 +1592,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   await waitFor('SQLite error keeps the editor open', () => evaluate(`document.querySelector('dialog.entry-draft-dialog[open] [role="alert"]')?.textContent.includes('Nie udało się zapisać lub odczytać danych lokalnych')`));
   assert.equal(inspectWindow('Visibility', primary.pid, window), 'visible');
   assert.equal(await evaluate(`document.querySelector('#entry-draft-description')?.value`), savedText);
-  const blocked = new DatabaseSync(testDb);
+  const blocked = openTestDb();
   try {
     assert.equal(blocked.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, secondDescription);
     assert.equal(blocked.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 0);
@@ -1497,7 +1600,7 @@ async function verifyDraft(cdp, sessionId, phase, primary) {
   } finally { blocked.close(); }
   await evaluate(`[...document.querySelectorAll('dialog.entry-draft-dialog[open] button')].find(button => button.textContent.trim() === 'Zapisz').click()`);
   await waitFor('save hides the main window', () => inspectWindow('Visibility', primary.pid, window) === 'hidden');
-  const saved = new DatabaseSync(testDb, { readOnly: true });
+  const saved = openTestDb({ readOnly: true });
   try {
     assert.equal(saved.prepare('SELECT description FROM entry_descriptions WHERE entry_id=2').get().description, savedText);
     assert.equal(saved.prepare('SELECT COUNT(*) AS count FROM description_revisions WHERE entry_id=2').get().count, 1);
@@ -1533,7 +1636,7 @@ const writeFailure = {
 };
 
 function writeFailureState() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     return {
       entries: db.prepare(`SELECT e.id, e.project_id, e.task_id, e.started_at, e.ended_at, e.duration_seconds, e.manually_resolved,
@@ -1546,7 +1649,7 @@ function writeFailureState() {
 }
 
 function holdWriteLock() {
-  const lock = new DatabaseSync(testDb);
+  const lock = openTestDb();
   lock.exec('BEGIN IMMEDIATE');
   return { release() { try { lock.exec('ROLLBACK'); } finally { lock.close(); } } };
 }
@@ -1567,7 +1670,7 @@ async function verifyWriteFailure(cdp, sessionId) {
   const idle = `!document.querySelector(${JSON.stringify(`${timer} .timer-stop button`)}) && !document.querySelector(${JSON.stringify(`${timer} .status.running`)})`;
   const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
   const projects = (() => {
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try {
       return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row }));
     } finally { db.close(); }
@@ -1629,7 +1732,7 @@ async function verifyWriteFailure(cdp, sessionId) {
 
   // Switch failing inside its transaction: the previous entry is updated first, then the
   // insert of the new entry fails. The update must be rolled back with it.
-  const trigger = new DatabaseSync(testDb);
+  const trigger = openTestDb();
   try { trigger.exec("CREATE TRIGGER test_reject_switch BEFORE INSERT ON time_entries BEGIN SELECT RAISE(FAIL, 'test write failure'); END"); }
   finally { trigger.close(); }
   try {
@@ -1643,7 +1746,7 @@ async function verifyWriteFailure(cdp, sessionId) {
     assert.deepEqual(writeFailureState(), runningState, 'a failed insert left the previous entry closed (partial switch)');
     console.log('PASS: T20 Switch failing after the previous entry was closed rolled back completely');
   } finally {
-    const cleanup = new DatabaseSync(testDb);
+    const cleanup = openTestDb();
     try { cleanup.exec('DROP TRIGGER test_reject_switch'); } finally { cleanup.close(); }
   }
 
@@ -1907,7 +2010,7 @@ async function verifyDiskFull(cdp, sessionId, disk) {
   const enabledButton = selector => `(el => Boolean(el && !el.disabled))(document.querySelector(${JSON.stringify(selector)}))`;
   const click = selector => evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
   const projects = (() => {
-    const db = new DatabaseSync(testDb, { readOnly: true });
+    const db = openTestDb({ readOnly: true });
     try { return db.prepare(`SELECT p.id, p.client_id AS clientId, c.name AS client FROM projects p JOIN clients c ON c.id=p.client_id ORDER BY p.id`).all().map(row => ({ ...row })); }
     finally { db.close(); }
   })();
@@ -2067,7 +2170,7 @@ async function verifyDuplicateClientChoices(cdp, sessionId) {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
     return result.result.value;
   };
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   let primaryId, secondId, primaryMarker, secondMarker;
   try {
     primaryId = db.prepare('SELECT id FROM clients WHERE name=?').get(primaryClient).id;
@@ -2135,7 +2238,7 @@ async function verifyShortSleep(cdp, sessionId) {
   const description = 'D4 krótkie uśpienie';
   const start = Date.parse('2026-01-05T08:00:00.000Z');
   const minute = 60_000;
-  let db = new DatabaseSync(testDb, { readOnly: true });
+  let db = openTestDb({ readOnly: true });
   let project;
   try {
     // The packaged app migrated the test database to the current schema with 'auto_included'.
@@ -2146,9 +2249,11 @@ async function verifyShortSleep(cdp, sessionId) {
     assert.ok(project, 'an active project for the short-sleep entry');
   } finally { db.close(); }
   await invoke('create_project_manual_entry', { projectId: project.projectId, taskId: null, startedAt: new Date(start).toISOString(), endedAt: new Date(start + 60 * minute).toISOString(), description });
-  db = new DatabaseSync(testDb);
+  db = openTestDb();
   let entryId, ids;
   try {
+    // One write transaction (it waits for the app's short read locks): the app never sees a partial set.
+    db.exec('BEGIN IMMEDIATE');
     entryId = db.prepare('SELECT e.id FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE d.description=?').get(description).id;
     const record = (offset, length) => {
       const id = Number(db.prepare('INSERT INTO sleep_periods(entry_id,started_ms) VALUES(?,?)').run(entryId, start + offset).lastInsertRowid);
@@ -2162,7 +2267,11 @@ async function verifyShortSleep(cdp, sessionId) {
     assert.equal(rows[0].decided_ms, rows[0].ended_ms, 'the automatic decision is recorded at the observed resume');
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='auto_included', decided_ms=ended_ms WHERE id=?").run(ids.boundary), /CHECK/);
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='excluded', decided_ms=1 WHERE id=?").run(ids.short), /immutable/);
-  } finally { db.close(); }
+    db.exec('COMMIT');
+  } finally {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    db.close();
+  }
 
   // One note above the timer for the two questions; the short sleep is not among them.
   const note = () => evaluate(`document.querySelector('.sleep-note')?.textContent ?? ''`);
@@ -2264,6 +2373,7 @@ async function runWindow(port, phase, recovery) {
       assert.ok(Number.isSafeInteger(seconds) && seconds >= 5);
       console.log(`${phase}: report matched the selected client (${seconds} s)`);
       await captureReportDetail(cdp, sessionId, phase === 'initial' ? 'selected-client' : 'restored-scope');
+      if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
       if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
@@ -2356,7 +2466,7 @@ async function waitForWindowClosed(port) {
 }
 
 function readInterruptedTimer() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     const active = db.prepare(`SELECT e.id, e.started_at, e.duration_seconds, e.manually_resolved, d.description
       FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE e.ended_at IS NULL`).all();
@@ -2390,7 +2500,7 @@ registry('add', ['/t', 'REG_SZ', '/d', `--remote-debugging-port=${port} --remote
 let seconds, interrupted, recovery, pendingWriteFailure;
 // The history built by the phases above, checked before PTT-36 adds its own synthetic entries.
 function assertBaselineHistory() {
-  const db = new DatabaseSync(testDb, { readOnly: true });
+  const db = openTestDb({ readOnly: true });
   try {
     const rows = db.prepare(`SELECT c.name AS client, p.name AS project, e.duration_seconds AS duration,
       t.name AS task, e.id, e.started_at, e.ended_at, e.manually_resolved FROM time_entries e JOIN projects p ON p.id=e.project_id

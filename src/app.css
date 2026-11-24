@@ -376,6 +376,53 @@ footer { margin: var(--space-6) 0; text-align: center; color: var(--color-text-m
 .export-preview .table-wrap { margin: var(--space-3) 0; }
 .export-preview td { white-space: pre-wrap; }
 
+/* Report Summary (DEV-30/31): KPI note, live line, SVG chart, legend and client → project → task groups. */
+.report-kpi-note { margin: var(--space-2) 0 0; font-size: var(--text-xs); }
+.report-live { margin: var(--space-3) 0 0; padding: var(--space-3) var(--space-4); border: 1px solid var(--color-pending-border); border-radius: var(--radius-md); background: var(--color-pending-bg); color: var(--color-pending-text); }
+.report-summary-empty { margin-top: var(--space-4); }
+.report-chart { margin: var(--space-6) 0 0; }
+.report-chart h3, .report-groups h3 { margin: 0; font-size: var(--text-md); }
+.report-chart figcaption p { margin: var(--space-1) 0 var(--space-3); font-size: var(--text-xs); }
+.report-chart-frame { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--space-2); }
+.report-chart-axis { position: relative; min-width: 48px; height: 168px; }
+.report-chart-axis span { position: absolute; right: 0; transform: translateY(-50%); color: var(--color-text-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.report-chart-plot { position: relative; min-width: 0; }
+.report-chart-plot svg { display: block; overflow: visible; }
+.report-chart-grid { stroke: var(--color-border); stroke-width: 1; }
+.report-chart-baseline { stroke: var(--color-border-control); stroke-width: 1; }
+.report-chart-hit { fill: transparent; stroke: none; }
+.report-chart-bar { outline: none; cursor: default; }
+.report-chart-bar:hover .report-chart-hit { fill: var(--color-surface-muted); }
+.report-chart-bar:focus-visible .report-chart-hit { fill: var(--color-accent-soft); stroke: var(--color-focus); stroke-width: 2; }
+.report-chart-segment { stroke: var(--color-surface); stroke-width: 1; }
+.report-chart-label { fill: var(--color-text-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.report-chart-segment[data-project-colour='1'], .report-chart-swatch[data-project-colour='1'] { fill: var(--project-1); background: var(--project-1); }
+.report-chart-segment[data-project-colour='2'], .report-chart-swatch[data-project-colour='2'] { fill: var(--project-2); background: var(--project-2); }
+.report-chart-segment[data-project-colour='3'], .report-chart-swatch[data-project-colour='3'] { fill: var(--project-3); background: var(--project-3); }
+.report-chart-segment[data-project-colour='4'], .report-chart-swatch[data-project-colour='4'] { fill: var(--project-4); background: var(--project-4); }
+.report-chart-segment[data-project-colour='5'], .report-chart-swatch[data-project-colour='5'] { fill: var(--project-5); background: var(--project-5); }
+.report-chart-segment[data-project-colour='6'], .report-chart-swatch[data-project-colour='6'] { fill: var(--project-6); background: var(--project-6); }
+.report-chart-segment[data-project-colour='7'], .report-chart-swatch[data-project-colour='7'] { fill: var(--project-7); background: var(--project-7); }
+.report-chart-segment[data-project-colour='8'], .report-chart-swatch[data-project-colour='8'] { fill: var(--project-8); background: var(--project-8); }
+.report-chart-swatch { display: inline-block; flex: none; width: 12px; height: 12px; border-radius: var(--radius-sm); }
+.report-chart-tooltip { position: absolute; top: 0; z-index: 2; display: grid; gap: var(--space-1); width: max-content; max-width: min(320px, 90%); padding: var(--space-3); transform: translateX(-50%); border: 1px solid var(--color-border-control); border-radius: var(--radius-md); background: var(--color-surface); box-shadow: var(--shadow-card); color: var(--color-text); font-size: var(--text-xs); overflow-wrap: anywhere; pointer-events: none; }
+.report-chart-tooltip ul { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }
+.report-chart-tooltip li { display: flex; align-items: center; gap: var(--space-2); }
+.report-chart-legend { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); margin: var(--space-3) 0 0; padding: 0; list-style: none; }
+.report-chart-legend li { display: flex; align-items: center; gap: var(--space-2); min-width: 0; max-width: 100%; font-size: var(--text-xs); }
+.report-chart-legend li > span:nth-child(2) { display: grid; min-width: 0; overflow-wrap: anywhere; }
+.report-chart-legend small { color: var(--color-text-muted); font-size: var(--text-xs); }
+.report-groups { margin-top: var(--space-6); }
+.report-groups .section-top { flex-wrap: wrap; gap: var(--space-2); }
+.report-groups .actions { margin: 0; }
+.report-groups th[scope='row'] { font-weight: 500; text-align: left; overflow-wrap: anywhere; }
+.report-groups tr[data-level='client'] th[scope='row'] { font-weight: 650; }
+.report-groups tfoot th, .report-groups tfoot td { font-weight: 650; border-top: 1px solid var(--color-border-control); }
+.report-group-depth-1 { padding-left: var(--space-6); }
+.report-group-depth-2 { padding-left: var(--space-8); }
+.report-group-toggle { display: inline-flex; align-items: center; gap: var(--space-2); min-height: var(--control-h-sm); padding: 0 var(--space-1); border: 0; background: transparent; color: inherit; font: inherit; font-weight: inherit; text-align: left; cursor: pointer; }
+.report-group-toggle:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+
 /* Entry drafts */
 .entry-drafts { display: grid; gap: var(--space-3); margin-top: var(--space-3); }
 .entry-drafts > button { justify-self: start; }
