@@ -64,8 +64,8 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
   // (liveMonth), and nothing at all without a running timer. `now` is read from a ref in the base on purpose.
   const nowRef = useRef(now);
   nowRef.current = now;
-  const entryState = snapshotActive ? `${snapshotActive.id}|${snapshotActive.project_id}|${snapshotActive.task_id}|${snapshotActive.started_at}|${snapshotActive.billable}|${snapshotActive.description}|${!!snapshotActive.recovered}|${!!snapshotActive.uncertain}` : '';
-  const stableActive = useMemo(() => snapshotActive, [entryState]);
+  const activeKey = snapshotActive ? `${snapshotActive.id}|${snapshotActive.project_id}|${snapshotActive.task_id}|${snapshotActive.started_at}|${snapshotActive.billable}|${snapshotActive.description}|${!!snapshotActive.recovered}|${!!snapshotActive.uncertain}` : '';
+  const stableActive = useMemo(() => snapshotActive, [activeKey]);
   const base = useMemo(() => {
     if (!report.read || !shownMonth || resolved.problem) return null;
     try { return calendarMonth({ data: report.read.data, catalog, filter, month: shownMonth, now: nowRef.current, snapshotActive: stableActive, snapshotFresh: false }); }
