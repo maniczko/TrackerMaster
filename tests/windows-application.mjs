@@ -346,7 +346,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-entry') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -974,6 +974,186 @@ async function verifyCalendar(cdp, sessionId) {
   await invoke('stop_timer', { expectedActiveId: running.id });
   await waitFor('calendar timer stopped', async () => (await active()) === null);
   console.log('PASS: calendar week equals the report (midnight and DST), navigation and keyboard details, and the timer survives view changes');
+}
+
+// DEV-26 (calendar package B): add and edit time from the calendar. Its own client and a fixed past week
+// (9–15.03.2026, CET), so nothing depends on the runner's clock; Warsaw wall time = UTC + 1 h in that week.
+const calendarEntryFixture = {
+  client: 'Klient kalendarza B E2E', project: 'Dodawanie z kalendarza', date: '2026-03-11', heading: '9–15 marca 2026',
+  existing: ['2026-03-10T08:00:00Z', '2026-03-10T09:00:00Z', 'Kalendarz B: istniejący wpis'],
+  description: 'Kalendarz B: dodany kliknięciem',
+};
+function calendarEntryRows() {
+  const db = new DatabaseSync(testDb, { readOnly: true });
+  try {
+    return db.prepare(`SELECT e.id, e.started_at, e.ended_at, e.duration_seconds, COALESCE(d.description, '') AS description,
+        EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=e.id) AS billable,
+        (SELECT COUNT(*) FROM entry_revisions r WHERE r.entry_id=e.id) AS timeRevisions,
+        (SELECT COUNT(*) FROM billing_revisions r WHERE r.entry_id=e.id) AS billingRevisions,
+        (SELECT COUNT(*) FROM entry_draft_resolutions r WHERE r.entry_id=e.id) AS resolutions
+      FROM time_entries e JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id
+      LEFT JOIN entry_descriptions d ON d.entry_id=e.id
+      WHERE c.name=? AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id`).all(calendarEntryFixture.client).map(row => ({ ...row }));
+  } finally { db.close(); }
+}
+async function verifyCalendarEntry(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const key = async (name, code, keyCode, text) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: name, code, windowsVirtualKeyCode: keyCode, ...(text ? { text } : {}) }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: name, code, windowsVirtualKeyCode: keyCode }, sessionId);
+  };
+  const dialog = 'dialog.calendar-entry-dialog';
+  const inDialog = selector => `document.querySelector(${JSON.stringify(`${dialog} ${selector}`)})`;
+  const setValue = (selector, value, event) => evaluate(`(() => {
+    const element = ${inDialog(selector)};
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value').set.call(element, ${JSON.stringify(value)});
+    element.dispatchEvent(new Event(${JSON.stringify(event)}, { bubbles: true }));
+    return true;
+  })()`);
+  const alertText = `[...document.querySelectorAll(${JSON.stringify(`${dialog} [role="alert"]`)})].map(node => node.textContent).join(' | ')`;
+  const readWeek = `(() => { const root = document.querySelector('[aria-label="Kalendarz"]');
+    return { heading: root.querySelector('.calendar-range')?.textContent, week: root.querySelector('.calendar-week-total')?.textContent,
+      days: [...root.querySelectorAll('.calendar-day-total')].map(node => node.textContent), blocks: root.querySelectorAll('.calendar-block').length,
+      note: root.querySelector('.calendar-entry-note')?.textContent ?? null }; })()`;
+  // A real mouse click at a wall-clock minute of a day column (the column is scrolled into view first).
+  const clickSlot = async (date, minute) => {
+    const point = await evaluate(`(() => {
+      const body = document.querySelector('.calendar-body'); const column = document.querySelector('.calendar-column[data-date="${date}"]');
+      body.scrollTop = Math.max(0, ${minute} * column.getBoundingClientRect().height / 1440 - 120);
+      const box = column.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + ${minute} * box.height / 1440 };
+    })()`);
+    for (const type of ['mousePressed', 'mouseReleased']) await cdp.send('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, button: 'left', clickCount: 1 }, sessionId);
+  };
+
+  const clientId = await invoke('create_client', { name: calendarEntryFixture.client });
+  const projectId = await invoke('create_project', { clientId, name: calendarEntryFixture.project });
+  const [existingStart, existingEnd, existingDescription] = calendarEntryFixture.existing;
+  await invoke('create_project_manual_entry', { projectId, taskId: null, startedAt: existingStart, endedAt: existingEnd, description: existingDescription });
+  const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${viewButton('Kalendarz')}.click()`);
+  await waitFor('calendar opens for package B', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-week-total'))`));
+  await evaluate(`(() => { const input = document.querySelector('[aria-label="Kalendarz"] input[type="date"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(calendarEntryFixture.date)});
+    input.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await waitFor('fixture week of package B', async () => { const value = await evaluate(readWeek); return value.heading === calendarEntryFixture.heading && value.blocks === 1; });
+
+  // 1. Add: a click at 10:20 opens "Nowy wpis" 10:15–10:45 (quarter-hour, +30 min); Enter saves.
+  await clickSlot(calendarEntryFixture.date, 10 * 60 + 20);
+  await waitFor('new entry dialog', () => evaluate(`Boolean(${inDialog('h3')}?.textContent === 'Nowy wpis' && document.querySelector(${JSON.stringify(dialog)}).open)`));
+  const readOpened = `({ start: ${inDialog('input[type="datetime-local"]')}.value, end: document.querySelectorAll(${JSON.stringify(`${dialog} input[type="datetime-local"]`)})[1].value,
+    focus: document.activeElement?.closest('label')?.firstChild?.textContent })`;
+  let opened = null;
+  await waitFor('focus on the first field of the new entry', async () => { opened = await evaluate(readOpened); return opened.focus === 'Klient'; })
+    .catch(error => { throw new Error(`${error.message}; dialog state: ${JSON.stringify(opened)}`); });
+  assert.deepEqual(opened, { start: '2026-03-11T10:15', end: '2026-03-11T10:45', focus: 'Klient' });
+  await evaluate(`${inDialog('button[type="submit"]')}.click()`);
+  await waitFor('missing project is named', async () => (await evaluate(alertText)).includes('Wybierz klienta i projekt.'));
+  await setValue('select', String(clientId), 'change');
+  await waitFor('project list for the client', () => evaluate(`[...document.querySelectorAll(${JSON.stringify(`${dialog} select`)})[1].options].some(option => option.value === ${JSON.stringify(String(projectId))})`));
+  await evaluate(`(() => { const element = document.querySelectorAll(${JSON.stringify(`${dialog} select`)})[1];
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(element, ${JSON.stringify(String(projectId))});
+    element.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  await evaluate(`${inDialog('.calendar-entry-billable input')}.click()`);
+  await evaluate(`${inDialog('textarea')}.focus()`);
+  await cdp.send('Input.insertText', { text: calendarEntryFixture.description }, sessionId);
+  assert.equal(await evaluate(`${inDialog('.calendar-entry-length strong')}.textContent`), '00:30:00');
+  // UI_LAYOUT of the dialog at 1280×720 and at 125 % (1024×576 CSS px): inside the window, controls ≥ 40 px, no horizontal scroll.
+  const dialogLayout = `(() => { const box = document.querySelector(${JSON.stringify(dialog)}).getBoundingClientRect();
+    const controls = [...document.querySelectorAll(${JSON.stringify(`${dialog} button, ${dialog} select, ${dialog} input[type="datetime-local"]`)})];
+    return { inside: box.top >= 0 && box.left >= 0 && box.bottom <= innerHeight + 0.5 && box.right <= innerWidth + 0.5, width: Math.round(box.width), height: Math.round(box.height),
+      minControl: Math.min(...controls.map(node => node.getBoundingClientRect().height)), scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth,
+      modal: document.querySelector(${JSON.stringify(dialog)}).matches(':modal') }; })()`;
+  for (const [label, metrics] of [['1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }], ['1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
+    try {
+      await waitFor(`calendar entry dialog at ${label}`, () => evaluate(`window.innerWidth === ${metrics.width} && window.innerHeight === ${metrics.height}`));
+      await delay(300);
+      const layout = await evaluate(dialogLayout);
+      console.log(`UI_LAYOUT calendar-entry-dialog ${label} ${JSON.stringify(layout)}`);
+      assert.ok(layout.inside && layout.modal, `the entry dialog leaves the window at ${label}`);
+      assert.ok(layout.minControl >= 40, `a dialog control is lower than 40 px at ${label}`);
+      assert.ok(layout.scrollWidth <= layout.clientWidth, `the page scrolls horizontally at ${label}`);
+      await saveScreenshot(cdp, sessionId, `calendar-entry-dialog-${label}`);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+  await evaluate(`${inDialog('textarea')}.focus()`);
+  await key('Enter', 'Enter', 13, '\r');
+  await waitFor('new entry saved and dialog closed', async () => { const value = await evaluate(readWeek); return !(await evaluate(`Boolean(document.querySelector(${JSON.stringify(dialog)}))`)) && value.note === 'Dodano wpis.' && value.blocks === 2; });
+  let rows = calendarEntryRows();
+  assert.equal(rows.length, 2, 'one click and one Enter must add exactly one entry');
+  const added = rows[1];
+  assert.deepEqual({ ...added, id: 0 }, { id: 0, started_at: '2026-03-11T09:15:00.000Z', ended_at: '2026-03-11T09:45:00.000Z', duration_seconds: 1800,
+    description: calendarEntryFixture.description, billable: 1, timeRevisions: 0, billingRevisions: 0, resolutions: 0 });
+
+  // 2. Overlap: a click at 09:20 on 10.03 gives 09:15–09:45 inside the existing 09:00–10:00; the form names it and saves nothing.
+  await clickSlot('2026-03-10', 9 * 60 + 20);
+  await waitFor('overlap is refused in the form', async () => (await evaluate(alertText)).includes('Ten czas nakłada się na istniejący pomiar'));
+  await evaluate(`${inDialog('button[type="submit"]')}.click()`);
+  await delay(500);
+  await key('Escape', 'Escape', 27);
+  await waitFor('overlap dialog closed with Escape', () => evaluate(`!document.querySelector(${JSON.stringify(dialog)}) && document.activeElement?.classList.contains('calendar-add')`));
+  assert.deepEqual(calendarEntryRows(), rows, 'a refused overlap changed the database');
+
+  // 3. Edit with a database that cannot be written: error shown, no partial change, the draft kept; one retry saves once.
+  const blockOf = description => `[...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-block')].find(node => node.getAttribute('aria-label').startsWith(${JSON.stringify(description)}))`;
+  await evaluate(`${blockOf(calendarEntryFixture.description)}.focus()`);
+  await key('Enter', 'Enter', 13, '\r');
+  await waitFor('edit dialog with the entry loaded', () => evaluate(`${inDialog('h3')}?.textContent === 'Edycja wpisu #${added.id}' && ${inDialog('input[type="datetime-local"]')}?.value === '2026-03-11T10:15'`));
+  await evaluate(`(() => { const element = document.querySelectorAll(${JSON.stringify(`${dialog} input[type="datetime-local"]`)})[1];
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(element, '2026-03-11T11:15:00');
+    element.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await evaluate(`${inDialog('.calendar-entry-billable input')}.click()`);
+  assert.equal(await evaluate(`${inDialog('.calendar-entry-length strong')}.textContent`), '01:00:00');
+  const draftPath = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'entry-drafts', `entry-${added.id}.json`);
+  const lock = holdWriteLock();
+  try {
+    await evaluate(`${inDialog('button[type="submit"]')}.click()`);
+    await waitFor('save error in the edit dialog', async () => {
+      const text = await evaluate(alertText);
+      return text.includes('Nie zapisano:') && text.includes('Nie udało się zapisać lub odczytać danych lokalnych');
+    });
+    assert.deepEqual(calendarEntryRows(), rows, 'a failed calendar correction changed the database');
+    assert.ok(existsSync(draftPath), 'the failed correction must keep its local draft');
+    assert.deepEqual(await evaluate(`({ end: document.querySelectorAll(${JSON.stringify(`${dialog} input[type="datetime-local"]`)})[1].value,
+      billable: ${inDialog('.calendar-entry-billable input')}.checked, retry: ${inDialog('button[type="submit"]')}.textContent })`),
+      { end: '2026-03-11T11:15', billable: false, retry: 'Spróbuj ponownie' });
+  } finally { lock.release(); }
+  await evaluate(`${inDialog('button[type="submit"]')}.click()`);
+  await waitFor('retried correction saved', async () => (await evaluate(readWeek)).note === 'Zmiany wpisu zostały zapisane.' && !(await evaluate(`Boolean(document.querySelector(${JSON.stringify(dialog)}))`)));
+  rows = calendarEntryRows();
+  assert.equal(rows.length, 2, 'the retry added an entry');
+  assert.deepEqual({ ...rows[1] }, { ...added, ended_at: '2026-03-11T10:15:00.000Z', duration_seconds: 3600, billable: 0, timeRevisions: 1, billingRevisions: 1, resolutions: 1 });
+  assert.ok(!existsSync(draftPath), 'the applied draft must be removed');
+
+  // 4. The week equals the report data for the same entries, without duplicates (Tue 1 h, Wed 1 h).
+  const week = await waitFor('calendar refreshed after the edit', async () => { const value = await evaluate(readWeek); return value.week === '02:00:00' && value.blocks === 2 ? value : null; });
+  assert.deepEqual(week.days, ['00:00:00', '01:00:00', '01:00:00', '00:00:00', '00:00:00', '00:00:00', '00:00:00']);
+  const report = await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } });
+  const inWeek = report.entries.filter(entry => entry.started_at >= '2026-03-08T23:00:00' && entry.started_at < '2026-03-15T23:00:00');
+  assert.deepEqual(inWeek.map(entry => entry.id).sort((a, b) => a - b), rows.map(row => row.id));
+  assert.equal(inWeek.reduce((sum, entry) => sum + entry.duration_seconds, 0), 7200, 'the report has other seconds than the calendar for the week');
+  await saveScreenshot(cdp, sessionId, 'calendar-entry-saved-1280x720');
+
+  // 5. A running timer only shows details (no edit form) and is not changed by the calendar.
+  await invoke('start_project_timer', { projectId, taskId: null, expectedActiveId: null, description: 'Kalendarz B: pomiar w tle' });
+  const activeId = await waitFor('package B timer running', () => invoke('get_snapshot').then(snapshot => snapshot.active?.id));
+  await evaluate(`[...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-nav button')].find(button => button.textContent.trim() === 'Dziś').click()`);
+  await waitFor('running block in this week', () => evaluate(`Boolean(document.querySelector('.calendar-block[data-running="true"]'))`));
+  await evaluate(`document.querySelector('.calendar-block[data-running="true"]').click()`);
+  await waitFor('running block shows details only', () => evaluate(`Boolean(document.querySelector('div.calendar-details')) && !document.querySelector(${JSON.stringify(dialog)})`));
+  await key('Escape', 'Escape', 27);
+  await invoke('stop_timer', { expectedActiveId: activeId });
+  await waitFor('package B timer stopped', () => invoke('get_snapshot').then(snapshot => snapshot.active === null));
+  await evaluate(`${viewButton('Timer')}.click()`);
+  console.log(`PASS: DEV-26 calendar add (slot 10:15–10:45, Enter), overlap refused, edit with a failed write changed nothing and kept the draft, one retry saved one correction (#${added.id}), week 02:00:00 equals the report`);
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
@@ -2191,6 +2371,7 @@ async function runWindow(port, phase, recovery) {
       await verifyDuplicateClientChoices(cdp, sessionId);
     }
     if (phase === 'calendar') await verifyCalendar(cdp, sessionId);
+    if (phase === 'calendar-entry') await verifyCalendarEntry(cdp, sessionId);
     if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
@@ -2309,6 +2490,9 @@ try {
   // DEV-24: calendar week with fixed entries (separate client), before PTT-36 adds its own entries.
   await waitForWindowClosed(port);
   await runWindow(port, 'calendar', recovery);
+  // DEV-26: add and edit from the calendar (own client, fixed past week), also before PTT-36.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'calendar-entry', recovery);
   // PTT-36: T20 (Stop, Switch, correction with an unwritable database, then one retry) and
   // T26 (the unsaved correction survives a restart and is saved exactly once).
   await waitForWindowClosed(port);

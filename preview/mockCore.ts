@@ -102,6 +102,68 @@ const exportData = (scope: { clientId?: number | null; projectId?: number | null
 };
 const resize = (expanded: boolean) => { try { window.parent?.postMessage({ type: 'tm-preview-widget', expanded }, '*'); } catch { /* standalone */ } };
 
+// DEV-26: add/edit from the calendar. The same rules and messages as the backend (range, future, overlap),
+// drafts kept in memory, and ?failsave=1 to make the first save fail once (click-through of the save error and retry).
+const DATABASE_ID = '0123456789abcdef0123456789abcdef';
+let failSaves = Number(params.get('failsave') ?? 0) || 0;
+type MockDraft = { formatVersion: 1; source: ReturnType<typeof editSource>; fields: { start: string; end: string; description: string; inputTimeZone: string }; revision: string; snapshotUpdatedAt: string };
+const drafts = new Map<number, MockDraft>();
+let draftSequence = 0;
+function editSource(entryId: number) {
+  const entry = entries.find(item => item.id === entryId && item.ended_at);
+  if (!entry) throw 'Nie znaleziono zakończonego wpisu.';
+  const project = projects.find(item => item.id === entry.project_id)!;
+  return { databaseId: DATABASE_ID, entryId, clientId: project.client_id, projectId: project.id, taskId: entry.task_id, startedAt: entry.started_at,
+    endedAt: entry.ended_at!, durationSeconds: entry.duration_seconds ?? 0, description: entry.description, billable: entry.billable,
+    timeRevision: 0, descriptionRevision: 0, billingRevision: 0 };
+}
+function checkRange(startedAt: string, endedAt: string, exclude: number | null) {
+  const start = Date.parse(startedAt), end = Date.parse(endedAt);
+  if (!Number.isFinite(start)) throw 'Podaj poprawny czas rozpoczęcia.';
+  if (!Number.isFinite(end)) throw 'Podaj poprawny czas zakończenia.';
+  if (end <= start) throw 'Koniec musi być późniejszy od początku.';
+  if (end > now()) throw 'Czas zakończenia nie może być w przyszłości.';
+  const open = active ? [{ id: active.id, s: Date.parse(active.started_at), e: Infinity }] : [];
+  const others = [...entries.map(item => ({ id: item.id, s: Date.parse(item.started_at), e: Date.parse(item.ended_at!) })), ...open];
+  if (others.some(item => item.id !== exclude && item.e !== item.s && item.s < end && item.e > start)) throw 'Ten czas nakłada się na istniejący pomiar. Popraw godziny przed zapisaniem.';
+  return { start, end };
+}
+function failOnce() { if (failSaves > 0) { failSaves--; throw 'Nie udało się zapisać lub odczytać danych lokalnych.'; } }
+const entryHandlers: Record<string, (a: any) => unknown> = {
+  get_entry_edit_source: a => editSource(a.entryId),
+  get_entry_drafts: () => ({ drafts: [...drafts.values()], unreadable: 0 }),
+  save_entry_draft: a => {
+    const previous = drafts.get(a.source.entryId);
+    if ((previous?.revision ?? null) !== (a.expectedRevision ?? null)) throw 'Szkic zmienił się w innym oknie. Otwórz go ponownie.';
+    const draft: MockDraft = { formatVersion: 1, source: a.source, fields: a.fields, revision: `preview-${++draftSequence}`, snapshotUpdatedAt: new Date().toISOString() };
+    drafts.set(a.source.entryId, draft);
+    return draft;
+  },
+  discard_entry_draft: a => { if (drafts.get(a.entryId)?.revision === a.revision) drafts.delete(a.entryId); },
+  apply_entry_draft: a => {
+    const draft = drafts.get(a.entryId);
+    if (!draft || draft.revision !== a.revision) throw 'Szkic zmienił się w innym oknie. Otwórz go ponownie.';
+    const entry = entries.find(item => item.id === a.entryId)!;
+    const range = a.application.range && checkRange(a.application.range.startedAt, a.application.range.endedAt, entry.id);
+    if (range && entry.sleep_periods?.length) throw 'Wpis zawiera okresy uśpienia. Jego zmiana wymaga pełnej obsługi tych okresów.';
+    failOnce();
+    if (range) { entry.started_at = iso(range.start); entry.ended_at = iso(range.end); entry.duration_seconds = Math.floor((range.end - range.start) / 1000); }
+    entry.description = a.application.description;
+    if (typeof a.application.billable === 'boolean') entry.billable = a.application.billable;
+    drafts.delete(a.entryId);
+    return entry.id;
+  },
+  create_project_manual_entry: a => {
+    const project = projects.find(item => item.id === a.projectId && !item.archived);
+    if (!project) throw 'Wybierz projekt.';
+    const { start, end } = checkRange(a.startedAt, a.endedAt, null);
+    failOnce();
+    entries.push({ id: nextId++, task_id: a.taskId ?? null, project_id: project.id, started_at: iso(start), ended_at: iso(end),
+      duration_seconds: Math.floor((end - start) / 1000), billable: typeof a.billable === 'boolean' ? a.billable : project.billable, description: a.description ?? '' });
+    return snapshot();
+  },
+};
+
 const handlers: Record<string, (a: any) => unknown> = {
   get_snapshot: snapshot,
   get_report_data: reportData,
@@ -137,11 +199,11 @@ const handlers: Record<string, (a: any) => unknown> = {
   shortcut_status: () => ({ registered: true, message: '', shortcut: 'Ctrl+Shift+Space' }),
   set_global_shortcut: a => ({ registered: true, message: '', shortcut: a.shortcut }),
   get_report_filter: () => null, get_report_scope: () => null, get_draft_sort: () => 'newest',
-  get_entry_drafts: () => ({ drafts: [], unreadable: 0 }),
   restore_widget_on_top: () => false, set_widget_on_top: () => null,
   diagnose_database: health, create_backup: () => 'C:\\Users\\(podgląd)\\backups\\tracker-podglad.sqlite3',
   entry_revisions: () => [], billing_revisions: () => [], description_revisions: () => [], deleted_entries: () => [],
   widget_panel: a => resize(!!a?.expanded),
+  ...entryHandlers,
 };
 
 // Harmless window and preference calls made while screens load. Everything else that
