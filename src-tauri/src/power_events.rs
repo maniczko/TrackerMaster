@@ -70,9 +70,11 @@ fn active(tracker: &Tracker, now_ms: i64, sample: crate::PowerSample) -> Result<
     Ok(Some((id,periods,sleep_ms)))
 }
 
+// Only sleep periods are compared with the power counters; an idle period is time awake
+// (TECH-12 §1.7, B1). An open sleep period means a missed resume and fails.
 #[cfg(windows)]
 fn known_sleep(periods: &[crate::sleep_periods::SleepPeriod]) -> Option<u64> {
-    periods.iter().try_fold(0u64, |sum, period| {
+    periods.iter().filter(|period| period.is_sleep()).try_fold(0u64, |sum, period| {
         let duration = u64::try_from(period.ended_ms?.checked_sub(period.started_ms)?).ok()?;
         sum.checked_add(duration)
     })
@@ -83,6 +85,7 @@ fn handle_suspend(tracker: &mut Tracker, now_ms: i64, power: crate::PowerSample)
     let Some((id,periods,actual)) = active(tracker,now_ms,power)? else { return Ok(()); };
     let known = known_sleep(&periods).ok_or("Nierozstrzygnięty koniec uśpienia.")?;
     if known.abs_diff(actual) > 4_000 { return Err("Nie można ustalić czasu uśpienia.".into()); }
+    // record_suspend first ends an open idle period at the suspend time, in the same transaction.
     crate::sleep_periods::record_suspend(&mut tracker.db,id,now_ms).map_err(crate::db_err)?;
     Ok(())
 }
@@ -90,8 +93,9 @@ fn handle_suspend(tracker: &mut Tracker, now_ms: i64, power: crate::PowerSample)
 #[cfg(windows)]
 fn handle_resume(tracker: &mut Tracker, now_ms: i64, power: crate::PowerSample) -> Result<(), String> {
     let Some((id,periods,actual)) = active(tracker,now_ms,power)? else { return Ok(()); };
-    let Some(open) = periods.iter().find(|p| p.ended_ms.is_none()) else { return Ok(()); };
-    let previous = periods.iter().filter(|p| p.id != open.id).try_fold(0u64, |sum,p| {
+    // The open sleep period, never an open idle period; earlier sleep only (TECH-12 §1.7, B1).
+    let Some(open) = periods.iter().find(|p| p.ended_ms.is_none() && p.is_sleep()) else { return Ok(()); };
+    let previous = periods.iter().filter(|p| p.id != open.id && p.is_sleep()).try_fold(0u64, |sum,p| {
         sum.checked_add(u64::try_from(p.ended_ms?.checked_sub(p.started_ms)?).ok()?)
     }).ok_or("Niepoprawne okresy uśpienia.")?;
     let current = u64::try_from(now_ms.checked_sub(open.started_ms).ok_or("Niepoprawny czas.")?).map_err(|_| "Niepoprawny czas.")?;
@@ -160,5 +164,50 @@ mod tests {
         // A repeated resume event changes nothing.
         handle_resume(&mut tracker,start+4_300_000,PowerSample { total_ms:5_300_000,awake_ms:4_880_000 }).unwrap();
         assert_eq!(crate::sleep_periods::list_for_entry(&tracker.db,1).unwrap(),periods);
+    }
+
+    // I07 (TECH-12 §1.5, §1.7 B1): away since 10:48 (an open idle period, written here directly;
+    // the idle engine is DEV-39 PR 2), then the computer sleeps 11:00–12:00. With power counters
+    // consistent with that hour the sleep is recorded and finished next to the idle period, the
+    // two touch at the suspend time, and the projection is verified, not uncertain.
+    #[test]
+    fn sleep_after_idle_is_recorded_next_to_it_and_the_projection_stays_verified() {
+        let (mut tracker,start)=fixture();
+        tracker.db.execute("INSERT INTO sleep_periods(entry_id,source,started_ms) VALUES(1,'idle',?1)",[start+2_880_000]).unwrap();
+        handle_suspend(&mut tracker,start+3_600_000,PowerSample { total_ms:4_600_000,awake_ms:4_600_000 }).unwrap();
+        handle_resume(&mut tracker,start+7_200_000,PowerSample { total_ms:8_200_000,awake_ms:4_600_000 }).unwrap();
+        let periods=crate::sleep_periods::list_for_entry(&tracker.db,1).unwrap();
+        assert_eq!(periods.iter().map(|p| (p.source.as_str(),p.started_ms,p.ended_ms,p.decision.as_str())).collect::<Vec<_>>(),
+            [("idle",start+2_880_000,Some(start+3_600_000),"pending"),("sleep",start+3_600_000,Some(start+7_200_000),"pending")]);
+        // 12:10, awake since the resume: 2 h 10 min minus the pending 12 min away and 1 h of sleep.
+        let current=DateTime::parse_from_rfc3339("2026-01-01T12:10:00Z").unwrap().with_timezone(&chrono::Utc);
+        let projection=crate::active_projection(&tracker.db,tracker.running_since.as_ref(),1,"2026-01-01T10:00:00Z",current,&Ok(PowerSample { total_ms:8_800_000,awake_ms:5_200_000 })).expect("verified projection");
+        assert_eq!((projection.seconds,projection.excluded_sleep_ms),(7_800-720-3_600,4_320_000));
+        crate::sleep_periods::validate(&tracker.db).unwrap();
+    }
+
+    // I07b: a finished idle period before the first sleep and a second idle period after the wake.
+    // handle_resume finds the open sleep, never the idle period, and earlier time counts sleep only.
+    #[test]
+    fn resume_finds_the_open_sleep_and_counts_only_earlier_sleep_next_to_idle_periods() {
+        let (mut tracker,start)=fixture();
+        // Away 10:30–10:45 (the user came back), then sleep 11:00–11:30.
+        tracker.db.execute("INSERT INTO sleep_periods(entry_id,source,started_ms,ended_ms) VALUES(1,'idle',?1,?2)",[start+1_800_000,start+2_700_000]).unwrap();
+        handle_suspend(&mut tracker,start+3_600_000,PowerSample { total_ms:4_600_000,awake_ms:4_600_000 }).unwrap();
+        handle_resume(&mut tracker,start+5_400_000,PowerSample { total_ms:6_400_000,awake_ms:4_600_000 }).unwrap();
+        // Away again from 11:40; a stray resume event while only idle is open changes nothing.
+        tracker.db.execute("INSERT INTO sleep_periods(entry_id,source,started_ms) VALUES(1,'idle',?1)",[start+6_000_000]).unwrap();
+        handle_resume(&mut tracker,start+6_600_000,PowerSample { total_ms:7_600_000,awake_ms:5_800_000 }).unwrap();
+        assert_eq!(crate::sleep_periods::list_for_entry(&tracker.db,1).unwrap()[2].ended_ms,None);
+        // Second sleep 12:00–12:20: suspend ends the idle period, resume counts the first sleep only.
+        handle_suspend(&mut tracker,start+7_200_000,PowerSample { total_ms:8_200_000,awake_ms:6_400_000 }).unwrap();
+        handle_resume(&mut tracker,start+8_400_000,PowerSample { total_ms:9_400_000,awake_ms:6_400_000 }).unwrap();
+        let periods=crate::sleep_periods::list_for_entry(&tracker.db,1).unwrap();
+        assert_eq!(periods.iter().map(|p| (p.source.as_str(),p.started_ms,p.ended_ms,p.decision.as_str())).collect::<Vec<_>>(), [
+            ("idle",start+1_800_000,Some(start+2_700_000),"pending"),
+            ("sleep",start+3_600_000,Some(start+5_400_000),"pending"),
+            ("idle",start+6_000_000,Some(start+7_200_000),"pending"),
+            ("sleep",start+7_200_000,Some(start+8_400_000),"pending")]);
+        crate::sleep_periods::validate(&tracker.db).unwrap();
     }
 }
