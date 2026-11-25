@@ -1,6 +1,6 @@
 # TECH-13 — analiza: import historii z Toggl Track (CSV)
 
-**Status:** analiza techniczna, wersja 2 (25.11.2026). Wprowadza poprawki po recenzji PR #72: bloker B1 (idempotencja niezależna od strefy) oraz uwagi N1–N8. Decyzje O2–O10 zostały zatwierdzone 25.11.2026 (§9.3). Wersja 1: 24.11.2026. Wymaganie: [PTT-62](https://app.notion.com/p/422e1de1f67a811ba910ef88ef86da0b), karta: [TECH-13](https://app.notion.com/p/422e1de1f67a81b29b4dff1dfb647c10). Zakres zatwierdził właściciel produktu 24.11.2026.
+**Status:** analiza techniczna, wersja 3 (25.11.2026). Zawiera poprawki po dwóch recenzjach PR #72: B1 (idempotencja niezależna od strefy), N1–N8 oraz B2 (oba klucze, odcisk i ID, zapisywane i sprawdzane łącznie, §4). Decyzje O2–O10 zostały zatwierdzone 25.11.2026 (§9.3). Wersja 1: 24.11.2026. Wymaganie: [PTT-62](https://app.notion.com/p/422e1de1f67a811ba910ef88ef86da0b), karta: [TECH-13](https://app.notion.com/p/422e1de1f67a81b29b4dff1dfb647c10). Zakres zatwierdził właściciel produktu 24.11.2026.
 
 **Czego ten dokument nie robi:** nie zmienia kodu aplikacji, schematu, testów ani workflow. Nie jest odbiorem PTT-62. Implementacja to DEV-40, rozpisana w §9.
 
@@ -8,7 +8,7 @@
 
 **Zasada nadrzędna:** import dodaje dane, niczego nie nadpisuje. Każda wątpliwość oznacza odrzucenie wiersza albo całego pliku, z podaniem powodu. Nie zgadujemy.
 
-Synthetic fixture: [`docs/fixtures/toggl-detailed-synthetic.csv`](fixtures/toggl-detailed-synthetic.csv). Wszystkie dane są fikcyjne, a domena e-mail to zarezerwowane `example.invalid`.
+Synthetic fixture: [`docs/fixtures/toggl-detailed-synthetic.csv`](fixtures/toggl-detailed-synthetic.csv) oraz wariant z kolumną ID: [`docs/fixtures/toggl-detailed-synthetic-with-id.csv`](fixtures/toggl-detailed-synthetic-with-id.csv), z tymi samymi 18 rekordami. Wszystkie dane są fikcyjne, a domena e-mail to zarezerwowane `example.invalid`.
 
 ---
 
@@ -52,7 +52,7 @@ Fixture zakłada **roboczy** układ: `User, Email, Client, Project, Task, Descri
 - **sam wiersz nagłówka** prawdziwego eksportu, bez wierszy danych;
 - opis ustawień profilu: format daty, godziny i czasu trwania oraz strefa.
 
-Przy okazji trzeba sprawdzić, czy eksport zawiera kolumnę **ID wpisu Toggl**. Jeśli tak, staje się ona kluczem głównym idempotencji (§4). Prawdziwego eksportu nie commitujemy ani nigdzie nie wysyłamy. Sprawdza go wyłącznie właściciel, na własnym komputerze (§8.3).
+Przy okazji trzeba sprawdzić, czy eksport zawiera kolumnę **ID wpisu Toggl**. Jeśli tak, jest ona drugim kluczem idempotencji, obok odcisku lokalnego (§4.1). Prawdziwego eksportu nie commitujemy ani nigdzie nie wysyłamy. Sprawdza go wyłącznie właściciel, na własnym komputerze (§8.3).
 
 ### 1.3 Projekt parsera: nagłówki zamiast pozycji, fail closed
 
@@ -72,6 +72,7 @@ Nagłówki rozpoznajemy po nazwie, na zamkniętej liście aliasów, np. `End dat
 | `Start date`, `Start time`, `End date`, `End time`, `Duration` | tak | czas (§3) |
 | `Billable` | nie | ustawiane dla każdego wpisu. Gdy brakuje kolumny, wszystkie wpisy dostają `false` (D12: brak wartości oznacza false). Import wymaga wtedy **jawnego potwierdzenia** w podglądzie, bo wpływa to na rozliczenia i Billable% (O13). Gdy kolumna jest, ale ma nieznaną wartość, wiersz jest odrzucany. |
 | `Tags` | nie | §1.4 |
+| `ID` (ID wpisu Toggl; nazwa do potwierdzenia, O1) | nie | drugi klucz idempotencji (§4.1), nie wchodzi do odcisku |
 | `User`, `Email` | nie | wyłącznie kontrola jednej osoby: więcej niż jedna wartość odrzuca cały plik. Tych danych nie zapisujemy. |
 | inne (`Amount`, stawki, pola własne) | — | ignorowane i wymienione w podglądzie jako „pominięte kolumny” |
 
@@ -132,53 +133,73 @@ Nowe projekty nie są domyślnie rozliczalne. Rozliczalność importowanych wpis
    - **W pliku:** wszystkie wiersze grupy, która się nakłada, są odrzucane, także gdy dotyczą różnych klientów (D10 obowiązuje per użytkownik). Fixture, wiersze 10–11. Nie wybieramy „zwycięzcy”, bo to byłoby zgadywanie.
    - **Z bazą:** porównanie z każdym nieusuniętym wpisem, także z historycznymi kolizjami (D10: nie usuwać). Aktywny timer traktujemy jako otwarty do nieskończoności, jak w `ensure_no_overlap`. Wpisy o zerowej długości w bazie pomijamy, jak w `ensure_no_overlap`. Odrzucony zostaje wiersz importu, z odwołaniem do kolidującego wpisu (data i godzina, bez ujawniania innych pól).
    - **Wydajność:** `ensure_no_overlap` skanuje całą tabelę przy każdym wpisie, co przy 10 000 × 10 000 daje O(N·M). Import ładuje przedziały raz, sortuje je i sprawdza zamiatając (O((N+M) log)). Test parzystości z `ensure_no_overlap` na tych samych danych jest obowiązkowy (§8).
-7. **Kolejność reguł** (decyduje o raportowanym powodzie): plik → format wiersza i klucz źródłowy (§4.1) → **klucz zaimportowany wcześniej z inną strefą = odrzucenie całego pliku** (§4.2) → czas/DST → mapowanie → klucz (duplikat w pliku lub wcześniej zaimportowany) → nakładanie w pliku → nakładanie z bazą. Każdy wiersz dostaje dokładnie jeden status: `do importu`, `już zaimportowany` albo `odrzucony: <kod>`.
+7. **Kolejność reguł** (decyduje o raportowanym powodzie): plik → format wiersza i oba klucze (§4.1) → **odcisk lub ID zaimportowane wcześniej z inną strefą = odrzucenie całego pliku** (§4.2, R1/R2) → czas/DST → mapowanie → klucze (R3–R7 oraz duplikat w pliku, R10) → nakładanie w pliku → nakładanie z bazą. Każdy wiersz dostaje dokładnie jeden status: `do importu`, `już zaimportowany` albo `odrzucony: <kod>`.
 
 ---
 
 ## 4. Idempotencja
 
-### 4.1 Klucz wpisu (niezależny od strefy)
+### 4.1 Klucze wpisu (niezależne od strefy, zawsze oba)
 
-**Wersja 1 tego dokumentu była błędna** (bloker B1 z recenzji). Odcisk liczony z instancji UTC po przeliczeniu zależał od strefy wybranej przy imporcie. Ponowny import tego samego pliku z inną strefą dawał inne odciski. Nakładanie chroniło tylko wpisy dłuższe niż przesunięcie strefy, więc krótsze były liczone **podwójnie**. Na fixture: Warsaw, potem `UTC` daje +3 wpisy i +5400 s. Wiersze 2 i 4 są zdublowane (4500 s), a wiersz 7 trafia do bazy w złej strefie (900 s). Szczegóły w §8.1, AC2b.
+**Historia poprawek tej sekcji:**
 
-**Klucz w wersji 2:**
+- **Wersja 1 (B1).** Odcisk liczono z instancji UTC po przeliczeniu, więc zależał od strefy wybranej przy imporcie. Ponowny import tego samego pliku z inną strefą dawał inne odciski. Nakładanie chroniło tylko wpisy dłuższe niż przesunięcie strefy, więc krótsze liczone były **podwójnie**. Na fixture, Warsaw → `UTC`: +3 wpisy, +5400 s. Rekordy 2 i 4 są zdublowane (4500 s), a rekord 7 trafia do bazy w złej strefie (900 s).
+- **Wersja 2 (B2).** Każdy wpis miał **jeden** klucz: ID *albo* odcisk, zależnie od obecności kolumny ID. Kolumny raportu Detailed można ukrywać i dodawać [S1], więc dwa eksporty tego samego zakresu mogą się różnić obecnością ID. Wtedy klucze się nie pokrywają:
+  - przy innej strefie wraca B1 (+3 wpisy, +5400 s);
+  - przy tej samej strefie AC2 daje 7 odrzuceń „nakładanie” zamiast „już zaimportowany”.
 
-1. **ID wpisu Toggl**, jeśli eksport ma taką kolumnę (sprawdzane w O1). Klucz: `toggl-id/v1 ␟ <ID>`. Jest jednoznaczny i nie zależy od strefy ani od późniejszych zmian w Toggl.
-2. W przeciwnym razie **odcisk lokalny**: SHA-256 z kanonicznego zapisu UTF-8 **surowych wartości źródłowych**, przed jakimkolwiek przeliczeniem strefy. Pola rozdziela znak `U+001F`:
+  Obie wersje są pokazane w §8.1.
 
-   `toggl-csv/v2 ␟ Start date ␟ Start time ␟ End date ␟ End time ␟ czas trwania [s] ␟ klient ␟ projekt ␟ zadanie ␟ opis ␟ billable ␟ tagi`
+**Wersja 3 (obowiązująca).** Każdy wiersz ma **zawsze odcisk lokalny** i **dodatkowo ID Toggl**, jeśli plik je zawiera. Oba klucze są zapisywane i **sprawdzane łącznie**.
 
-   - Wartości dat i godzin bierzemy dokładnie tak, jak są w pliku (po walidacji formatu ISO, O7).
-   - Nazwy i opis są po `trim`, a w opisie CRLF zamieniamy na LF.
-   - Billable jest znormalizowane do `0/1`.
-   - Tagi bierzemy po `trim`, posortowane.
-   - Normalizacji Unicode nie stosujemy: Toggl eksportuje zawsze te same bajty.
+1. **Odcisk lokalny** (`local_key`, zawsze). To SHA-256 z kanonicznego zapisu UTF-8 **surowych wartości źródłowych**, przed jakimkolwiek przeliczeniem strefy. Pola rozdziela `U+001F`:
 
-Odcisk liczymy na etapie formatu wiersza (§3.7), więc istnieje także dla wierszy, które później odpadną na DST albo nakładaniu. Strefę zapisujemy osobno, w `import_batches.source_time_zone`. Odcisk lokalny jest zatem cechą wiersza pliku, a nie wyniku przeliczenia.
+   `toggl-csv/v3 ␟ Start date ␟ Start time ␟ End date ␟ End time ␟ czas trwania [s] ␟ klient ␟ projekt ␟ opis`
+
+   - Odcisk obejmuje **tylko kolumny wymagane** (§1.3). Ukrycie kolumn opcjonalnych (`ID`, `Task`, `Billable`, `Tags`) w eksporcie go nie zmienia.
+   - Daty i godziny bierzemy dokładnie tak, jak są w pliku, po walidacji formatu ISO (O7). Nazwy i opis są po `trim`, a w opisie CRLF zamieniamy na LF.
+   - Normalizacji Unicode nie stosujemy. **Założenie, bez źródła:** Toggl eksportuje ten sam tekst tymi samymi bajtami. Jeśli założenie jest fałszywe, odcisk się nie pokryje. Przy tej samej strefie skutkiem jest odrzucenie przez nakładanie, a nie duplikat.
+   - **Fałszywa kolizja.** Dwa różne wpisy o identycznych wartościach wszystkich ośmiu pól w jednym pliku i tak odpadają na D10 (identyczny przedział). Między plikami skutkiem jest pominięcie wpisu, a nie podwójne naliczenie, co jest zgodne z fail closed.
+2. **ID Toggl** (`toggl_id`, opcjonalnie). Zapisujemy wartość kolumny ID, jeśli plik ją ma. Nazwę i format kolumny trzeba potwierdzić w O1; fixture zakłada kolumnę `ID` z liczbą. ID nie wchodzi do odcisku.
+
+Oba klucze liczymy na etapie formatu wiersza (§3.7). Istnieją więc także dla wierszy, które później odpadną na DST albo nakładaniu. Strefę zapisujemy osobno, w `import_batches.source_time_zone`.
 
 ### 4.2 Zachowanie przy ponownym imporcie
 
-| Sytuacja | Wynik |
-|---|---|
-| Klucz istnieje z **tą samą** strefą (AC2) | wiersz `już zaimportowany`. Ten sam plik daje `0 nowych / 7 już zaimportowanych / 11 odrzuconych`. |
-| Klucz istnieje z **inną** strefą (AC2b) | **cały plik odrzucony**, 0 zmian: „Ten plik (lub jego część) zaimportowano <data> ze strefą X. Import z inną strefą zdublowałby lub przesunął wpisy.” Odrzucamy cały plik, a nie tylko pasujące wiersze. Inaczej wiersze, które wcześniej odpadły (np. wiersz 7, dwuznaczny w Warsaw, poprawny w UTC), trafiłyby do bazy w innej strefie niż reszta tego samego eksportu. |
-| Wpis zaimportowany, potem usunięty (`entry_deletions`) | `wcześniej zaimportowany (usunięty)`, nie wraca (O9) |
-| Zmiana nazwy lub korekta godzin w TrackerMaster po imporcie | bez wpływu: klucz pochodzi z pliku i jest związany z `entry_id` |
-| Wpis zmieniony w Toggl (np. nowa nazwa projektu) i wyeksportowany ponownie | nowy klucz, ale te same instancje UTC (gdy strefa jest wybrana poprawnie), więc **nakładanie** z istniejącym wpisem i odrzucenie, a nie duplikat |
-| Dwa identyczne wiersze w jednym pliku | oba odrzucone: „Powtórzony wiersz w pliku” (wiersze 16–17) |
+Dla każdego wiersza szukamy zapisanych wpisów, w których pasuje `local_key` **lub** `toggl_id` (o ile oba istnieją). Reguły obowiązują w tej kolejności:
 
-Zapisujemy też SHA-256 całego pliku. Gdy ten sam plik był już importowany, podgląd mówi „ten plik zaimportowano <data> ze strefą X”, a z inną strefą odmawia jak w tabeli. Ocena per wiersz i tak się odbywa, bo eksporty z różnych zakresów mogą się zazębiać.
+| # | Sytuacja | Wynik |
+|---|---|---|
+| R1 | Jakikolwiek wiersz pliku pasuje którymkolwiek kluczem do partii o **innej** strefie (AC2b) | **cały plik odrzucony**, 0 zmian: „Wpisy z tego pliku zaimportowano <data> ze strefą X. Import ze strefą Y zdublowałby lub przesunął wpisy.” Odrzucamy cały plik, a nie tylko pasujące wiersze. Inaczej wiersze, które wcześniej odpadły (np. rekord 7, dwuznaczny w Warsaw, poprawny w UTC), trafiłyby do bazy w innej strefie niż reszta eksportu. |
+| R2 | Pasujące klucze wskazują partie w **kilku różnych strefach** | jak R1, ale komunikat wymienia wszystkie strefy i wskazuje kopię sprzed **najwcześniejszej** z tych partii. Taki plik zostanie odrzucony przy każdym wyborze strefy, a jedyną drogą jest przywrócenie kopii (§4.3). |
+| R3 | `toggl_id` i `local_key` pasują do **różnych** zapisanych wpisów | wiersz odrzucony: „Niespójne dopasowanie z wcześniejszym importem (ID i treść wskazują różne wpisy)”. Nie zgadujemy, który jest właściwy. |
+| R4 | `local_key` pasuje do zapisanego wpisu z **innym** niepustym `toggl_id` | wiersz odrzucony: „Ten sam czas i opis co wcześniej zaimportowany wpis o innym ID”. |
+| R5 | Pasuje `local_key` lub `toggl_id`, ta sama strefa (AC2) | wiersz `już zaimportowany`. Obejmuje to przejścia bez ID → z ID i z ID → bez ID. Ten sam plik daje `0 nowych / 7 już zaimportowanych / 11 odrzuconych`. |
+| R6 | Pasuje tylko `toggl_id`, bo wpis zmieniono w Toggl po imporcie (opis, klient, projekt albo godziny) | `już zaimportowany (zmieniony w Toggl — nie aktualizujemy)`. Import nigdy nie nadpisuje istniejących wpisów. |
+| R7 | Wpis zaimportowany, potem usunięty (`entry_deletions`) | `wcześniej zaimportowany (usunięty)`, nie wraca (O9) |
+| R8 | Zmiana nazwy lub korekta godzin w TrackerMaster po imporcie | bez wpływu: klucze pochodzą z pliku i są związane z `entry_id` |
+| R9 | Wpis zmieniony w Toggl, eksport **bez** ID, a ID nie zapisano | nowy `local_key`, ale te same instancje UTC (przy poprawnie wybranej strefie), więc **nakładanie** z istniejącym wpisem i odrzucenie, a nie duplikat |
+| R10 | Dwa wiersze o tym samym `local_key` albo `toggl_id` w jednym pliku | oba odrzucone: „Powtórzony wiersz w pliku” (rekordy 16–17; w wariancie z ID mają różne ID, ale ten sam odcisk) |
+
+**Bez uzupełniania ID wstecz.** Gdy wpis zaimportowano bez ID, a późniejszy eksport ma ID, wpis jest rozpoznany odciskiem (R5), ale ID **nie jest dopisywane**. Tabela importu jest tylko do dopisywania (triggery blokują UPDATE), żeby ślad audytowy był niezmienny. Skutek: dla takich wpisów późniejsza zmiana treści w Toggl jest obsługiwana przez R9 (nakładanie), a nie przez R6.
+
+Zapisujemy też SHA-256 całego pliku. Gdy ten sam plik był już importowany, podgląd mówi „ten plik zaimportowano <data> ze strefą X”, a z inną strefą odmawia jak w R1. Ocena per wiersz i tak się odbywa, bo eksporty z różnych zakresów mogą się zazębiać.
 
 ### 4.3 Import z błędną strefą: jak to naprawić
 
 1. **Zapobieganie.** Domyślna strefa to strefa poprzedniego importu (§3.1). Inna strefa wymaga potwierdzenia: „Poprzedni import użył strefy X. Wybrano Y. Potwierdzam, że profil Toggl w tym eksporcie miał strefę Y.” Podgląd pokazuje godziny kilku pierwszych wpisów w obu strefach, do porównania z Toggl.
-2. **Wykrycie.** Ten sam plik albo eksport zazębiający się z wcześniejszym, ale z inną strefą, zostaje odrzucony w całości (§4.2).
+2. **Wykrycie.** Plik, którego wiersze pasują kluczem do wcześniejszego importu w innej strefie, zostaje odrzucony w całości (§4.2, R1/R2). Działa to niezależnie od tego, czy któryś z eksportów miał kolumnę ID.
 3. **Naprawa (O12).** W wersji 1 import cofa się wyłącznie przez **przywrócenie kopii sprzed importu**, istniejącym przepływem DEV-13. Komunikat odmowy wskazuje kopię z `import_batches.backup_file`. Przywrócenie cofa całą bazę do stanu sprzed tamtego importu, razem z tabelami importu. UI ostrzega, że zmiany wprowadzone po imporcie też zostaną cofnięte. Potem import z poprawną strefą przechodzi normalnie.
 
-   Ręczne usunięcie zaimportowanych wpisów **nie** pozwala na ponowny import, bo odciski zostają (O9). Komunikat musi więc kierować do przywrócenia kopii. Dedykowane „Cofnij import partii” jest kandydatem na kolejną wersję, nie na wersję 1 (O12 B).
+   Ręczne usunięcie zaimportowanych wpisów **nie** pozwala na ponowny import, bo klucze zostają (O9). Komunikat musi więc kierować do przywrócenia kopii. Dedykowane „Cofnij import partii” jest kandydatem na kolejną wersję, nie na wersję 1 (O12 B).
 
-**Ryzyko resztkowe** (bez kolumny ID): użytkownik zmienił strefę profilu w Toggl, wyeksportował zazębiający się zakres, **i** wybrał przy imporcie złą strefę. Zegar ścienny w pliku jest wtedy inny, więc klucze się nie pokrywają, a krótkie wpisy mogą się zdublować. Ograniczają to: potwierdzenie innej strefy niż poprzednio, porównanie godzin w podglądzie oraz kolumna ID (O1), która usuwa to ryzyko całkowicie.
+**Ryzyko resztkowe** (tylko gdy wcześniejszy import nie miał ID). Warunki muszą zajść łącznie:
+
+- użytkownik zmienił strefę profilu w Toggl;
+- wyeksportował zazębiający się zakres;
+- wybrał przy imporcie złą strefę.
+
+Zegar ścienny w pliku jest wtedy inny, więc odcisk się nie pokrywa, a zapisanego ID nie ma. Krótkie wpisy mogą się wtedy zdublować. Ograniczają to: potwierdzenie innej strefy niż poprzednio, porównanie godzin w podglądzie oraz eksport z kolumną ID od pierwszego importu (O1). Gdy **oba** eksporty mają ID, ryzyko znika (R1 przez `toggl_id`).
 
 ### 4.4 Schemat
 
@@ -194,13 +215,14 @@ CREATE TABLE import_batches (
 CREATE TABLE imported_entries (
   entry_id INTEGER PRIMARY KEY REFERENCES time_entries(id),
   batch_id INTEGER NOT NULL REFERENCES import_batches(id),
-  source_key TEXT NOT NULL UNIQUE,                 -- 'toggl-id/v1…' albo odcisk 'toggl-csv/v2…'
+  local_key TEXT NOT NULL UNIQUE,                  -- odcisk 'toggl-csv/v3…', zawsze
+  toggl_id TEXT UNIQUE,                            -- ID z pliku albo NULL; wiele NULL dozwolone
   source_row INTEGER NOT NULL,                     -- numer rekordu danych (§1.3)
   source_tags TEXT NOT NULL DEFAULT '');
 -- triggery: brak UPDATE/DELETE (ślad audytowy), jak w sleep_periods
 ```
 
-Wiersze, które odpadły na etapie czasu (np. wiersz 7), nie trafiają do `imported_entries`. Wykrycie innej strefy (§4.2) wystarczy jednak, że **jakikolwiek** wiersz pliku ma zapisany klucz. Na fixture dotyczy to 7 wierszy.
+Wiersze, które odpadły na etapie czasu (np. rekord 7), nie trafiają do `imported_entries`. Wykrycie innej strefy (R1) wymaga jednak tylko tego, żeby **jakikolwiek** wiersz pliku miał zapisany klucz. Na fixture dotyczy to 7 wierszy.
 
 Alternatywa odrzucona: rozpoznawanie duplikatów tylko po identycznym przedziale czasu, bez tabeli. Ponowny import pokazałby wtedy N „konfliktów nakładania” zamiast „już zaimportowane” i nie wykryłby innej strefy.
 
@@ -280,6 +302,7 @@ Przykładowe komunikaty o odrzuceniu całego pliku:
 - „Nieznany układ kolumn: brak Start date”
 - „Plik zawiera wpisy wielu osób”
 - „Plik przekracza 10 MB”
+- „Wpisy z tego pliku pochodzą z importów w różnych strefach (Europe/Warsaw, UTC). Tego pliku nie da się zaimportować przy żadnej strefie. Przywróć kopię sprzed pierwszego z tych importów: `<plik kopii>`.” (R2)
 - „Wpisy z tego pliku zaimportowano 25.11.2026 ze strefą Europe/Warsaw. Import ze strefą UTC zdublowałby lub przesunął wpisy. Aby zmienić strefę, przywróć kopię sprzed tamtego importu: `<plik kopii>`.”
 
 Raport odrzuceń w wersji 1 jest **tylko na ekranie** (O10). Zapis do pliku byłby kolejną ścieżką zapisu danych klientów; można go dodać później z ochroną formuł.
@@ -318,17 +341,29 @@ Raport odrzuceń w wersji 1 jest **tylko na ekranie** (O10). Zapis do pliku był
 
 Rozliczalne: 20 730 s, czyli 54,8%. Nowe obiekty: klienci 2, projekty 3, zadania 2.
 
-**Ponowne importy tego samego pliku (AC2 / AC2b)**, sekwencja na jednej bazie:
+**Ponowne importy tego samego pliku (AC2 / AC2b)**, sekwencja na jednej bazie, plik `toggl-detailed-synthetic.csv`:
 
-| Krok | Strefa | Wynik w wersji 2 (ten dokument) | Stan bazy po kroku | Dla porównania: wersja 1 (odcisk z UTC, B1) |
+| Krok | Strefa | Wynik w wersji 3 (ten dokument) | Stan bazy po kroku | Dla porównania: wersja 1 (odcisk z UTC, B1) |
 |---|---|---|---|---|
 | 1 | `Europe/Warsaw` | 7 nowych, 0 już zaimportowanych, 11 odrzuconych | 7 wpisów, 37 830 s | to samo |
 | 2 | `Europe/Warsaw` | 0 nowych, 7 już zaimportowanych, 11 odrzuconych (te same powody) | bez zmian | to samo |
-| 3 | `UTC` | **cały plik odrzucony**: klucze rekordów 1–6 i 9 zapisano wcześniej ze strefą `Europe/Warsaw`. 0 zmian, komunikat wskazuje kopię sprzed kroku 1. | bez zmian: 7 wpisów, 37 830 s | **błąd:** +3 wpisy, +5400 s (razem 10 wpisów, 43 230 s). Rekord 2 (10:30–11:00 → 10:30Z zamiast 09:30Z) i rekord 4 (08:00–08:45) nie nakładają się na swoje kopie, więc są **zdublowane** (1800 + 2700 = 4500 s). Rekord 7, dwuznaczny w Warsaw, jest poprawny w UTC, więc trafia do bazy w innej strefie (900 s). Rekordy 1, 3 i 5 są odrzucone jako nakładanie, a rekordy 6, 8 i 9 jako niezgodny czas trwania (w UTC nie ma zmiany czasu). |
+| 3 | `UTC` | **cały plik odrzucony** (R1): klucze rekordów 1–6 i 9 zapisano wcześniej ze strefą `Europe/Warsaw`. 0 zmian, komunikat wskazuje kopię sprzed kroku 1. | bez zmian: 7 wpisów, 37 830 s | **błąd:** +3 wpisy, +5400 s (razem 10 wpisów, 43 230 s). Rekord 2 (10:30–11:00 → 10:30Z zamiast 09:30Z) i rekord 4 (08:00–08:45) nie nakładają się na swoje kopie, więc są **zdublowane** (1800 + 2700 = 4500 s). Rekord 7, dwuznaczny w Warsaw, jest poprawny w UTC, więc trafia do bazy w innej strefie (900 s). Rekordy 1, 3 i 5 są odrzucone jako nakładanie, a rekordy 6, 8 i 9 jako niezgodny czas trwania (w UTC nie ma zmiany czasu). |
 
-Kolumnę „wersja 1” policzono symulacją reguł z §3 na fixture (`@js-temporal/polyfill`, 25.11.2026). Arytmetyka: 37 830 + 1800 + 2700 + 900 = 43 230 s ✓.
+**Przejścia między eksportem bez ID a eksportem z ID (B2).** Drugi fixture, `toggl-detailed-synthetic-with-id.csv`, zawiera te same 18 rekordów i dodatkową kolumnę `ID` (fikcyjne 900001–900018; nazwa kolumny to założenie, O1). Krok 1 we wszystkich scenariuszach: 7 nowych / 37 830 s.
 
-Wynik kroku 3 w wersji 2 nie zależy od kolejności kroków: wystarczy jeden wcześniej zapisany klucz z inną strefą. Wariant odwrotny (najpierw `UTC`, potem `Europe/Warsaw`) też musi odrzucić cały plik.
+| Scenariusz | Krok 1 | Krok 2 | Wersja 3: krok 2 / stan bazy | Wersja 2 (jeden klucz): krok 2 / stan bazy |
+|---|---|---|---|---|
+| S1 | bez ID, Warsaw | z ID, Warsaw | 0 nowych, **7 już zaimportowanych** (R5, odciskiem), 11 odrzuconych / 7 wpisów, 37 830 s | 0 nowych, ale **7 odrzuceń „nakładanie”** zamiast „już zaimportowany” / 7 wpisów, 37 830 s |
+| S2 | bez ID, Warsaw | z ID, `UTC` | **cały plik odrzucony** (R1, odciskiem) / 7 wpisów, 37 830 s | **błąd:** +3 wpisy, +5400 s / 10 wpisów, 43 230 s (jak B1) |
+| S3 | z ID, Warsaw | bez ID, `UTC` | **cały plik odrzucony** (R1, odciskiem) / 7 wpisów, 37 830 s | **błąd:** +3 wpisy, +5400 s / 10 wpisów, 43 230 s |
+| S4 | z ID, Warsaw | z ID, Warsaw | 0 nowych, 7 już zaimportowanych (R5, oba klucze) / 7, 37 830 s | to samo |
+| S5 | z ID, Warsaw | z ID, `UTC` | **cały plik odrzucony** (R1) / 7, 37 830 s | to samo |
+| S6 | z ID, Warsaw | z ID, Warsaw, opis rekordu 1 zmieniony w Toggl | 0 nowych, 7 już zaimportowanych; rekord 1 przez R6 (pasuje tylko ID) / 7, 37 830 s | to samo |
+| S7 | z ID, Warsaw | jak S6, ale `UTC` | **cały plik odrzucony** (R1: rekord 1 przez ID, pozostałe przez oba klucze) / 7, 37 830 s | to samo |
+
+Obie tabele policzono symulacją reguł z §3 i §4.2 na obu fixture (`@js-temporal/polyfill`, 25.11.2026). W każdym scenariuszu wersji 3 baza po kroku 2 ma 7 wpisów i 37 830 s, czyli tyle, ile po kroku 1. Arytmetyka błędów wersji 1 i 2: 37 830 + 1800 + 2700 + 900 = 43 230 s ✓. Wariant S6 (zmiana opisu) test generuje w pamięci; nie jest osobnym plikiem.
+
+Wynik R1 nie zależy od kolejności kroków: wystarczy jeden wcześniej zapisany klucz z inną strefą. Wariant odwrotny (najpierw `UTC`, potem `Europe/Warsaw`) też musi odrzucić cały plik.
 
 ### 8.2 Kryteria PTT-62 → testy
 
@@ -336,7 +371,8 @@ Wynik kroku 3 w wersji 2 nie zależy od kolejności kroków: wystarczy jeden wcz
 |---|---|---|
 | AC1: N poprawnych → N wpisów, sumy co do sekundy | fixture → 7 wpisów, 37 830 s, sumy dzienne jak w §8.1. Ten sam wynik przez `reportByDay` (TECH-09) i KPI Summary. | Rust (CI `build`), node (lista „Check report calculations”), E2E |
 | AC2: ponowny import = 0 nowych | drugi `prepare` i `apply` daje 0 / 7 / 11. Liczby i sumy bez zmian. Wariant: po zmianie nazwy projektu i po korekcie godzin jednego wpisu, wynik ten sam. | Rust, E2E |
-| AC2b: ten sam plik z inną strefą | kroki 1–3 z §8.1: krok 3 (`UTC`) odrzuca cały plik, 0 nowych, baza 7 / 37 830 s. Asercja wprost na rekordach 2 i 4, czyli wpisach krótszych niż przesunięcie strefy. Wariant odwrotny UTC → Warsaw. Wariant z kolumną ID wpisu (po O1). Komunikat wskazuje istniejący plik kopii. | Rust, E2E |
+| AC2b: ten sam plik z inną strefą | kroki 1–3 z §8.1: krok 3 (`UTC`) odrzuca cały plik, 0 nowych, baza 7 / 37 830 s. Asercja wprost na rekordach 2 i 4, czyli wpisach krótszych niż przesunięcie strefy. Wariant odwrotny UTC → Warsaw. Komunikat wskazuje istniejący plik kopii. | Rust, E2E |
+| AC2c: przejścia bez ID ↔ z ID (B2) | scenariusze S1–S7 z §8.1 na obu fixture. S1: „już zaimportowany”, a nie „nakładanie”. S2, S3, S5 i S7: cały plik odrzucony. S6: R6. W każdym przypadku baza po kroku 2 = 7 / 37 830 s. Do tego testy reguł R2 (partie w dwóch strefach), R3 (ID i odcisk wskazują różne wpisy) i R4 (ten sam odcisk, inne ID), na danych generowanych w teście. | Rust; E2E co najmniej S1 i S2 |
 | AC3: błąd w połowie → baza bez zmian, kopia istnieje | trigger `RAISE(FAIL)` na N-tym wierszu; `SQLITE_FULL` przez `PRAGMA max_page_count`; zmiana danych między podglądem a zapisem. Za każdym razem baza identyczna, kopia przechodzi preflight. | Rust; E2E (trigger przez testowe połączenie SQLite, jak w fazie `write-failure`) |
 | AC4: nakładanie, DST, północ, brakujące pola | wiersze 5–18 z kodami powodów. Brak komunikatu sukcesu przy 0 importowanych. | Rust, E2E (zrzut tabeli odrzuceń) |
 
@@ -372,7 +408,7 @@ Testy dodatkowe:
 
 | PR | Zakres | Rozmiar |
 |---|---|---|
-| **A** `feat/dev40-toggl-parser-…` | moduł Rust `toggl_import.rs`, czysty i bez bazy: dekodowanie, nagłówki, rekordy, klucz źródłowy (§4.1), rozstrzyganie strefy i DST, kody odrzuceń; testy na fixture. Rekomendacja: crate `csv` (dojrzały, RFC 4180) zamiast własnego parsera; do decyzji recenzenta. To nowa zależność, więc zmieni się `Cargo.lock`. Ten PR dodaje też `.gitattributes` z `docs/fixtures/*.csv -text`: przy `core.autocrlf=true` checkout zamieniłby LF na CRLF, także w wielowierszowym opisie rekordu 3, i zmieniłby `file_sha256`. Warianty CRLF i BOM test generuje sam. | M |
+| **A** `feat/dev40-toggl-parser-…` | moduł Rust `toggl_import.rs`, czysty i bez bazy: dekodowanie, nagłówki, rekordy, oba klucze (odcisk i ID, §4.1), rozstrzyganie strefy i DST, kody odrzuceń; testy na fixture. Rekomendacja: crate `csv` (dojrzały, RFC 4180) zamiast własnego parsera; do decyzji recenzenta. To nowa zależność, więc zmieni się `Cargo.lock`. Ten PR dodaje też `.gitattributes` z `docs/fixtures/*.csv -text`: przy `core.autocrlf=true` checkout zamieniłby LF na CRLF, także w wielowierszowym opisie rekordu 3, i zmieniłby `file_sha256`. Warianty CRLF i BOM test generuje sam. | M |
 | **B** `feat/dev40-import-schema-v15-…` | migracja `import_batches` / `imported_entries` z kopią, triggery, walidacja w `initialise`, preflight i restore | S–M |
 | **C** `feat/dev40-import-commands-…` | `prepare_toggl_import` / `apply_toggl_import`, mapowanie, nakładanie przez zamiatanie, kopia, transakcja, ponowna weryfikacja planu; testy AC1–AC4 w Rust | M |
 | **D** `feat/dev40-import-ui-e2e-…` | karta UI, podgląd, tabela odrzuceń, faza E2E `toggl-import`, zrzuty | M |
