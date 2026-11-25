@@ -36,6 +36,10 @@ fn transition_with_power(tracker: &mut crate::Tracker, expected: Option<i64>, at
         if !resume && target.as_ref().is_some_and(|t| t.0==active_project && t.1==active_task) { return Ok(()); }
         let start = DateTime::parse_from_rfc3339(&started).map_err(|_| "Niepoprawny zapis czasu w bazie.")?;
         let end = DateTime::parse_from_rfc3339(at).map_err(|_| "Niepoprawny czas systemowy.")?;
+        // Stop, switch and resume are input: an open idle period of the active entry ends now,
+        // in this transaction, and stays pending as its own item (TECH-12 §1.4, §1.7). Any
+        // failure below rolls it back with the rest.
+        crate::sleep_periods::close_open_idle(&tx,id,end.timestamp_millis()).map_err(crate::db_err)?;
         let projection = crate::active_projection(&tx,tracker.running_since.as_ref(),id,&started,end.with_timezone(&Utc),&power);
         let seconds = match projection {
             Some(value) => value.seconds,
@@ -582,5 +586,72 @@ mod tests {
         assert!(error.contains("czas wybudzenia"), "{error}");
         assert!(tracker.running_since.is_some());
         assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    // TECH-12 / DEV-39 PR 1: entry 41 runs since 10:00 and the user has been away since 12:30
+    // (an open idle period, written here directly; the idle engine is DEV-39 PR 2).
+    fn running_with_open_idle() -> crate::Tracker {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient');
+            INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt'),(2,1,'Inny projekt');
+            INSERT INTO time_entries(id,project_id,started_at,ended_at,duration_seconds) VALUES(40,2,'2026-01-01T08:00:00Z','2026-01-01T09:00:00Z',3600);
+            INSERT INTO time_entries(id,project_id,started_at) VALUES(41,1,'2026-01-01T10:00:00Z');").unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        db.execute("INSERT INTO sleep_periods(entry_id,source,started_ms) VALUES(41,'idle',?1)", [start + 9_000_000]).unwrap();
+        let clock = crate::RunningClock { since: Instant::now(), power: crate::PowerSample { total_ms: 1_000_000, awake_ms: 1_000_000 } };
+        crate::Tracker { db, running_since: Some(clock), restored: false }
+    }
+
+    // I15b (TECH-12 §1.4): back and straight to Stop, switch or resume while the idle period is
+    // still open. The same transaction ends it at the action as its own pending item, then ends
+    // the entry: no refusal and no wake-time prompt. The next timer starts clean (D3).
+    #[test]
+    fn stop_switch_and_resume_end_an_open_idle_period_at_the_action_and_keep_it_pending() {
+        let start = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().timestamp_millis();
+        for action in ["stop", "switch", "resume"] {
+            let mut tracker = running_with_open_idle();
+            // No sleep: the power counters agree with 3 h awake.
+            let power = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 11_800_000 });
+            let next = match action {
+                "stop" => TimerAction::Stop,
+                "switch" => TimerAction::Start { project_id: 2, task_id: None, description: "" },
+                _ => TimerAction::Resume { entry_id: 40 },
+            };
+            transition_with_power(&mut tracker, Some(41), "2026-01-01T13:00:00Z", next, power).unwrap();
+            let (ended, seconds): (String, i64) = tracker.db.query_row("SELECT ended_at,duration_seconds FROM time_entries WHERE id=41", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!((ended.as_str(), seconds), ("2026-01-01T13:00:00Z", 9_000), "{action}: 3 h minus the pending 30 min");
+            let periods = crate::sleep_periods::list_for_entry(&tracker.db, 41).unwrap();
+            assert_eq!((periods.len(), periods[0].ended_ms, periods[0].manual_resume, periods[0].decision.as_str(), periods[0].is_sleep()),
+                (1, Some(start + 10_800_000), false, "pending", false), "{action}");
+            let running: Option<i64> = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).optional().unwrap();
+            match running {
+                None => assert_eq!(action, "stop"),
+                Some(id) => assert!(id != 41 && crate::sleep_periods::list_for_entry(&tracker.db, id).unwrap().is_empty(), "{action}"),
+            }
+            assert_eq!(crate::pending_sleep(&tracker.db).unwrap().len(), 1, "{action}");
+            crate::sleep_periods::validate(&tracker.db).unwrap();
+        }
+    }
+
+    // I07c (Stop): with an open idle period and clocks that disagree (1 h of sleep that no period
+    // explains), Stop is refused with the recovery message, not the wake-time prompt. The idle end
+    // written in the transaction is rolled back with it.
+    #[test]
+    fn open_idle_period_with_mismatched_clocks_is_rolled_back_and_handed_to_recovery() {
+        let mut tracker = running_with_open_idle();
+        let power = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 8_200_000 });
+        let error = transition_with_power(&mut tracker, Some(41), "2026-01-01T13:00:00Z", TimerAction::Stop, power).unwrap_err();
+        assert_eq!(error, crate::unverifiable_timer_message(false));
+        assert!(!error.contains("czas wybudzenia"), "{error}");
+        assert!(tracker.running_since.is_none());
+        assert_eq!(tracker.db.query_row("SELECT COUNT(*) FROM time_entries WHERE id=41 AND ended_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let period = crate::sleep_periods::list_for_entry(&tracker.db, 41).unwrap().remove(0);
+        assert_eq!((period.ended_ms, period.decision.as_str()), (None, "pending"));
+        // Manual recovery then clips the idle period at the given end (I06).
+        let now = DateTime::parse_from_rfc3339("2026-01-01T14:00:00Z").unwrap().with_timezone(&Utc);
+        crate::resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).unwrap();
+        let seconds: i64 = tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=41", [], |r| r.get(0)).unwrap();
+        assert_eq!(seconds, 9_000);
     }
 }

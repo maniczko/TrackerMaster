@@ -2435,7 +2435,8 @@ async function verifyShortSleep(cdp, sessionId) {
   const rust = await readFile(join('src-tauri', 'src', 'sleep_periods.rs'), 'utf8');
   const latest = Number(main.match(/const LATEST_SCHEMA_VERSION: i64 = (\d+);/)[1]);
   const threshold = rust.match(/pub const SHORT_SLEEP_AUTO_INCLUDE_MS: i64 = ([\d_ *]+);/)[1].replace(/_/g, '').split('*').reduce((product, factor) => product * Number(factor), 1);
-  const resumeSql = rust.match(/"(UPDATE sleep_periods SET ended_ms=\?1, decision=CASE[^"]+)"/)[1];
+  // The v15 statement (sleep only, O5a: TECH-12 / DEV-39 PR 1); the app runs the same text.
+  const resumeSql = rust.match(/const RESUME_SQL: &str = "(UPDATE sleep_periods SET ended_ms=\?1, decision=CASE[^"]+)"/)[1];
   assert.equal(threshold, 300_000);
   const description = 'D4 krótkie uśpienie';
   const start = Date.parse('2026-01-05T08:00:00.000Z');
@@ -2446,6 +2447,8 @@ async function verifyShortSleep(cdp, sessionId) {
     // The packaged app migrated the test database to the current schema with 'auto_included'.
     assert.equal(db.prepare('PRAGMA user_version').get().user_version, latest);
     assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name='sleep_periods'").get().sql, /'auto_included'/);
+    // v15: every period has a source; the periods written below are sleep (the column default).
+    assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name='sleep_periods'").get().sql, /source TEXT NOT NULL DEFAULT 'sleep' CHECK \(source IN \('sleep', 'idle'\)\)/);
     project = db.prepare(`SELECT p.id AS projectId, p.client_id AS clientId FROM projects p WHERE p.archived=0
       AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=p.client_id) ORDER BY p.id LIMIT 1`).get();
     assert.ok(project, 'an active project for the short-sleep entry');
@@ -2466,6 +2469,7 @@ async function verifyShortSleep(cdp, sessionId) {
     ids = { short: record(10 * minute, 2 * minute), boundary: record(20 * minute, threshold), long: record(30 * minute, 10 * minute) };
     const rows = db.prepare('SELECT id, decision, decided_ms, ended_ms FROM sleep_periods WHERE entry_id=? ORDER BY started_ms').all(entryId).map(row => ({ ...row }));
     assert.deepEqual(rows.map(row => row.decision), ['auto_included', 'pending', 'pending']);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sleep_periods WHERE entry_id=? AND source='sleep'").get(entryId).n, 3);
     assert.equal(rows[0].decided_ms, rows[0].ended_ms, 'the automatic decision is recorded at the observed resume');
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='auto_included', decided_ms=ended_ms WHERE id=?").run(ids.boundary), /CHECK/);
     assert.throws(() => db.prepare("UPDATE sleep_periods SET decision='excluded', decided_ms=1 WHERE id=?").run(ids.short), /immutable/);
