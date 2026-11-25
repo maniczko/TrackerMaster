@@ -40,8 +40,10 @@ export function useCalendarMove(input: {
   view: CalendarWeek | null; blocks: readonly CalendarBlock[]; data: CalendarReportData | undefined; editable: boolean; now: number;
   active: CalendarClockEntry | null; canvas: RefObject<HTMLDivElement | null>; body: RefObject<HTMLDivElement | null>; minutePx: number; minBlockPx: number;
   onSaved: (message: string) => Promise<void>;
+  /** A move's outcome (saving, refused, cancelled) is about to be shown: the previous note goes, so messages never stack above the grid. */
+  onOutcome: () => void;
 }) {
-  const { view, blocks, data, editable, now, active, canvas, body, minutePx, minBlockPx, onSaved } = input;
+  const { view, blocks, data, editable, now, active, canvas, body, minutePx, minBlockPx, onSaved, onOutcome } = input;
   const zone = view?.zone ?? 'UTC';
   const drag = useRef<Drag | null>(null);
   const swallowClick = useRef(false);
@@ -110,10 +112,11 @@ export function useCalendarMove(input: {
     if (current?.active) swallowClick.current = true;
     if (current) { try { current.node.releasePointerCapture(current.pointerId); } catch { /* already released */ } }
     setShown(null);
-    if (message) setFailure({ text: message, pending: null });
+    if (message) { onOutcome(); setFailure({ text: message, pending: null }); }
   }
 
   async function commit(entry: DragEntry, result: DragProposal) {
+    if (!result.ok || result.changed) onOutcome();
     if (!result.ok) { setFailure({ text: `Nie przesunięto wpisu #${entry.id}: ${result.problem.message} Wpis został na swoim miejscu.`, pending: null }); setShown(null); return; }
     if (!result.changed) { setShown(null); setFailure(null); return; }
     await run({ entry, fields: result.fields, zone, source: null, draft: null }, { startMs: result.startMs, endMs: result.endMs });
@@ -158,7 +161,9 @@ export function useCalendarMove(input: {
       // Autoscroll near the visible edges of the day axis (the window may cut the scroll area at 125 %).
       const area = body.current?.getBoundingClientRect();
       if (area && body.current) {
-        if (event.clientY < Math.max(area.top, 0) + 32) body.current.scrollTop -= 12;
+        // The top edge is below the sticky day header, which covers the first rows of the scroll area.
+        const head = body.current.querySelector('.calendar-head')?.getBoundingClientRect().bottom ?? area.top;
+        if (event.clientY < Math.max(area.top, head, 0) + 32) body.current.scrollTop -= 12;
         else if (event.clientY > Math.min(area.bottom, window.innerHeight) - 32) body.current.scrollTop += 12;
       }
       propose(current, event.clientX, event.clientY);
@@ -206,7 +211,7 @@ export function useCalendarMove(input: {
   /** Alt+arrows propose a move (Shift: the end); Enter saves it, Esc cancels. Returns true when handled. */
   function onKeyDown(block: CalendarBlock, event: ReactKeyboardEvent<HTMLElement>): boolean {
     const pending = shown && shown.via === 'keyboard' && shown.key === block.key ? shown : null;
-    if (pending && event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setShown(null); setFailure({ text: 'Przesunięcie anulowane. Wpis został na swoim miejscu.', pending: null }); return true; }
+    if (pending && event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setShown(null); onOutcome(); setFailure({ text: 'Przesunięcie anulowane. Wpis został na swoim miejscu.', pending: null }); return true; }
     if (pending && event.key === 'Enter') { event.preventDefault(); if (pending.result) void commit(pending.entry, pending.result); return true; }
     if (!event.altKey || !movable(block)) return false;
     const action: KeyAction | undefined = event.shiftKey ? (event.key === 'ArrowUp' ? 'shorter' : event.key === 'ArrowDown' ? 'longer' : undefined) : KEYS[event.key];

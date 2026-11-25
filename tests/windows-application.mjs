@@ -1442,24 +1442,27 @@ async function verifyCalendarDrag(cdp, sessionId) {
       dialog: Boolean(document.querySelector('dialog.calendar-entry-dialog')) }; })()`;
   const blockOf = description => `[...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-block')].find(node => node.getAttribute('aria-label').startsWith(${JSON.stringify(description)}))`;
   const labelOf = description => evaluate(`${blockOf(description)}?.getAttribute('aria-label') ?? null`);
-  // Scrolls the page and then the day axis so `minute` is 60 px below the top of the scroll area (away from the autoscroll edges),
-  // then returns the block's box, its column and the point to press: the middle, or 3 px inside an edge handle.
+  // Scrolls the page and then the day axis so `minute` is 60 px below the sticky day header (run 45577179918: measured
+  // from the top of the scroll area, which the 51 px header covers, the press point landed 51 px too low), then returns the
+  // block's box, its column, the point to press (the middle, or 3 px inside an edge handle) and the visible axis.
   const grip = (description, part, minute) => evaluate(`(() => {
     const body = document.querySelector('.calendar-body'); const block = ${blockOf(description)};
     const column = block.closest('.calendar-column');
     // The page first: at 125 % a message above the grid pushes it down, so the day header goes to the window top.
     document.querySelector('[aria-label="Kalendarz"] .calendar-head').scrollIntoView({ block: 'start' });
-    body.scrollTop = Math.max(0, ${minute} * column.getBoundingClientRect().height / 1440 - 60);
+    const head = () => document.querySelector('[aria-label="Kalendarz"] .calendar-head').getBoundingClientRect().bottom;
+    const at = () => column.getBoundingClientRect().top + ${minute} * column.getBoundingClientRect().height / 1440;
+    body.scrollTop += at() - (head() + 60);
     const box = block.getBoundingClientRect(); const area = column.getBoundingClientRect(); const scroller = body.getBoundingClientRect();
     const x = box.left + box.width / 2, y = ${JSON.stringify(part)} === 'end' ? box.bottom - 3 : ${JSON.stringify(part)} === 'start' ? box.top + 3 : box.top + box.height / 2;
     const hit = document.elementFromPoint(x, y);
     return { x, y, perMinute: area.height / 1440, hit: hit?.closest('.calendar-block') === block ? (hit.closest('[data-edge]')?.dataset.edge ?? 'block') : String(hit?.className),
-      movable: block.hasAttribute('data-movable'), top: scroller.top, bottom: Math.min(scroller.bottom, innerHeight) };
+      movable: block.hasAttribute('data-movable'), top: Math.max(scroller.top, head()), bottom: Math.min(scroller.bottom, innerHeight), minuteAt: Math.round(at() - head()) };
   })()`);
   // A real drag: press, eight moves (past the 6 px threshold), then release (or not, to look at the ghost).
   const drag = async (point, dx, dy, { release = true } = {}) => {
     // Both ends inside the visible axis and more than 32 px from its edges, where the calendar would autoscroll.
-    for (const y of [point.y, point.y + dy]) assert.ok(y > point.top + 32 && y < point.bottom - 32, `drag point ${Math.round(y)} outside ${Math.round(point.top)}–${Math.round(point.bottom)}`);
+    for (const y of [point.y, point.y + dy]) assert.ok(y > point.top + 32 && y < point.bottom - 32, `drag point ${Math.round(y)} not 32 px inside the visible axis ${Math.round(point.top)}–${Math.round(point.bottom)} (target minute ${point.minuteAt} px below the header)`);
     await mouse('mouseMoved', point.x, point.y, { button: 'none' });
     await mouse('mousePressed', point.x, point.y, { buttons: 1, clickCount: 1 });
     for (let step = 1; step <= 8; step++) {
@@ -1582,6 +1585,7 @@ async function verifyCalendarDrag(cdp, sessionId) {
     }
   }
   await waitFor('back at 1280x720', () => evaluate('window.innerWidth === 1280 && window.innerHeight === 720'));
+  await delay(300);
 
   // AC3b: a drop while the database cannot be written: the error names it, the block is in its original place,
   // the database is unchanged and the draft is kept; one "Spróbuj ponownie" saves exactly one correction.
