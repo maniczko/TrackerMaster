@@ -1299,12 +1299,20 @@ async function verifyCalendarEntry(cdp, sessionId) {
   await evaluate(`${inDialog('textarea')}.focus()`);
   await cdp.send('Input.insertText', { text: calendarEntryFixture.description }, sessionId);
   assert.equal(await evaluate(`${inDialog('.calendar-entry-length strong')}.textContent`), '00:30:00');
-  // UI_LAYOUT of the dialog at 1280×720 and at 125 % (1024×576 CSS px): inside the window, controls ≥ 40 px, no horizontal scroll.
+  // UI_LAYOUT of the dialog at 1280×720 and at 125 % (1024×576 CSS px): inside the window, controls ≥ 40 px, no horizontal scroll,
+  // and no field drawn over another or past the dialog (c6e460a: en-US date-time fields overlapped each other and the length).
   const dialogLayout = `(() => { const box = document.querySelector(${JSON.stringify(dialog)}).getBoundingClientRect();
     const controls = [...document.querySelectorAll(${JSON.stringify(`${dialog} button, ${dialog} select, ${dialog} input[type="datetime-local"]`)})];
     return { inside: box.top >= 0 && box.left >= 0 && box.bottom <= innerHeight + 0.5 && box.right <= innerWidth + 0.5, width: Math.round(box.width), height: Math.round(box.height),
       minControl: Math.min(...controls.map(node => node.getBoundingClientRect().height)), scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth,
-      modal: document.querySelector(${JSON.stringify(dialog)}).matches(':modal') }; })()`;
+      modal: document.querySelector(${JSON.stringify(dialog)}).matches(':modal'), overlaps: (() => {
+      const parts = [...document.querySelectorAll(${JSON.stringify(`${dialog} select, ${dialog} input[type="datetime-local"], ${dialog} textarea, ${dialog} .calendar-entry-length strong, ${dialog} .actions button`)})]
+        .map(node => ({ name: node.closest('label')?.firstChild?.textContent?.trim() || node.textContent.trim() || node.tagName, rect: node.getBoundingClientRect() }));
+      const pairs = [];
+      for (const [i, a] of parts.entries()) for (const b of parts.slice(i + 1)) {
+        if (a.rect.left < b.rect.right - 0.5 && b.rect.left < a.rect.right - 0.5 && a.rect.top < b.rect.bottom - 0.5 && b.rect.top < a.rect.bottom - 0.5) pairs.push(a.name + " / " + b.name);
+      }
+      return pairs.concat(parts.filter(part => part.rect.left < box.left - 0.5 || part.rect.right > box.right + 0.5).map(part => part.name + " / dialog edge")); })() }; })()`;
   for (const [label, metrics] of [['1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }], ['1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
     await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
     try {
@@ -1315,6 +1323,7 @@ async function verifyCalendarEntry(cdp, sessionId) {
       assert.ok(layout.inside && layout.modal, `the entry dialog leaves the window at ${label}`);
       assert.ok(layout.minControl >= 40, `a dialog control is lower than 40 px at ${label}`);
       assert.ok(layout.scrollWidth <= layout.clientWidth, `the page scrolls horizontally at ${label}`);
+      assert.deepEqual(layout.overlaps, [], `dialog fields overlap at ${label}`);
       await saveScreenshot(cdp, sessionId, `calendar-entry-dialog-${label}`);
     } finally {
       await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);

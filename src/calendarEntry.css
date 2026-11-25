@@ -9,8 +9,12 @@
 .calendar-entry-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-2) var(--space-3); margin-bottom: var(--space-3); }
 .calendar-entry-row > label { display: flex; flex: 1 1 150px; flex-direction: column; gap: var(--space-1); min-width: 0; font-size: var(--text-sm); }
 .app-shell .calendar-entry-dialog select, .app-shell .calendar-entry-dialog input[type='datetime-local'] { min-height: var(--control-h); width: 100%; box-sizing: border-box; }
-.calendar-entry-length { display: flex; flex-direction: column; gap: var(--space-1); margin: 0; min-width: 84px; font-size: var(--text-sm); color: var(--color-text-muted); }
-.calendar-entry-length strong { display: flex; align-items: center; min-height: var(--control-h); color: var(--color-text); font-variant-numeric: tabular-nums; }
+/* A date-time field never gets narrower than its own text (en-US "03/11/2026 10:15:00 AM" is wider than pl);
+   when two fields and the length do not fit in one line, the next one wraps instead of overlapping (CI c6e460a). */
+.calendar-entry-row > label.calendar-entry-time { flex: 1 1 200px; min-width: auto; }
+.app-shell .calendar-entry-dialog input[type='datetime-local'] { min-width: max-content; }
+.calendar-entry-length { display: flex; align-items: center; gap: var(--space-2); min-height: var(--control-h); margin: 0; min-width: 84px; font-size: var(--text-sm); color: var(--color-text-muted); }
+.calendar-entry-length strong { color: var(--color-text); font-variant-numeric: tabular-nums; }
 .calendar-entry-description { display: flex; flex-direction: column; gap: var(--space-1); margin-bottom: var(--space-3); font-size: var(--text-sm); }
 .app-shell .calendar-entry-description textarea { min-height: calc(2 * var(--control-h)); width: 100%; box-sizing: border-box; resize: vertical; }
 .calendar-entry-billable { display: inline-flex; align-items: center; gap: var(--space-2); min-height: var(--control-h); margin-bottom: var(--space-2); font-size: var(--text-sm); cursor: pointer; }

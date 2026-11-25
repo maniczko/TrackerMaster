@@ -225,9 +225,9 @@ export default function CalendarEntryDialog({ request, zone, now, catalog, data,
               </select></label>
             </div>}
           <div className="calendar-entry-row">
-            <label>Rozpoczęcie<input ref={ref('start')} type="datetime-local" step={1} required value={form.start} disabled={timeDisabled}
+            <label className="calendar-entry-time">Rozpoczęcie<input ref={ref('start')} type="datetime-local" step={1} required value={form.start} disabled={timeDisabled}
               aria-invalid={invalid('start')} aria-describedby={described('start')} onChange={event => change({ start: event.target.value.length === 16 ? `${event.target.value}:00` : event.target.value })} /></label>
-            <label>Zakończenie<input ref={ref('end')} type="datetime-local" step={1} required value={form.end} disabled={timeDisabled}
+            <label className="calendar-entry-time">Zakończenie<input ref={ref('end')} type="datetime-local" step={1} required value={form.end} disabled={timeDisabled}
               aria-invalid={invalid('end')} aria-describedby={described('end')} onChange={event => change({ end: event.target.value.length === 16 ? `${event.target.value}:00` : event.target.value })} /></label>
             <p className="calendar-entry-length" aria-live="polite"><span>Czas</span> <strong>{length ?? '—'}</strong></p>
           </div>
