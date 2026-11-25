@@ -1,0 +1,29 @@
+/* Calendar add/edit dialog (DEV-26): Quiet Precision tokens from app.css only; 40 px controls. */
+/* The dialog keeps the details class (Enter/Esc contract of package A) but is a centred modal, not a side panel. */
+.app-shell dialog.calendar-entry-dialog { position: fixed; inset: 0; top: 0; right: 0; margin: auto; width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+  box-sizing: border-box; overflow-y: auto; padding: var(--space-5) var(--space-6); color: var(--color-text); background: var(--color-surface);
+  border: 1px solid var(--color-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-control); }
+.calendar-entry-dialog::backdrop { background: var(--color-backdrop); }
+.calendar-entry-dialog h3 { margin: 0 0 var(--space-1); }
+.calendar-entry-dialog form > .helper { margin: 0 0 var(--space-3); }
+.calendar-entry-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-2) var(--space-3); margin-bottom: var(--space-3); }
+.calendar-entry-row > label { display: flex; flex: 1 1 150px; flex-direction: column; gap: var(--space-1); min-width: 0; font-size: var(--text-sm); }
+.app-shell .calendar-entry-dialog select, .app-shell .calendar-entry-dialog input[type='datetime-local'] { min-height: var(--control-h); width: 100%; box-sizing: border-box; }
+/* A date-time field never gets narrower than its own text (en-US "03/11/2026 10:15:00 AM" is wider than pl);
+   when two fields and the length do not fit in one line, the next one wraps instead of overlapping (CI c6e460a). */
+.calendar-entry-row > label.calendar-entry-time { flex: 1 1 200px; min-width: auto; }
+.app-shell .calendar-entry-dialog input[type='datetime-local'] { min-width: max-content; }
+.calendar-entry-length { display: flex; align-items: center; gap: var(--space-2); min-height: var(--control-h); margin: 0; min-width: 84px; font-size: var(--text-sm); color: var(--color-text-muted); }
+.calendar-entry-length strong { color: var(--color-text); font-variant-numeric: tabular-nums; }
+.calendar-entry-description { display: flex; flex-direction: column; gap: var(--space-1); margin-bottom: var(--space-3); font-size: var(--text-sm); }
+.app-shell .calendar-entry-description textarea { min-height: calc(2 * var(--control-h)); width: 100%; box-sizing: border-box; resize: vertical; }
+.calendar-entry-billable { display: inline-flex; align-items: center; gap: var(--space-2); min-height: var(--control-h); margin-bottom: var(--space-2); font-size: var(--text-sm); cursor: pointer; }
+.calendar-entry-billable input { width: 20px; height: 20px; margin: 0; }
+.calendar-entry-target { margin: 0 0 var(--space-3); }
+.calendar-entry-target .helper { grid-column: 1 / -1; margin: 0; }
+.calendar-entry-dialog .alert { margin: 0 0 var(--space-2); }
+.calendar-entry-dialog .actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3); }
+.app-shell .calendar-entry-dialog .actions button { min-height: var(--control-h); min-width: 112px; }
+/* Empty slots: a click adds an entry at that quarter-hour. */
+.calendar-column[data-addable] { cursor: cell; }
+.app-shell .calendar-add { min-height: var(--control-h); }

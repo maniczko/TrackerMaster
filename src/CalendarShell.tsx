@@ -10,6 +10,8 @@ import CalendarMonth from './CalendarMonth';
 type Props = {
   report: AllClientsReport; catalog: ReportCatalog; loaded: boolean; now: number;
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean;
+  /** DEV-26: the week adds and edits entries; the month stays read only. */
+  editable: boolean; onEntrySaved: () => Promise<void>;
 };
 type Mode = 'week' | 'month';
 const MODE_KEY = 'trackermaster.calendar.mode.v1';

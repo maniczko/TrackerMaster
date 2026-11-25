@@ -170,7 +170,7 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
               </li>)}
             </ul>}
           <div className="actions"><button type="button" className="primary" onClick={() => onOpenWeek(chosen.date)}>Pokaż tydzień</button></div>
-          <p className="helper">Kalendarz tylko pokazuje wpisy. Popraw wpis w Historii.</p>
+          <p className="helper">Miesiąc tylko pokazuje wpisy. Dodasz lub poprawisz wpis w tygodniu („Pokaż tydzień”) albo w Historii.</p>
         </div>}
       </>}
   </section>;

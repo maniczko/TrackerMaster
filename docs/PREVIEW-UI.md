@@ -42,7 +42,7 @@ Bezpośrednie adresy (tylko podgląd):
 - `…&view=calendar&week=2026-11-16` — tydzień, w którym jest podany dzień;
 - `…&view=timer` — powrót do widoku Timer.
 
-Kalendarz tylko pokazuje wpisy (edycja i dodawanie: pakiet B). Sumy dni i tygodnia liczy ta sama funkcja co raport (`makeReportView` → `reportByDay`).
+Sumy dni i tygodnia liczy ta sama funkcja co raport (`makeReportView` → `reportByDay`).
 
 ## Kalendarz (miesiąc, pakiet C)
 
@@ -55,3 +55,13 @@ Bezpośrednie adresy (tylko podgląd):
 - `…&calendar=week` — powrót do tygodnia.
 
 Sumy komórek i miesiąca to sumy dni z `calendarWeek` (DEV-24), czyli ta sama funkcja co raport (`makeReportView` → `reportByDay`).
+
+## Kalendarz: dodawanie i edycja (pakiet B, DEV-26)
+
+- **Klik pustego miejsca** w kolumnie dnia otwiera „Nowy wpis” od najbliższego wcześniejszego kwadransa, z końcem 30 minut później. Z klawiatury to samo daje przycisk **+ Wpis** obok wyboru daty.
+- **Klik zakończonego wpisu** otwiera ten sam formularz w trybie edycji: godziny, opis i rozliczalność. Klienta, projektu ani zadania zapisanego wpisu nie zmienisz. Trwający pomiar, pomiar do weryfikacji i wpis z uśpieniem do rozstrzygnięcia pokazują tylko szczegóły.
+- Formularz od razu pokazuje błędy po polsku: nakładanie się na inny pomiar, koniec nie po początku, czas w przyszłości, nieistniejąca (29.03) lub powtórzona (25.10) godzina przy zmianie czasu.
+- Enter zapisuje, Esc zamyka bez zapisu, Tab nie wychodzi poza okno dialogu.
+- `…&failsave=1`: pierwszy zapis kończy się błędem zapisu danych lokalnych. Formularz zostaje z danymi, a „Spróbuj ponownie” zapisuje raz. Tak w podglądzie klika się ścieżkę błędu zapisu.
+
+Mock w `preview/mockCore.ts` sprawdza te same reguły i zwraca te same komunikaty co backend, ale to nie jest backend: atomowość zapisu, szkice na dysku i ponowienie bez duplikatu sprawdzają testy Rust i E2E Windows.

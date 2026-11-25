@@ -32,7 +32,7 @@ jobs:
       - name: Check frontend
         run: npm run build
       - name: Check report calculations
-        run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts tests/reportPresets.test.ts tests/reportFilterStorage.test.ts tests/reportCsv.test.ts tests/shortcut.test.ts tests/localDateTime.test.ts tests/messageText.test.ts tests/reportGlance.test.ts tests/historyFormat.test.ts tests/calendarModel.test.ts tests/calendarMonthModel.test.ts tests/reportDay.test.ts tests/reportSummaryModel.test.ts tests/timerChoice.test.ts tests/plural.test.ts tests/sleepPeriods.test.mjs tests/sleepTime.test.ts tests/entryDraft.test.ts tests/clientLabels.test.ts tests/reportRefresh.test.mjs
+        run: node --test tests/reportTime.test.ts tests/reportClientFilter.test.ts tests/reportPresets.test.ts tests/reportFilterStorage.test.ts tests/reportCsv.test.ts tests/shortcut.test.ts tests/localDateTime.test.ts tests/messageText.test.ts tests/reportGlance.test.ts tests/historyFormat.test.ts tests/calendarModel.test.ts tests/calendarMonthModel.test.ts tests/calendarEntry.test.ts tests/reportDay.test.ts tests/reportSummaryModel.test.ts tests/timerChoice.test.ts tests/plural.test.ts tests/sleepPeriods.test.mjs tests/sleepTime.test.ts tests/entryDraft.test.ts tests/clientLabels.test.ts tests/reportRefresh.test.mjs
       - name: Check mini timer model and keyboard transitions
         run: node --test tests/miniTimer.test.ts
       - name: Check UI design tokens, contrast and font sizes

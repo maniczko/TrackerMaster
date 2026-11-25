@@ -6,6 +6,7 @@ mod power_events;
 mod optional_task_migration;
 mod ui_preferences;
 mod entry_drafts;
+mod calendar_entry;
 mod editor_close;
 #[cfg(windows)]
 mod quit_dialog;
@@ -653,6 +654,12 @@ fn set_project_billing(db: &mut Connection, project_id: i64, expected: bool, bil
 
 fn set_entry_billing(db: &mut Connection, entry_id: i64, expected: bool, billable: bool, changed_at: &str) -> Cmd<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
+    update_entry_billing(&tx, entry_id, expected, billable, changed_at)?;
+    tx.commit().map_err(db_err)
+}
+
+/// Billing change on the caller's transaction (also a correction from the calendar, DEV-26), with its revision.
+fn update_entry_billing(tx: &rusqlite::Transaction<'_>, entry_id: i64, expected: bool, billable: bool, changed_at: &str) -> Cmd<()> {
     let current: Option<bool> = tx.query_row("SELECT EXISTS(SELECT 1 FROM billable_entries b WHERE b.entry_id=time_entries.id) FROM time_entries WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=time_entries.id)", [entry_id], |r| r.get(0)).optional().map_err(db_err)?;
     if current != Some(expected) { return Err("Wpis zmienił się lub został usunięty. Odśwież dane.".into()); }
     if expected != billable {
@@ -660,7 +667,7 @@ fn set_entry_billing(db: &mut Connection, entry_id: i64, expected: bool, billabl
         else { tx.execute("DELETE FROM billable_entries WHERE entry_id=?1", [entry_id]).map_err(db_err)?; }
         tx.execute("INSERT INTO billing_revisions(entry_id,changed_at,before_billable,after_billable) VALUES(?1,?2,?3,?4)", params![entry_id,changed_at,expected,billable]).map_err(db_err)?;
     }
-    tx.commit().map_err(db_err)
+    Ok(())
 }
 
 fn set_description(db: &mut Connection, entry_id: i64, expected: &str, description: &str, changed_at: &str) -> Cmd<()> {
@@ -1234,9 +1241,14 @@ fn create_manual_entry(state: State<'_, Shared>, task_id: i64, started_at: Strin
 }
 
 #[tauri::command]
-fn create_project_manual_entry(state: State<'_, Shared>, project_id: i64, task_id: Option<i64>, started_at: String, ended_at: String, description: Option<String>) -> Cmd<Snapshot> {
+fn create_project_manual_entry(state: State<'_, Shared>, project_id: i64, task_id: Option<i64>, started_at: String, ended_at: String, description: Option<String>, billable: Option<bool>) -> Cmd<Snapshot> {
     let mut tracker=locked(&state)?;
-    optional_task_migration::insert_manual(&mut tracker,project_id,task_id,&started_at,&ended_at,Utc::now(),description.as_deref().unwrap_or(""))?;
+    let description = description.as_deref().unwrap_or("");
+    match billable {
+        // DEV-26: the calendar form sends the billing chosen by the user; it is saved in the entry's own transaction.
+        Some(billable) => { calendar_entry::insert_entry(&mut tracker.db,project_id,task_id,&started_at,&ended_at,Utc::now(),description,billable)?; }
+        None => { optional_task_migration::insert_manual(&mut tracker,project_id,task_id,&started_at,&ended_at,Utc::now(),description)?; }
+    }
     snapshot(&tracker)
 }
 

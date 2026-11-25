@@ -94,6 +94,10 @@ pub(super) enum DraftApplication {
         base: DraftSource,
         range: Option<DraftRange>,
         description: String,
+        /// DEV-26: billing chosen in the calendar form, saved with the time and description.
+        /// Absent (the History editor, older callers): billing stays as it is.
+        #[serde(default)]
+        billable: Option<bool>,
     },
     NewEntry {
         database_id: String,
@@ -464,6 +468,7 @@ fn resolve_draft(
             base,
             range,
             description,
+            billable,
         } => {
             if base.entry_id != origin
                 || base.database_id != draft.source.database_id
@@ -485,6 +490,9 @@ fn resolve_draft(
                 )?;
             }
             crate::update_description(&tx, origin, &base.description, &description, &changed_at)?;
+            if let Some(billable) = billable {
+                crate::update_entry_billing(&tx, origin, base.billable, billable, &changed_at)?;
+            }
             (origin, CORRECTION)
         }
         DraftApplication::NewEntry {
@@ -830,6 +838,7 @@ mod tests {
             base: source.clone(),
             range: Some(range("2026-01-01T10:30:00.000Z")),
             description: "Odzyskany opis".into(),
+            billable: None,
         };
         db.execute_batch(
             "CREATE TRIGGER reject_resolution BEFORE INSERT ON entry_draft_resolutions
@@ -887,6 +896,7 @@ mod tests {
             base: source.clone(),
             range,
             description: "Opis po śnie".into(),
+            billable: None,
         };
         assert!(resolve_draft(
             &mut db,
@@ -916,6 +926,58 @@ mod tests {
             .unwrap();
         assert_eq!(periods, 1);
         discard_draft(&dir, 1, &draft.revision).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    // DEV-26: the calendar saves time, description and billing of one entry as one correction.
+    #[test]
+    fn calendar_correction_with_billing_is_atomic_and_retry_safe() {
+        let mut db = database();
+        let source = read_source(&db, 1).unwrap().unwrap();
+        assert!(!source.billable);
+        let dir = test_directory("calendar-billing");
+        let draft = persist_draft(&dir, source.clone(), fields("Z kalendarza"), None).unwrap();
+        let application = || DraftApplication::Correction {
+            base: source.clone(),
+            range: Some(range("2026-01-01T10:30:00.000Z")),
+            description: "Z kalendarza".into(),
+            billable: Some(true),
+        };
+        let count = |db: &Connection, table: &str| -> i64 {
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
+        };
+        // The last write of the correction fails: time and description must roll back with it.
+        db.execute_batch(
+            "CREATE TRIGGER reject_billing_revision BEFORE INSERT ON billing_revisions
+             BEGIN SELECT RAISE(ABORT, 'write failed'); END;",
+        )
+        .unwrap();
+        assert!(resolve_draft(&mut db, &draft, application(), test_now()).is_err());
+        assert_eq!(read_source(&db, 1).unwrap(), Some(source.clone()));
+        assert_eq!(find_resolution(&db, 1, &draft.revision).unwrap(), None);
+        assert_eq!(list_drafts(&dir).unwrap().drafts, vec![draft.clone()]);
+        for table in ["entry_revisions", "description_revisions", "billing_revisions", "billable_entries"] {
+            assert_eq!(count(&db, table), 0, "{table} changed by a failed correction");
+        }
+        db.execute_batch("DROP TRIGGER reject_billing_revision").unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(resolve_draft(&mut db, &draft, application(), test_now()).unwrap(), 1);
+        }
+        let edited = read_source(&db, 1).unwrap().unwrap();
+        assert_eq!((edited.description.as_str(), edited.duration_seconds, edited.billable), ("Z kalendarza", 5400, true));
+        for table in ["entry_revisions", "description_revisions", "billing_revisions", "entry_draft_resolutions"] {
+            assert_eq!(count(&db, table), 1, "{table} after one correction and one retry");
+        }
+        // Without a billing choice (History editor) billing is left alone.
+        let next = read_source(&db, 1).unwrap().unwrap();
+        // (resolve_draft keeps the file; apply_entry_draft removes it after commit.)
+        let other = persist_draft(&dir, next.clone(), fields("Tylko opis"), Some(&draft.revision)).unwrap();
+        let only_description = DraftApplication::Correction { base: next, range: None, description: "Tylko opis".into(), billable: None };
+        resolve_draft(&mut db, &other, only_description, test_now()).unwrap();
+        assert!(read_source(&db, 1).unwrap().unwrap().billable);
+        assert_eq!(count(&db, "billing_revisions"), 1);
+        discard_draft(&dir, 1, &other.revision).unwrap();
         fs::remove_dir(dir).unwrap();
     }
 

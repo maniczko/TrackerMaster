@@ -179,7 +179,10 @@ export function reportByDay(entries: ReportEntry[], from: string, through: strin
       continue;
     }
     const included = segments.filter(segment => inRange(segment.date) && segment.seconds > 0);
+    // Under a whole second in the range (e.g. a timer started a moment ago): still a 0 s entry of the
+    // range, as for a zero-length one, so the running timer is not missing from the report and calendar.
     if (included.length) addEntry(entry.id, included, 0, false);
+    else if (entry.duration_seconds === 0 && segments.some(segment => inRange(segment.date))) addEntry(entry.id, [], 0, false);
   }
   const days = [...totals].sort(([a], [b]) => a.localeCompare(b)).map(([date, seconds]) => ({ date, seconds }));
   const totalSeconds = days.reduce((sum, day) => sum + day.seconds, 0);
