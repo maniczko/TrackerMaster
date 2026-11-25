@@ -168,3 +168,12 @@ test('calendarMove.css has no raw colours, no own custom properties and token fo
   assert.doesNotMatch(css, /--[\w-]+\s*:/);
   for (const [, value] of css.matchAll(/font-size:\s*([^;]+);/g)) assert.match(value.trim(), /^var\(--text-(xs|sm|md|lg|xl)\)$/);
 });
+
+// E2E AC4 (run 45623333020): Alt+Shift+arrows move only the end by 15 minutes and keep its seconds and the start.
+test('keyboard end step keeps the seconds of both ends', () => {
+  const e = entry('2026-02-19T08:15:00Z', '2026-02-19T08:45:27Z');
+  const longer = check(keyFields('longer', e, zone), e);
+  assert.ok(longer.ok);
+  assert.deepEqual(longer.fields, { start: '2026-02-19T09:15:00', end: '2026-02-19T10:00:27' });
+  assert.equal(proposalSeconds(longer.startMs, longer.endMs), 2727);
+});
