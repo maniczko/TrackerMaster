@@ -43,3 +43,15 @@ Bezpośrednie adresy (tylko podgląd):
 - `…&view=timer` — powrót do widoku Timer.
 
 Kalendarz tylko pokazuje wpisy (edycja i dodawanie: pakiet B). Sumy dni i tygodnia liczy ta sama funkcja co raport (`makeReportView` → `reportByDay`).
+
+## Kalendarz (miesiąc, pakiet C)
+
+W kalendarzu przełącznik **Tydzień | Miesiąc** zmienia zakres. Miesiąc to siatka Pon–Nd (4–6 wierszy). W komórce są: data, suma dnia HH:MM, do trzech skróconych wpisów i „+N”. Dni sąsiednich miesięcy są wyszarzone i nie wliczają się do sumy miesiąca. Klik albo Enter na dniu otwiera listę jego wpisów (tylko odczyt) z przyciskiem „Pokaż tydzień”. Strzałki przechodzą między dniami, a Home/End na początek i koniec tygodnia. Podgląd ma wpisy na dniach od 8 do 45 dni wstecz, dzień z pięcioma krótkimi wpisami (12.) i wpis 23:50–00:10 na przełomie miesiąca.
+
+Bezpośrednie adresy (tylko podgląd):
+
+- `http://127.0.0.1:1430/index.html?scenario=running&view=calendar&calendar=month` — bieżący miesiąc;
+- `…&calendar=month&month=2026-10` — wybrany miesiąc;
+- `…&calendar=week` — powrót do tygodnia.
+
+Sumy komórek i miesiąca to sumy dni z `calendarWeek` (DEV-24), czyli ta sama funkcja co raport (`makeReportView` → `reportByDay`).

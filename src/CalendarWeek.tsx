@@ -1,34 +1,37 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { calendarWeek, clockText, DAY_MINUTES, MIN_BLOCK_PX, pieceRange, shiftWeek, validCalendarDate, weekLabel, weekStartOf } from './calendarModel';
 import type { CalendarBillable, CalendarBlock, CalendarClockEntry, CalendarFilter } from './calendarModel';
 import { formatDuration as duration } from './reportCsv';
 import { dateInZone } from './reportTime';
-import { allReportClients, changeReportScope, resolveReportScope } from './reportScope';
+import { allReportClients, resolveReportScope } from './reportScope';
 import type { ReportCatalog, ReportScope } from './reportScope';
 import type { AllClientsReport } from './useAllClientsReport';
-import { clientLabels } from './clientLabels';
+import CalendarFilters from './CalendarFilters';
 import './calendar.css';
 
 type Props = {
   report: AllClientsReport; catalog: ReportCatalog; loaded: boolean; now: number;
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean;
+  /** DEV-25: open on the week of this day (from the month view); the Tydzień | Miesiąc switch. */
+  initialWeek?: string; viewSwitch?: ReactNode;
 };
 
 // Convenience only (DEV-28): the last week and filters. Never a source of data; failures are ignored.
 const STORAGE_KEY = 'trackermaster.calendar.v1';
-type Saved = { week?: string; scope?: ReportScope; billable?: CalendarBillable };
-function readSaved(): Saved {
+export type Saved = { week?: string; month?: string; scope?: ReportScope; billable?: CalendarBillable };
+export function readSaved(): Saved {
   try {
     const value = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? 'null');
     if (!value || typeof value !== 'object') return {};
     const id = (item: unknown) => item === null || (Number.isSafeInteger(item) && (item as number) > 0);
     const scope = value.scope && id(value.scope.clientId) && id(value.scope.projectId) && id(value.scope.taskId) ? value.scope as ReportScope : undefined;
-    return { week: validCalendarDate(value.week) ? weekStartOf(value.week) : undefined, scope,
+    return { week: validCalendarDate(value.week) ? weekStartOf(value.week) : undefined, month: typeof value.month === 'string' ? value.month : undefined, scope,
       billable: ['all', 'billable', 'nonbillable'].includes(value.billable) ? value.billable : undefined };
   } catch { return {}; }
 }
-function save(value: Saved) { try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value)); } catch { /* convenience only */ } }
+// Week and month keep each other's last position and share the filters (DEV-25).
+export function save(value: Saved) { try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...readSaved(), ...value })); } catch { /* convenience only */ } }
 
 // 40 px per hour: about 10 hours of the axis at 1280×720 and 6 at 125 % DPI (PO, PR #63 review).
 const HOUR_PX = 40;
@@ -51,11 +54,11 @@ function blockLabel(block: CalendarBlock): string {
   return `${block.title} — ${block.path}, ${pieceRange(block)}, ${state}`;
 }
 
-export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh }: Props) {
+export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, initialWeek, viewSwitch }: Props) {
   const [saved] = useState(readSaved);
   const zone = report.read?.data.time_zone;
   const today = zone ? (() => { try { return dateInZone(now, zone); } catch { return null; } })() : null;
-  const [week, setWeek] = useState<string | null>(saved.week ?? null);
+  const [week, setWeek] = useState<string | null>(initialWeek && validCalendarDate(initialWeek) ? weekStartOf(initialWeek) : saved.week ?? null);
   const [scope, setScope] = useState<ReportScope>(saved.scope ?? allReportClients);
   const [billable, setBillable] = useState<CalendarBillable>(saved.billable ?? 'all');
   const [selected, setSelected] = useState<string | null>(null);
@@ -80,7 +83,6 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const blocks = view ? view.days.flatMap(day => day.blocks) : [];
   const chosen = blocks.find(block => block.key === selected) ?? null;
   const filtered = scope.clientId !== null || billable !== 'all';
-  const clientLabelById = useMemo(() => clientLabels(catalog.clients as { id: number | string; name: string }[]), [catalog.clients]);
 
   // Scroll once per week: this week to two hours before now, other weeks to about 08:00.
   useLayoutEffect(() => {
@@ -114,15 +116,10 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   }
   function onDialogKey(event: ReactKeyboardEvent) { if (event.key === 'Escape') { event.preventDefault(); close(); } }
   function go(next: string | null) { setSelected(null); setWeek(next); }
-  function changeScope(field: keyof ReportScope, value: string) {
-    const next = changeReportScope(scope, field, value ? Number(value) : null, catalog);
-    setScope(next.scope); setScopeNotice(next.message);
-  }
-  const projectChoices = catalog.projects.filter(item => Number(item.client_id) === scope.clientId);
-  const taskChoices = catalog.tasks.filter(item => Number(item.project_id) === scope.projectId);
 
   return <section className="card calendar" aria-label="Kalendarz">
     <div className="calendar-toolbar">
+      {viewSwitch}
       <div className="calendar-nav" role="group" aria-label="Wybór tygodnia">
         <button type="button" className="secondary" aria-label="Poprzedni tydzień" disabled={!shownWeek} onClick={() => shownWeek && go(shiftWeek(shownWeek, -1))}>‹</button>
         <button type="button" className="secondary" aria-label="Następny tydzień" disabled={!shownWeek} onClick={() => shownWeek && go(shiftWeek(shownWeek, 1))}>›</button>
@@ -131,23 +128,8 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
           onChange={event => { if (validCalendarDate(event.target.value)) go(weekStartOf(event.target.value)); }} />
       </div>
       <h2 className="calendar-range">{view ? weekLabel(view.from, view.through) : 'Tydzień'}</h2>
-      <div className="calendar-filters" role="group" aria-label="Filtry kalendarza">
-      <select aria-label="Klient" title="Klient" value={scope.clientId ?? ''} onChange={event => changeScope('clientId', event.target.value)}>
-        <option value="">Wszyscy klienci</option>
-        {catalog.clients.map(item => <option key={item.id} value={item.id}>{clientLabelById.get(String(item.id)) ?? item.name}{item.archived ? ' (archiwum)' : ''}</option>)}
-      </select>
-      <select aria-label="Projekt" title="Projekt" value={scope.projectId ?? ''} disabled={!resolved.client} onChange={event => changeScope('projectId', event.target.value)}>
-        <option value="">{resolved.client ? 'Wszystkie projekty' : 'Projekt: najpierw klient'}</option>
-        {projectChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.archived ? ' (archiwum)' : ''}</option>)}
-      </select>
-      <select aria-label="Zadanie" title="Zadanie" value={scope.taskId ?? ''} disabled={!resolved.project} onChange={event => changeScope('taskId', event.target.value)}>
-        <option value="">{resolved.project ? 'Wszystkie zadania' : 'Zadanie: najpierw projekt'}</option>
-        {taskChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.archived ? ' (archiwum)' : ''}</option>)}
-      </select>
-      <select aria-label="Rozliczalność" title="Rozliczalność" value={billable} onChange={event => setBillable(event.target.value as CalendarBillable)}>
-        <option value="all">Rozliczalne i nie</option><option value="billable">Tylko rozliczalne</option><option value="nonbillable">Tylko nierozliczalne</option>
-      </select>
-      </div>
+      <CalendarFilters catalog={catalog} scope={scope} billable={billable} resolved={resolved}
+        onScope={(next, message) => { setScope(next); setScopeNotice(message); }} onBillable={setBillable} />
       <p className="calendar-total"><span>{filtered ? 'Suma (filtry)' : 'Suma'}</span> <strong className="calendar-week-total" aria-live="off">{view ? duration(view.weekSeconds) : '—'}</strong>
         <button type="button" className="secondary calendar-info" aria-label="Jak liczone są sumy" aria-expanded={noteOpen} aria-controls="calendar-scope-note" title={scopeNote(filtered, zone)} onClick={() => setNoteOpen(open => !open)}><span aria-hidden="true">i</span></button></p>
     </div>
