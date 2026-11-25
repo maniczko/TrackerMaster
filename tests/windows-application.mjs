@@ -1442,11 +1442,13 @@ async function verifyCalendarDrag(cdp, sessionId) {
       dialog: Boolean(document.querySelector('dialog.calendar-entry-dialog')) }; })()`;
   const blockOf = description => `[...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-block')].find(node => node.getAttribute('aria-label').startsWith(${JSON.stringify(description)}))`;
   const labelOf = description => evaluate(`${blockOf(description)}?.getAttribute('aria-label') ?? null`);
-  // Scrolls the day axis so `minute` is 60 px below the top of the scroll area (away from the autoscroll edges),
+  // Scrolls the page and then the day axis so `minute` is 60 px below the top of the scroll area (away from the autoscroll edges),
   // then returns the block's box, its column and the point to press: the middle, or 3 px inside an edge handle.
   const grip = (description, part, minute) => evaluate(`(() => {
     const body = document.querySelector('.calendar-body'); const block = ${blockOf(description)};
     const column = block.closest('.calendar-column');
+    // The page first: at 125 % a message above the grid pushes it down, so the day header goes to the window top.
+    document.querySelector('[aria-label="Kalendarz"] .calendar-head').scrollIntoView({ block: 'start' });
     body.scrollTop = Math.max(0, ${minute} * column.getBoundingClientRect().height / 1440 - 60);
     const box = block.getBoundingClientRect(); const area = column.getBoundingClientRect(); const scroller = body.getBoundingClientRect();
     const x = box.left + box.width / 2, y = ${JSON.stringify(part)} === 'end' ? box.bottom - 3 : ${JSON.stringify(part)} === 'start' ? box.top + 3 : box.top + box.height / 2;
