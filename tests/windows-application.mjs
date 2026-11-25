@@ -1623,10 +1623,10 @@ async function verifyCalendarDrag(cdp, sessionId) {
   assert.equal(last.dialog, false, 'Enter after Alt+arrows saves the move, it does not open the form');
   now = rows();
   assert.deepEqual(now[2], { ...c, started_at: '2026-02-19T08:15:00.000Z', ended_at: '2026-02-19T08:45:27.000Z', duration_seconds: 1827, timeRevisions: 1, resolutions: 1 });
-  // Alt+Shift+↓ then Escape: cancelled, nothing saved.
+  // Alt+Shift+↓ then Escape: only the end moves by 15 minutes and keeps its seconds (09:45:27 → 10:00:27, 2727 s); cancelled, nothing saved.
   await evaluate(`${blockOf(fixture.keyboard[2])}.focus()`);
   await key('ArrowDown', 'ArrowDown', 40, 1 | 8);
-  await settle('keyboard resize proposal', value => value.status.includes(`Wpis #${c.id}: 19.02 09:15–10:00 (00:45:00).`));
+  await settle('keyboard resize proposal', value => value.status.includes(`Wpis #${c.id}: 19.02 09:15–10:00 (00:45:27).`));
   await key('Escape', 'Escape', 27);
   await settle('keyboard move cancelled', value => (value.error ?? '').includes('Przesunięcie anulowane. Wpis został na swoim miejscu.') && value.ghosts.length === 0);
   assert.deepEqual(rows(), now, 'a cancelled keyboard move changed the database');
