@@ -65,3 +65,20 @@ Sumy komórek i miesiąca to sumy dni z `calendarWeek` (DEV-24), czyli ta sama f
 - `…&failsave=1`: pierwszy zapis kończy się błędem zapisu danych lokalnych. Formularz zostaje z danymi, a „Spróbuj ponownie” zapisuje raz. Tak w podglądzie klika się ścieżkę błędu zapisu.
 
 Mock w `preview/mockCore.ts` sprawdza te same reguły i zwraca te same komunikaty co backend, ale to nie jest backend: atomowość zapisu, szkice na dysku i ponowienie bez duplikatu sprawdzają testy Rust i E2E Windows.
+
+## Kalendarz: przeciąganie i zmiana długości (DEV-38)
+
+W widoku tygodnia (`…&view=calendar&calendar=week`), np. scenariusz `stopped`:
+
+- **Przeciągnij zakończony wpis** na inną godzinę lub inny dzień. Wpis zachowuje długość, a początek ląduje na siatce 15 minut. Przeciąganie startuje dopiero po 6 px ruchu, więc zwykły klik nadal otwiera formularz z DEV-26.
+- **Uchwyty górnej i dolnej krawędzi** (kursor `ns-resize`) zmieniają tylko początek albo tylko koniec. Drugi koniec zostaje co do sekundy, bo backend zachowuje niezmienioną granicę (#58).
+- W trakcie przeciągania półprzezroczysty „duch” pokazuje nowe miejsce. Na czerwono oznacza miejsce niedozwolone: nakładanie (D10), przyszłość, koniec przed początkiem, godzinę zmiany czasu. Pływający komunikat na dole okna (`aria-live`) podaje godziny albo powód. Esc anuluje.
+- **Klawiatura** na zaznaczonym bloku:
+  - Alt+↑/↓ przesuwa wpis o ±15 min, Alt+←/→ o ±1 dzień;
+  - Alt+Shift+↑/↓ zmienia koniec o ±15 min;
+  - Enter zapisuje, Esc anuluje.
+- Zapis idzie tą samą korektą co formularz (szkic → `apply_entry_draft`). Do czasu odświeżenia danych blok zostaje na starym miejscu, a duch pokazuje zapisywane miejsce.
+- `…&failsave=1`: pierwszy zapis się nie udaje. Blok zostaje na swoim miejscu, a komunikat oferuje „Spróbuj ponownie” (ten sam szkic, zapis raz) albo „Odrzuć zmianę”.
+- Nie przesuwa się: trwającego lub odzyskanego pomiaru, pomiaru do weryfikacji ani wpisu z uśpieniem. Widok miesiąca jest tylko do odczytu.
+
+Zrzuty: `docs/screenshots/calendar-drag-*.png` (1280×720 i 125 % DPI).

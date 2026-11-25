@@ -1,0 +1,27 @@
+/* DEV-38: moving and resizing calendar blocks. Quiet Precision tokens from app.css only. */
+/* A movable block shows the grab cursor; touch-action keeps a pen or touch press from scrolling while dragging. */
+.app-shell .calendar-block[data-movable] { cursor: grab; touch-action: none; }
+.app-shell .calendar-block[data-moving] { opacity: 0.45; }
+/* Resize handles: the full width of the block's top and bottom edge (8 px), a visible grip on hover and focus. */
+.app-shell .calendar-block > .calendar-handle { position: absolute; left: 0; right: 0; z-index: 1; display: flex; justify-content: center; height: 8px; cursor: ns-resize; }
+.app-shell .calendar-block > .calendar-handle[data-edge='start'] { top: 0; align-items: flex-start; }
+.app-shell .calendar-block > .calendar-handle[data-edge='end'] { bottom: 0; align-items: flex-end; }
+.calendar-handle::after { content: ''; width: 24px; height: 3px; margin: 1px 0; border-radius: var(--radius-sm); background: var(--color-text-muted); opacity: 0; }
+.app-shell .calendar-block:hover .calendar-handle::after, .app-shell .calendar-block:focus-visible .calendar-handle::after { opacity: 1; }
+/* The proposed place while dragging or saving; red with a dashed edge when it may not be saved. */
+.calendar-ghost { position: absolute; left: 2px; right: 2px; z-index: 3; box-sizing: border-box; padding: 2px var(--space-2); border: 2px dashed var(--color-accent-strong); border-radius: var(--radius-sm);
+  background: var(--color-accent-soft); color: var(--color-text); font-size: var(--text-xs); pointer-events: none; }
+.calendar-ghost[data-invalid] { border-color: var(--color-error-border); background: var(--color-error-bg); color: var(--color-error-text); }
+.calendar-ghost[data-saving] { border-style: solid; }
+.calendar-ghost small { font-weight: 650; }
+/* The live status (aria-live, always in the DOM): floats at the bottom of the window while a move is proposed,
+   so it never pushes the grid under the pointer during a drag. Hidden while empty. */
+.calendar-move-status { position: fixed; z-index: 20; left: 50%; bottom: var(--space-4); transform: translateX(-50%); box-sizing: border-box; width: max-content;
+  max-width: calc(100vw - 2 * var(--space-4)); margin: 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  background: var(--color-surface); box-shadow: var(--shadow-card); font-size: var(--text-sm); color: var(--color-text); pointer-events: none; }
+.calendar-move-status:empty { display: none; }
+.calendar-move-status[data-problem] { border-color: var(--color-error-border); background: var(--color-error-bg); color: var(--color-error-text); }
+.calendar-move-error { margin: 0 0 var(--space-2); }
+.calendar-move-error p { margin: 0 0 var(--space-2); }
+.calendar-move-error .actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.app-shell .calendar-move-error .actions button { min-height: var(--control-h); }
