@@ -20,7 +20,13 @@ try {
   const text = readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
   const before = 'function calendarPieces(zone: string) {\n  type Slice = { until: number; date: string };\n  const cache = new Map<number, Slice[]>();';
   const after = 'type Slice = { until: number; date: string };\nconst persistentBuckets = new Map<string, Map<number, Slice[]>>();\nfunction calendarPieces(zone: string) {\n  let cache = persistentBuckets.get(zone);\n  if (!cache) persistentBuckets.set(zone, cache = new Map<number, Slice[]>());';
-  if (!text.includes(before)) throw new Error('reportTime.calendarPieces changed; update the prototype patch.');
+  if (!text.includes(before)) {
+    if (text.includes('dayBoundaryCache')) {
+      console.log('The persistent day-boundary cache is already in src/reportTime.ts (TECH-15). Measure it with docs/tech14/bench-report.mjs.');
+      process.exitCode = 0;
+    } else throw new Error('reportTime.calendarPieces changed; update the prototype patch.');
+  }
+  else {
   writeFileSync(file, text.replace(before, after).replace('const stored = cache.get(day);', 'const stored = cache!.get(day);').replace('cache.set(day, slices);', 'cache!.set(day, slices);'));
   const { makeReportView: cached } = await import(pathToFileURL(join(work, 'reportView.ts')).href);
 
@@ -47,6 +53,7 @@ try {
     }
   }
   console.log('\nCzasy: mediana / p95 w ms (Node).');
+  }
 } finally {
   rmSync(work, { recursive: true, force: true });
 }
