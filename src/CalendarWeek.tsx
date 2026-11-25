@@ -102,7 +102,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const filtered = scope.clientId !== null || billable !== 'all';
   // DEV-38: drag, resize and Alt+arrows; saved through the same correction as the form.
   const move = useCalendarMove({ view, blocks, data: report.read?.data, editable: editable && !entryForm, now, active: snapshotActive, canvas, body,
-    minutePx: MINUTE_PX, minBlockPx: MIN_BLOCK_PX, onSaved: message => entrySaved(message) });
+    minutePx: MINUTE_PX, minBlockPx: MIN_BLOCK_PX, onSaved: message => entrySaved(message), onOutcome: () => setEntryNote(null) });
 
   // Scroll once per week: this week to two hours before now, other weeks to about 08:00.
   useLayoutEffect(() => {
