@@ -11,6 +11,7 @@ import CalendarFilters from './CalendarFilters';
 import CalendarEntryDialog from './CalendarEntryDialog';
 import type { CalendarEntryRequest } from './CalendarEntryDialog';
 import { defaultEnd, keyboardRange, minuteAt, slotStart } from './calendarEntry';
+import { useCalendarMove } from './useCalendarMove';
 import './calendar.css';
 
 type Props = {
@@ -56,7 +57,7 @@ const fullDate = (ms: number, zone: string) => new Intl.DateTimeFormat('pl-PL', 
 const kindLabel = { work: '', pending: 'Uśpienie do rozstrzygnięcia, nie wliczone do sum', unverified: 'Pomiar do weryfikacji, nie wliczony do sum' };
 
 function scopeNote(filtered: boolean, zone: string | undefined): string {
-  return `${filtered ? 'Sumy dotyczą wybranych filtrów, tak jak raport z tymi samymi filtrami.' : 'Sumy dla wszystkich klientów, tak jak w raporcie.'} Dni w strefie raportu${zone ? ` (${zone})` : ''}. Uśpienie do rozstrzygnięcia i pomiar do weryfikacji nie wliczają się do sum. Kliknij puste miejsce, aby dodać wpis, albo wpis, aby go poprawić.`;
+  return `${filtered ? 'Sumy dotyczą wybranych filtrów, tak jak raport z tymi samymi filtrami.' : 'Sumy dla wszystkich klientów, tak jak w raporcie.'} Dni w strefie raportu${zone ? ` (${zone})` : ''}. Uśpienie do rozstrzygnięcia i pomiar do weryfikacji nie wliczają się do sum. Kliknij puste miejsce, aby dodać wpis, albo wpis, aby go poprawić. Zakończony wpis możesz przeciągnąć (co 15 minut) albo zmienić jego początek lub koniec uchwytem; z klawiatury: Alt+strzałki przesuwają, Alt+Shift+strzałki zmieniają koniec, Enter zapisuje, Esc anuluje.`;
 }
 
 function blockLabel(block: CalendarBlock): string {
@@ -78,6 +79,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const shownWeek = week ?? (today ? weekStartOf(today) : null);
   const blockRefs = useRef(new Map<string, HTMLButtonElement>());
   const body = useRef<HTMLDivElement>(null);
+  const canvas = useRef<HTMLDivElement>(null);
   const dialog = useRef<HTMLDivElement>(null);
   const scrolledFor = useRef('');
   // DEV-26: the add/edit form, the control that opened it (focus returns there) and the message after it.
@@ -98,6 +100,9 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const blocks = view ? view.days.flatMap(day => day.blocks) : [];
   const chosen = blocks.find(block => block.key === selected) ?? null;
   const filtered = scope.clientId !== null || billable !== 'all';
+  // DEV-38: drag, resize and Alt+arrows; saved through the same correction as the form.
+  const move = useCalendarMove({ view, blocks, data: report.read?.data, editable: editable && !entryForm, now, active: snapshotActive, canvas, body,
+    minutePx: MINUTE_PX, minBlockPx: MIN_BLOCK_PX, onSaved: message => entrySaved(message), onOutcome: () => setEntryNote(null) });
 
   // Scroll once per week: this week to two hours before now, other weeks to about 08:00.
   useLayoutEffect(() => {
@@ -151,7 +156,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
     else setSelected(block.key === selected ? null : block.key);
   }
   function addAt(date: string, event: ReactMouseEvent<HTMLDivElement>) {
-    if (!view || (event.target as Element).closest('.calendar-block')) return;
+    if (move.consumeClick() || !view || (event.target as Element).closest('.calendar-block')) return;
     const box = event.currentTarget.getBoundingClientRect();
     const minute = minuteAt(event.clientY - box.top, box.height);
     if (minute === null) return;
@@ -179,6 +184,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
     </div>
     {noteOpen && <p id="calendar-scope-note" role="note" className="helper calendar-scope-note">{scopeNote(filtered, zone)}</p>}
     {scopeNotice && <p role="status" className="helper">{scopeNotice}</p>}
+    {move.status}
     {entryNote && <p role={entryNote.problem ? 'alert' : 'status'} className={entryNote.problem ? 'alert error calendar-entry-note' : 'alert success calendar-entry-note'}>{entryNote.text}</p>}
     {resolved.problem && <p role="alert" className="alert error">{resolved.problem} Wybierz inny filtr.</p>}
     {!loaded ? <p role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie w widoku Timer.</p>
@@ -199,7 +205,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
               <small>{weekday.format(utc(day.date))}</small> <strong>{dayNumber.format(utc(day.date))}</strong>
               <span className="calendar-day-total">{duration(day.seconds)}</span></span>)}
           </div>
-            <div className="calendar-canvas" style={{ height: DAY_MINUTES * MINUTE_PX }}>
+            <div className="calendar-canvas" ref={canvas} style={{ height: DAY_MINUTES * MINUTE_PX }}>
               <div className="calendar-hours" aria-hidden="true">{Array.from({ length: 24 }, (_, hour) => <span key={hour} style={{ top: hour * HOUR_PX }}>{String(hour).padStart(2, '0')}:00</span>)}</div>
               {view.days.map(day => <div key={day.date} className={day.isToday ? 'calendar-column is-today' : 'calendar-column'} role="group"
                 aria-label={`${new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }).format(utc(day.date))}: ${duration(day.seconds)}, wpisów ${day.blocks.length}`}
@@ -207,13 +213,19 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
                 {day.blocks.length === 0 && <span className="calendar-empty-day">Brak wpisów</span>}
                 {day.blocks.map(block => <button key={block.key} type="button" ref={node => { if (node) blockRefs.current.set(block.key, node); else blockRefs.current.delete(block.key); }}
                   className="calendar-block" data-kind={block.kind} data-size={(block.bottom - block.top) * MINUTE_PX < 44 ? "short" : undefined} data-running={block.running || undefined} data-project-colour={block.colour}
-                  aria-label={blockLabel(block)} title={`${block.title}\n${block.path}\n${pieceRange(block)}`} aria-haspopup="dialog" aria-expanded={selected === block.key}
+                  aria-label={blockLabel(block) + (move.movable(block) ? '. Alt+strzałki przesuwają wpis, Alt+Shift+strzałki zmieniają koniec' : '')} title={`${block.title}\n${block.path}\n${pieceRange(block)}`} aria-haspopup="dialog" aria-expanded={selected === block.key}
+                  aria-keyshortcuts={move.movable(block) ? 'Alt+ArrowUp Alt+ArrowDown Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowUp Alt+Shift+ArrowDown' : undefined}
+                  data-movable={move.movable(block) || undefined} data-moving={move.movingKey === block.key || move.savingId === block.entryId || undefined}
                   style={{ top: block.top * MINUTE_PX, height: (block.bottom - block.top) * MINUTE_PX, left: `${(100 * block.lane) / block.lanes}%`, width: `${100 / block.lanes}%` }}
-                  onClick={event => openBlock(block, event.currentTarget)}>
+                  onPointerDown={event => move.onPointerDown(block, event)} onKeyDown={event => { move.onKeyDown(block, event); }}
+                  onClick={event => { if (!move.consumeClick()) openBlock(block, event.currentTarget); }}>
+                  {move.movable(block) && block.startMs === block.entryStartMs && <span className="calendar-handle" data-edge="start" aria-hidden="true" title="Przeciągnij, aby zmienić początek" />}
+                  {move.movable(block) && block.endMs === block.entryEndMs && <span className="calendar-handle" data-edge="end" aria-hidden="true" title="Przeciągnij, aby zmienić koniec" />}
                   {(block.bottom - block.top) * MINUTE_PX < 44
                     ? <strong>{block.title} <small>{pieceRange(block)}</small></strong>
                     : <><strong>{block.title}</strong><span>{block.path}</span><small>{pieceRange(block)}</small></>}
                 </button>)}
+                {move.ghosts(day.date)}
                 {day.isToday && view.nowMinute !== null && <span className="calendar-now" style={{ top: view.nowMinute * MINUTE_PX }} aria-hidden="true" />}
               </div>)}
             </div>
