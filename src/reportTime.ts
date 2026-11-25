@@ -40,12 +40,21 @@ function parseReportTimestamp(value: string): number {
 
 // Cache timezone boundaries per UTC day so the input order does not affect reuse.
 // Splitting at the edge of each cache bucket preserves seconds because all pieces share the anchor.
-function calendarPieces(zone: string) {
-  type Slice = { until: number; date: string };
-  const cache = new Map<number, Slice[]>();
+// The cache lives for the whole process (TECH-15): a day's boundaries depend only on the zone and the
+// tzdata built into the Temporal polyfill, which do not change while the app runs. Without it every
+// reportByDay / reportOverlaps call paid the slow polyfill lookup again for each UTC day it touched.
+type Slice = { readonly until: number; readonly date: string };
+const dayBoundaryCache = new Map<string, Map<number, readonly Slice[]>>();
+/** Upper bound per zone (about 270 years of days), so a pathological input cannot grow memory without limit. */
+const DAY_BOUNDARY_CACHE_LIMIT = 100_000;
 
-  function readBucket(day: number): Slice[] {
-    const stored = cache.get(day);
+function calendarPieces(zone: string) {
+  let cache = dayBoundaryCache.get(zone);
+  if (!cache) dayBoundaryCache.set(zone, cache = new Map<number, readonly Slice[]>());
+  const zoneCache = cache;
+
+  function readBucket(day: number): readonly Slice[] {
+    const stored = zoneCache.get(day);
     if (stored) return stored;
     const slices: Slice[] = [];
     const stop = day + utcDayMs;
@@ -65,8 +74,10 @@ function calendarPieces(zone: string) {
       slices.push({ until, date: date.toString() });
       at = until;
     }
-    cache.set(day, slices);
-    return slices;
+    if (zoneCache.size >= DAY_BOUNDARY_CACHE_LIMIT) zoneCache.clear();
+    const frozen = Object.freeze(slices.map(slice => Object.freeze(slice)));
+    zoneCache.set(day, frozen);
+    return frozen;
   }
 
   return (start: number, end: number, anchor = start): ReportDay[] => {
