@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry' || phase === 'calendar-drag') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -1215,7 +1215,7 @@ const calendarEntryFixture = {
   existing: ['2026-03-10T08:00:00Z', '2026-03-10T09:00:00Z', 'Kalendarz B: istniejący wpis'],
   description: 'Kalendarz B: dodany kliknięciem',
 };
-function calendarEntryRows() {
+function calendarEntryRows(client = calendarEntryFixture.client) {
   const db = openTestDb({ readOnly: true });
   try {
     return db.prepare(`SELECT e.id, e.started_at, e.ended_at, e.duration_seconds, COALESCE(d.description, '') AS description,
@@ -1225,7 +1225,7 @@ function calendarEntryRows() {
         (SELECT COUNT(*) FROM entry_draft_resolutions r WHERE r.entry_id=e.id) AS resolutions
       FROM time_entries e JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id
       LEFT JOIN entry_descriptions d ON d.entry_id=e.id
-      WHERE c.name=? AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id`).all(calendarEntryFixture.client).map(row => ({ ...row }));
+      WHERE c.name=? AND NOT EXISTS(SELECT 1 FROM entry_deletions x WHERE x.entry_id=e.id) ORDER BY e.id`).all(client).map(row => ({ ...row }));
   } finally { db.close(); }
 }
 async function verifyCalendarEntry(cdp, sessionId) {
@@ -1408,6 +1408,255 @@ async function verifyCalendarEntry(cdp, sessionId) {
   await waitFor('package B timer stopped', () => invoke('get_snapshot').then(snapshot => snapshot.active === null));
   await evaluate(`${viewButton('Timer')}.click()`);
   console.log(`PASS: DEV-26 calendar add (slot 10:15–10:45, Enter), overlap refused, edit with a failed write changed nothing and kept the draft, one retry saved one correction (#${added.id}), week 02:00:00 equals the report`);
+}
+
+// DEV-38: moving and resizing calendar blocks (mouse and keyboard). Its own client and a fixed past week
+// (16–22.02.2026, CET: Warsaw wall time = UTC + 1 h), so nothing depends on the runner's clock. Real pointer
+// input through CDP (press, several moves, release); every save goes through the DEV-26 correction service.
+const calendarDragFixture = {
+  client: 'Klient przeciągania E2E', project: 'Przeciąganie w kalendarzu', date: '2026-02-18', heading: '16–22 lutego 2026', month: '2026-02',
+  moved: ['2026-02-17T08:00:00Z', '2026-02-17T09:00:00Z', 'Przeciąganie: wpis A'],
+  obstacle: ['2026-02-17T13:00:00Z', '2026-02-17T14:00:00Z', 'Przeciąganie: przeszkoda'],
+  keyboard: ['2026-02-19T08:00:00Z', '2026-02-19T08:30:27Z', 'Przeciąganie: klawiatura'],
+};
+async function verifyCalendarDrag(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const key = async (name, code, keyCode, modifiers = 0, text) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: name, code, windowsVirtualKeyCode: keyCode, modifiers, ...(text ? { text } : {}) }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: name, code, windowsVirtualKeyCode: keyCode, modifiers }, sessionId);
+  };
+  const mouse = (type, x, y, extra = {}) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', ...extra }, sessionId);
+  const fixture = calendarDragFixture;
+  const rows = () => calendarEntryRows(fixture.client);
+  const draftPath = id => join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'entry-drafts', `entry-${id}.json`);
+  const readWeek = `(() => { const root = document.querySelector('[aria-label="Kalendarz"]');
+    return { heading: root.querySelector('.calendar-range')?.textContent, week: root.querySelector('.calendar-week-total')?.textContent,
+      days: [...root.querySelectorAll('.calendar-day-total')].map(node => node.textContent), blocks: root.querySelectorAll('.calendar-block').length,
+      note: root.querySelector('.calendar-entry-note')?.textContent ?? null, error: root.querySelector('.calendar-move-error')?.textContent ?? null,
+      status: root.querySelector('.calendar-move-status')?.textContent ?? '', ghosts: [...root.querySelectorAll('.calendar-ghost')].map(node => node.textContent),
+      dialog: Boolean(document.querySelector('dialog.calendar-entry-dialog')) }; })()`;
+  const blockOf = description => `[...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-block')].find(node => node.getAttribute('aria-label').startsWith(${JSON.stringify(description)}))`;
+  const labelOf = description => evaluate(`${blockOf(description)}?.getAttribute('aria-label') ?? null`);
+  // Scrolls the day axis so `minute` is 60 px below the top of the scroll area (away from the autoscroll edges),
+  // then returns the block's box, its column and the point to press: the middle, or 3 px inside an edge handle.
+  const grip = (description, part, minute) => evaluate(`(() => {
+    const body = document.querySelector('.calendar-body'); const block = ${blockOf(description)};
+    const column = block.closest('.calendar-column');
+    body.scrollTop = Math.max(0, ${minute} * column.getBoundingClientRect().height / 1440 - 60);
+    const box = block.getBoundingClientRect(); const area = column.getBoundingClientRect(); const scroller = body.getBoundingClientRect();
+    const x = box.left + box.width / 2, y = ${JSON.stringify(part)} === 'end' ? box.bottom - 3 : ${JSON.stringify(part)} === 'start' ? box.top + 3 : box.top + box.height / 2;
+    const hit = document.elementFromPoint(x, y);
+    return { x, y, perMinute: area.height / 1440, hit: hit?.closest('.calendar-block') === block ? (hit.closest('[data-edge]')?.dataset.edge ?? 'block') : String(hit?.className),
+      movable: block.hasAttribute('data-movable'), top: scroller.top, bottom: Math.min(scroller.bottom, innerHeight) };
+  })()`);
+  // A real drag: press, eight moves (past the 6 px threshold), then release (or not, to look at the ghost).
+  const drag = async (point, dx, dy, { release = true } = {}) => {
+    // Both ends inside the visible axis and more than 32 px from its edges, where the calendar would autoscroll.
+    for (const y of [point.y, point.y + dy]) assert.ok(y > point.top + 32 && y < point.bottom - 32, `drag point ${Math.round(y)} outside ${Math.round(point.top)}–${Math.round(point.bottom)}`);
+    await mouse('mouseMoved', point.x, point.y, { button: 'none' });
+    await mouse('mousePressed', point.x, point.y, { buttons: 1, clickCount: 1 });
+    for (let step = 1; step <= 8; step++) {
+      await mouse('mouseMoved', point.x + dx * step / 8, point.y + dy * step / 8, { buttons: 1 });
+      await delay(25);
+    }
+    if (release) await mouse('mouseReleased', point.x + dx, point.y + dy, { buttons: 0, clickCount: 1 });
+  };
+  const reportSeconds = async () => {
+    const report = await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } });
+    const ids = new Set(rows().map(row => row.id));
+    return report.entries.filter(entry => ids.has(entry.id)).reduce((sum, entry) => sum + entry.duration_seconds, 0);
+  };
+  let last = null;
+  const settle = async (label, check) => waitFor(label, async () => { last = await evaluate(readWeek); return check(last) ? last : null; })
+    .catch(error => { throw new Error(`${error.message}; last calendar state: ${JSON.stringify(last)}`); });
+
+  // The whole phase at 1280×720 (the UI_LAYOUT block below also checks 125 %), so the drag distances fit the visible axis.
+  const standard = { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false };
+  await cdp.send('Emulation.setDeviceMetricsOverride', standard, sessionId);
+  try {
+  await waitFor('drag phase at 1280x720', () => evaluate('window.innerWidth === 1280 && window.innerHeight === 720'));
+  const clientId = await invoke('create_client', { name: fixture.client });
+  const projectId = await invoke('create_project', { clientId, name: fixture.project });
+  for (const [startedAt, endedAt, description] of [fixture.moved, fixture.obstacle, fixture.keyboard]) {
+    await invoke('create_project_manual_entry', { projectId, taskId: null, startedAt, endedAt, description });
+  }
+  const [a, b, c] = rows();
+  // A running timer the whole time: moving finished entries must never stop or change it.
+  await invoke('start_project_timer', { projectId, taskId: null, expectedActiveId: null, description: 'Przeciąganie: pomiar w tle' });
+  const running = await waitFor('drag phase timer running', () => invoke('get_snapshot').then(snapshot => snapshot.active && { id: snapshot.active.id, startedAt: snapshot.active.started_at }));
+  const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${viewButton('Kalendarz')}.click()`);
+  await waitFor('calendar opens for DEV-38', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-week-total'))`));
+  await evaluate(`(() => { const input = document.querySelector('[aria-label="Kalendarz"] input[type="date"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(fixture.date)});
+    input.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await settle('fixture week of DEV-38', value => value.heading === fixture.heading && value.blocks === 3);
+  const before = await reportSeconds();
+  assert.equal(before, 3600 + 3600 + 1827);
+
+  // AC1: the block 09:00–10:00 dragged by two hours lands at 11:00–12:00; the length stays 3600 s.
+  let point = await grip(fixture.moved[2], 'move', 9 * 60);
+  assert.equal(point.hit, 'block', 'the press must hit the block itself');
+  assert.ok(point.movable, 'a finished entry without sleep must be movable');
+  await drag(point, 0, 120 * point.perMinute);
+  await settle('AC1 move saved', value => value.note === `Przesunięto wpis #${a.id}: 17.02 11:00–12:00 (01:00:00).` && value.ghosts.length === 0);
+  assert.equal(last.dialog, false, 'a drag must not open the edit form');
+  let now = rows();
+  assert.deepEqual(now[0], { ...a, started_at: '2026-02-17T10:00:00.000Z', ended_at: '2026-02-17T11:00:00.000Z', duration_seconds: 3600, timeRevisions: 1, resolutions: 1 });
+  assert.deepEqual([now[1], now[2]], [b, c], 'moving one entry changed another');
+  assert.ok(!existsSync(draftPath(a.id)), 'the applied move must remove its draft');
+  assert.ok((await labelOf(fixture.moved[2])).includes('11:00–12:00'));
+
+  // AC2: the end handle 12:00 → 12:30 gives 5400 s; the report has exactly 1800 s more.
+  point = await grip(fixture.moved[2], 'end', 11 * 60);
+  assert.equal(point.hit, 'end', 'the press must hit the end handle');
+  await drag(point, 0, 30 * point.perMinute);
+  await settle('AC2 resize saved', value => value.note === `Przesunięto wpis #${a.id}: 17.02 11:00–12:30 (01:30:00).` && value.ghosts.length === 0);
+  now = rows();
+  assert.deepEqual(now[0], { ...a, started_at: '2026-02-17T10:00:00.000Z', ended_at: '2026-02-17T11:30:00.000Z', duration_seconds: 5400, timeRevisions: 2, resolutions: 2 });
+  assert.equal(await reportSeconds(), before + 1800, 'the report must have exactly 1800 s more after the resize');
+  const afterResize = now;
+
+  // AC3a: a drop onto the obstacle (13:30–15:00 over 14:00–15:00) is refused before saving; the block stays.
+  point = await grip(fixture.moved[2], 'move', 11 * 60);
+  await drag(point, 0, 150 * point.perMinute);
+  await settle('AC3 overlap refused', value => (value.error ?? '').includes(`Nie przesunięto wpisu #${a.id}: Ten czas nakłada się na istniejący pomiar (wpis #${b.id}, 17.02 14:00–15:00).`) && value.ghosts.length === 0);
+  assert.ok(last.error.includes('Wpis został na swoim miejscu.'));
+  assert.equal(last.dialog, false);
+  assert.ok((await labelOf(fixture.moved[2])).includes('11:00–12:30'), 'the refused block must be back in its original place');
+  assert.deepEqual(rows(), afterResize, 'a refused overlap changed the database');
+
+  // UI_LAYOUT while dragging (ghost and live status) and of the error, at 1280×720 and at 125 % (1024×576 CSS px).
+  // The drag is then cancelled with Escape before the release: nothing is saved.
+  for (const [label, metrics] of [['1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }], ['1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
+    try {
+      await waitFor(`calendar drag at ${label}`, () => evaluate(`window.innerWidth === ${metrics.width} && window.innerHeight === ${metrics.height}`));
+      await delay(300);
+      point = await grip(fixture.moved[2], 'move', 11 * 60);
+      await drag(point, 0, 60 * point.perMinute, { release: false });
+      await settle(`ghost at ${label}`, value => value.ghosts.length === 1 && value.status.includes('Puść, aby zapisać; Esc anuluje.'));
+      const layout = await evaluate(`(() => {
+        const ghost = document.querySelector('.calendar-ghost'); const box = ghost.getBoundingClientRect(); const area = ghost.closest('.calendar-column').getBoundingClientRect();
+        const status = document.querySelector('.calendar-move-status').getBoundingClientRect();
+        const handles = [...document.querySelectorAll('.calendar-block[data-movable] > .calendar-handle')].map(handle => {
+          const own = handle.getBoundingClientRect(); const block = handle.parentElement.getBoundingClientRect();
+          return { height: own.height, inside: own.left >= block.left - 0.5 && own.right <= block.right + 0.5 && own.top >= block.top - 0.5 && own.bottom <= block.bottom + 0.5 };
+        });
+        const error = document.querySelector('.calendar-move-error'); const errorBox = error?.getBoundingClientRect();
+        return { ghostInside: box.left >= area.left - 0.5 && box.right <= area.right + 0.5 && box.top >= area.top - 0.5 && box.bottom <= area.bottom + 0.5,
+          ghostText: ghost.textContent, ghostHeight: Math.round(box.height), statusInside: status.left >= 0 && status.right <= innerWidth + 0.5 && status.top >= 0 && status.bottom <= innerHeight + 0.5 && status.height > 0,
+          statusCoversGhost: status.left < box.right && box.left < status.right && status.top < box.bottom && box.top < status.bottom,
+          handles: handles.length, handleHeights: [...new Set(handles.map(handle => Math.round(handle.height)))], handlesInside: handles.every(handle => handle.inside),
+          moving: document.querySelectorAll('.calendar-block[data-moving]').length, cursor: getComputedStyle(document.querySelector('.calendar-block[data-movable]')).cursor,
+          errorInside: !errorBox || (errorBox.left >= 0 && errorBox.right <= innerWidth + 0.5),
+          errorButtons: error ? Math.min(...[...error.querySelectorAll('button')].map(button => button.getBoundingClientRect().height)) : null,
+          scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
+      })()`);
+      console.log(`UI_LAYOUT calendar-drag ${label} ${JSON.stringify(layout)}`);
+      assert.ok(layout.ghostInside, `the ghost leaves its day column at ${label}`);
+      assert.equal(layout.ghostText, '12:00–13:30');
+      assert.ok(layout.statusInside, `the drag status is not visible at ${label}`);
+      assert.equal(layout.statusCoversGhost, false, `the drag status covers the ghost at ${label}`);
+      assert.ok(layout.handles >= 2 && layout.handlesInside, `resize handles missing or outside their block at ${label}`);
+      assert.deepEqual(layout.handleHeights, [8]);
+      assert.equal(layout.moving, 1, 'the dragged block must be marked while dragging');
+      assert.equal(layout.cursor, 'grab');
+      assert.ok(layout.errorInside && (layout.errorButtons === null || layout.errorButtons >= 40), `the move error leaves the window or has small buttons at ${label}`);
+      assert.ok(layout.scrollWidth <= layout.clientWidth, `the page scrolls horizontally at ${label}`);
+      await saveScreenshot(cdp, sessionId, `calendar-drag-ghost-${label}`);
+      // Escape during the drag: cancelled, the release afterwards does nothing.
+      await key('Escape', 'Escape', 27);
+      await mouse('mouseReleased', point.x, point.y + 60 * point.perMinute, { buttons: 0, clickCount: 1 });
+      await settle(`drag cancelled at ${label}`, value => (value.error ?? '').includes('Przeciąganie anulowane. Wpis został na swoim miejscu.') && value.ghosts.length === 0 && !value.dialog);
+      assert.deepEqual(rows(), afterResize, 'a cancelled drag changed the database');
+    } finally {
+      await cdp.send('Emulation.setDeviceMetricsOverride', standard, sessionId);
+    }
+  }
+  await waitFor('back at 1280x720', () => evaluate('window.innerWidth === 1280 && window.innerHeight === 720'));
+
+  // AC3b: a drop while the database cannot be written: the error names it, the block is in its original place,
+  // the database is unchanged and the draft is kept; one "Spróbuj ponownie" saves exactly one correction.
+  const lock = holdWriteLock();
+  try {
+    point = await grip(fixture.moved[2], 'move', 8 * 60 + 30);
+    await drag(point, 0, -180 * point.perMinute);
+    await settle('AC3 write failure shown', value => (value.error ?? '').includes('Nie udało się zapisać lub odczytać danych lokalnych') && value.ghosts.length === 0);
+    assert.ok(last.error.includes('Nic nie zostało zmienione; wpis jest na swoim miejscu.') && last.error.includes('Spróbuj ponownie'));
+    assert.ok((await labelOf(fixture.moved[2])).includes('11:00–12:30'), 'after a failed save the block must be in its original place');
+    assert.deepEqual(rows(), afterResize, 'a failed move changed the database');
+    assert.ok(existsSync(draftPath(a.id)), 'the failed move must keep its draft for the retry');
+    await saveScreenshot(cdp, sessionId, 'calendar-drag-error-1280x720');
+  } finally { lock.release(); }
+  await evaluate(`[...document.querySelectorAll('.calendar-move-error button')].find(button => button.textContent === 'Spróbuj ponownie').click()`);
+  await settle('AC3 retry saved', value => value.note === `Przesunięto wpis #${a.id}: 17.02 08:00–09:30 (01:30:00).` && value.error === null && value.ghosts.length === 0);
+  now = rows();
+  assert.equal(now.length, 3, 'the retry added an entry');
+  assert.deepEqual(now[0], { ...a, started_at: '2026-02-17T07:00:00.000Z', ended_at: '2026-02-17T08:30:00.000Z', duration_seconds: 5400, timeRevisions: 3, resolutions: 3 });
+  assert.ok(!existsSync(draftPath(a.id)), 'the retried move must remove its draft');
+
+  // AC4: keyboard. Alt+↓ proposes 15 minutes later, Enter saves; the seconds and the exact length stay (1827 s).
+  await evaluate(`${blockOf(fixture.keyboard[2])}.focus()`);
+  await key('ArrowDown', 'ArrowDown', 40, 1);
+  await settle('AC4 keyboard proposal', value => value.status.includes(`Wpis #${c.id}: 19.02 09:15–09:45 (00:30:27). Enter zapisuje, Esc anuluje.`));
+  await key('Enter', 'Enter', 13, 0, '\r');
+  await settle('AC4 keyboard move saved', value => value.note === `Przesunięto wpis #${c.id}: 19.02 09:15–09:45 (00:30:27).` && value.ghosts.length === 0);
+  assert.equal(last.dialog, false, 'Enter after Alt+arrows saves the move, it does not open the form');
+  now = rows();
+  assert.deepEqual(now[2], { ...c, started_at: '2026-02-19T08:15:00.000Z', ended_at: '2026-02-19T08:45:27.000Z', duration_seconds: 1827, timeRevisions: 1, resolutions: 1 });
+  // Alt+Shift+↓ then Escape: cancelled, nothing saved.
+  await evaluate(`${blockOf(fixture.keyboard[2])}.focus()`);
+  await key('ArrowDown', 'ArrowDown', 40, 1 | 8);
+  await settle('keyboard resize proposal', value => value.status.includes(`Wpis #${c.id}: 19.02 09:15–10:00 (00:45:00).`));
+  await key('Escape', 'Escape', 27);
+  await settle('keyboard move cancelled', value => (value.error ?? '').includes('Przesunięcie anulowane. Wpis został na swoim miejscu.') && value.ghosts.length === 0);
+  assert.deepEqual(rows(), now, 'a cancelled keyboard move changed the database');
+  // A plain click (no travel) still opens the DEV-26 edit form, the full keyboard alternative; Escape closes it.
+  point = await grip(fixture.keyboard[2], 'move', 9 * 60);
+  await mouse('mousePressed', point.x, point.y, { buttons: 1, clickCount: 1 });
+  await mouse('mouseMoved', point.x + 2, point.y + 2, { buttons: 1 });
+  await mouse('mouseReleased', point.x + 2, point.y + 2, { buttons: 0, clickCount: 1 });
+  await waitFor('a click opens the edit form', () => evaluate(`document.querySelector('dialog.calendar-entry-dialog h3')?.textContent === 'Edycja wpisu #${c.id}'`));
+  await evaluate(`document.querySelector('dialog.calendar-entry-dialog textarea').focus()`);
+  await key('Escape', 'Escape', 27);
+  await waitFor('edit form closed', () => evaluate(`!document.querySelector('dialog.calendar-entry-dialog')`));
+  assert.deepEqual(rows(), now, 'opening and closing the form changed the database');
+
+  // Totals: the week, its days, the month and the report agree to the second (A 1:30 + B 1:00 on Tue, C 0:30:27 on Thu).
+  const week = await settle('week totals after the moves', value => value.week === '03:00:27');
+  assert.deepEqual(week.days, ['00:00:00', '02:30:00', '00:00:00', '00:30:27', '00:00:00', '00:00:00', '00:00:00']);
+  assert.equal(await reportSeconds(), 5400 + 3600 + 1827);
+  assert.deepEqual(rows().map(row => row.id), [a.id, b.id, c.id], 'moves must not add or remove entries');
+  const modeButton = label => `[...document.querySelectorAll('.calendar-mode button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${modeButton('Miesiąc')}.click()`);
+  await evaluate(`(() => { const input = document.querySelector('[aria-label="Kalendarz"] input[type="month"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(fixture.month)});
+    input.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await waitFor('February month total', () => evaluate(`document.querySelector('[aria-label="Kalendarz"] .calendar-month-total')?.textContent === '03:00:27'
+    && (document.querySelector('.month-cell[data-date="2026-02-17"]')?.getAttribute('aria-label') ?? '').includes('02:30:00')`));
+  await evaluate(`${modeButton('Tydzień')}.click()`);
+
+  // Not movable: the running timer (no handles, no grab cursor); it was never stopped or replaced by the moves.
+  await waitFor('week view again', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-week-total'))`));
+  await evaluate(`[...document.querySelectorAll('[aria-label="Kalendarz"] .calendar-nav button')].find(button => button.textContent.trim() === 'Dziś').click()`);
+  await waitFor('running block in this week', () => evaluate(`Boolean(document.querySelector('.calendar-block[data-running="true"]'))`));
+  assert.deepEqual(await evaluate(`(() => { const block = document.querySelector('.calendar-block[data-running="true"]');
+    return { movable: block.hasAttribute('data-movable'), handles: block.querySelectorAll('.calendar-handle').length, shortcuts: block.getAttribute('aria-keyshortcuts') }; })()`),
+    { movable: false, handles: 0, shortcuts: null });
+  assert.deepEqual(await invoke('get_snapshot').then(snapshot => snapshot.active && { id: snapshot.active.id, startedAt: snapshot.active.started_at }), running, 'moving entries stopped or replaced the running timer');
+  await invoke('stop_timer', { expectedActiveId: running.id });
+  await waitFor('drag phase timer stopped', () => invoke('get_snapshot').then(snapshot => snapshot.active === null));
+  await evaluate(`${viewButton('Timer')}.click()`);
+  } finally {
+    await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+  }
+  console.log(`PASS: DEV-38 drag 09:00–10:00 → 11:00–12:00 (3600 s), end handle → 12:30 (5400 s, report +1800 s), overlap refused and a failed write left the block and the database unchanged with one retry saving one correction (#${a.id}), Alt+arrows kept 1827 s, Esc cancels, click opens the form, totals equal to the second, running timer untouched`);
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
@@ -2638,6 +2887,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'calendar') await verifyCalendar(cdp, sessionId);
     if (phase === 'calendar-month') await verifyCalendarMonth(cdp, sessionId);
     if (phase === 'calendar-entry') await verifyCalendarEntry(cdp, sessionId);
+    if (phase === 'calendar-drag') await verifyCalendarDrag(cdp, sessionId);
     if (phase === 'write-failure') pendingWriteFailure = await verifyWriteFailure(cdp, sessionId);
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
@@ -2762,6 +3012,9 @@ try {
   // DEV-26: add and edit from the calendar (own client, fixed past week), also before PTT-36.
   await waitForWindowClosed(port);
   await runWindow(port, 'calendar-entry', recovery);
+  // DEV-38: moving and resizing blocks with the mouse and the keyboard (own client, fixed past week).
+  await waitForWindowClosed(port);
+  await runWindow(port, 'calendar-drag', recovery);
   // PTT-36: T20 (Stop, Switch, correction with an unwritable database, then one retry) and
   // T26 (the unsaved correction survives a restart and is saved exactly once).
   await waitForWindowClosed(port);
