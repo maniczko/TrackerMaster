@@ -1432,7 +1432,11 @@ async function verifyCalendarDrag(cdp, sessionId) {
   };
   const mouse = (type, x, y, extra = {}) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', ...extra }, sessionId);
   const fixture = calendarDragFixture;
-  const rows = () => calendarEntryRows(fixture.client);
+  // The phase's running timer belongs to the same client: `all` has it, `rows` only the three fixture entries
+  // (run 45620837329 counted the timer as a fourth row and reported it as a duplicate).
+  let runningId = null;
+  const all = () => calendarEntryRows(fixture.client);
+  const rows = () => all().filter(row => row.id !== runningId);
   const draftPath = id => join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'entry-drafts', `entry-${id}.json`);
   const readWeek = `(() => { const root = document.querySelector('[aria-label="Kalendarz"]');
     return { heading: root.querySelector('.calendar-range')?.textContent, week: root.querySelector('.calendar-week-total')?.textContent,
@@ -1494,6 +1498,8 @@ async function verifyCalendarDrag(cdp, sessionId) {
   // A running timer the whole time: moving finished entries must never stop or change it.
   await invoke('start_project_timer', { projectId, taskId: null, expectedActiveId: null, description: 'Przeciąganie: pomiar w tle' });
   const running = await waitFor('drag phase timer running', () => invoke('get_snapshot').then(snapshot => snapshot.active && { id: snapshot.active.id, startedAt: snapshot.active.started_at }));
+  runningId = Number(running.id);
+  assert.deepEqual(all().map(row => row.id), [a.id, b.id, c.id, runningId], 'the running timer is the only other entry of the client');
   const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
   await evaluate(`${viewButton('Kalendarz')}.click()`);
   await waitFor('calendar opens for DEV-38', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-week-total'))`));
@@ -1604,6 +1610,7 @@ async function verifyCalendarDrag(cdp, sessionId) {
   await settle('AC3 retry saved', value => value.note === `Przesunięto wpis #${a.id}: 17.02 08:00–09:30 (01:30:00).` && value.error === null && value.ghosts.length === 0);
   now = rows();
   assert.equal(now.length, 3, 'the retry added an entry');
+  assert.equal(all().length, 4, 'the retry added an entry (three fixture entries and the running timer)');
   assert.deepEqual(now[0], { ...a, started_at: '2026-02-17T07:00:00.000Z', ended_at: '2026-02-17T08:30:00.000Z', duration_seconds: 5400, timeRevisions: 3, resolutions: 3 });
   assert.ok(!existsSync(draftPath(a.id)), 'the retried move must remove its draft');
 
@@ -1639,6 +1646,7 @@ async function verifyCalendarDrag(cdp, sessionId) {
   assert.deepEqual(week.days, ['00:00:00', '02:30:00', '00:00:00', '00:30:27', '00:00:00', '00:00:00', '00:00:00']);
   assert.equal(await reportSeconds(), 5400 + 3600 + 1827);
   assert.deepEqual(rows().map(row => row.id), [a.id, b.id, c.id], 'moves must not add or remove entries');
+  assert.deepEqual(all().map(row => row.id), [a.id, b.id, c.id, runningId], 'moves must not add entries next to the running timer');
   const modeButton = label => `[...document.querySelectorAll('.calendar-mode button')].find(button => button.textContent.trim() === ${JSON.stringify(label)})`;
   await evaluate(`${modeButton('Miesiąc')}.click()`);
   await evaluate(`(() => { const input = document.querySelector('[aria-label="Kalendarz"] input[type="month"]');
