@@ -1635,7 +1635,7 @@ async function verifyCalendarDrag(cdp, sessionId) {
   await mouse('mousePressed', point.x, point.y, { buttons: 1, clickCount: 1 });
   await mouse('mouseMoved', point.x + 2, point.y + 2, { buttons: 1 });
   await mouse('mouseReleased', point.x + 2, point.y + 2, { buttons: 0, clickCount: 1 });
-  await waitFor('a click opens the edit form', () => evaluate(`document.querySelector('dialog.calendar-entry-dialog h3')?.textContent === 'Edycja wpisu #${c.id}'`));
+  await waitFor('a click opens the edit form', () => evaluate(`document.querySelector('dialog.calendar-entry-dialog h3')?.textContent === 'Edycja wpisu #${c.id}' && Boolean(document.querySelector('dialog.calendar-entry-dialog textarea'))`));
   await evaluate(`document.querySelector('dialog.calendar-entry-dialog textarea').focus()`);
   await key('Escape', 'Escape', 27);
   await waitFor('edit form closed', () => evaluate(`!document.querySelector('dialog.calendar-entry-dialog')`));
