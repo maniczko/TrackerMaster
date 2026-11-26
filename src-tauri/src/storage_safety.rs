@@ -290,7 +290,7 @@ mod tests {
     fn existing_legacy_database_passes_preflight_and_migrates() {
         let path = test_path("legacy");
         let _cleanup = Cleanup(path.clone());
-        let mut db = Connection::open(&path).unwrap();
+        let db = Connection::open(&path).unwrap();
         db.execute_batch("
             CREATE TABLE clients (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
             CREATE TABLE projects (id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id), name TEXT NOT NULL);

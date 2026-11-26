@@ -481,7 +481,7 @@ fn create_backup(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<String>
 #[derive(Serialize)]
 struct RestorePreview { token: String, health: storage_safety::DatabaseHealth }
 
-fn is_unc_path(path: &Path) -> bool {
+fn is_unc_path(path: &std::path::Path) -> bool {
     matches!(
         path.components().next(),
         Some(std::path::Component::Prefix(prefix))
@@ -3700,8 +3700,8 @@ mod tests {
 
     #[test]
     fn unc_paths_are_rejected_for_backup_restore() {
-        assert!(is_unc_path(Path::new(r"\\server\share\backup.sqlite3")));
-        assert!(is_unc_path(Path::new(r"\\?\UNC\server\share\backup.sqlite3")));
-        assert!(!is_unc_path(Path::new(r"C:\Users\Test\backups\backup.sqlite3")));
+        assert!(is_unc_path(std::path::Path::new(r"\\server\share\backup.sqlite3")));
+        assert!(is_unc_path(std::path::Path::new(r"\\?\UNC\server\share\backup.sqlite3")));
+        assert!(!is_unc_path(std::path::Path::new(r"C:\Users\Test\backups\backup.sqlite3")));
     }
 }
