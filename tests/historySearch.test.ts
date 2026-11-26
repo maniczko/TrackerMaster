@@ -4,7 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { buildSearchIndex, foldSearchText, matchEntries, MAX_SEARCH_LENGTH, searchBase, searchSummary, searchTerms } from '../src/historySearch.ts';
+import { buildSearchIndex, dataDateBounds, foldSearchText, matchEntries, MAX_SEARCH_LENGTH, paginateHistoryDays, searchBase, searchHighlightParts, searchSummary, searchTerms } from '../src/historySearch.ts';
+import { historyDays } from '../src/reportDayModel.ts';
 import { makeReportView } from '../src/reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from '../src/reportView.ts';
 import { reportByDay } from '../src/reportTime.ts';
@@ -201,9 +202,57 @@ test('results are newest first and the day totals are newest first', () => {
 });
 
 test('privacy: the search model keeps no state and never stores or logs the phrase', () => {
+  const bar = readFileSync(new URL('../src/HistorySearchBar.tsx', import.meta.url), 'utf8').replace(/\/\/.*$/gm, '');
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   const source = readFileSync(new URL('../src/historySearch.ts', import.meta.url), 'utf8').replace(/\/\/.*$/gm, '');
-  for (const forbidden of ['localStorage', 'sessionStorage', 'indexedDB', 'console.', 'invoke(', 'fetch(', 'document.cookie']) {
-    assert.ok(!source.includes(forbidden), `historySearch.ts must not use ${forbidden}`);
+  for (const code of [source, bar]) {
+    for (const forbidden of ['localStorage', 'sessionStorage', 'indexedDB', 'console.', 'invoke(', 'fetch(', 'document.cookie']) {
+      assert.ok(!code.includes(forbidden), `search code must not use ${forbidden}`);
+    }
   }
   assert.ok(!/^let\s|^const\s+\w+\s*=\s*new\s+Map/m.test(source), 'no module-level mutable state');
+  // In App.tsx, historyQuery / historyRangeMode / historyCustomRange must never flow into storage or invoke.
+  for (const name of ['historyQuery', 'historyRangeMode', 'historyCustomRange']) {
+    const lines = appSource.split(/\r?\n/).filter(line => line.includes(name));
+    assert.ok(lines.length >= 1, `${name} must exist in App.tsx`);
+    for (const line of lines) {
+      assert.ok(!/localStorage|sessionStorage|indexedDB|console\.|invoke\(/.test(line), `${name} leaked to ${line}`);
+    }
+  }
+});
+
+test('UI helpers: highlight spans, bounds, pagination and precomputed search days match the report', () => {
+  assert.deepEqual(searchHighlightParts('Zażółć gęślą jaźń', ['zolc', 'gesl']), [
+    { text: 'Za', hit: false },
+    { text: 'żółć', hit: true },
+    { text: ' ', hit: false },
+    { text: 'gęśl', hit: true },
+    { text: 'ą jaźń', hit: false },
+  ]);
+  const e1 = completed(1, 10, 100, '2026-11-01T22:30:00.000Z', '2026-11-02T00:30:00.000Z', 'Żółć nocna');
+  const e2 = completed(2, 10, 100, '2026-11-02T09:00:00.000Z', '2026-11-02T10:00:00.000Z', 'Żółć dzienna');
+  const all = data([e1, e2]);
+  const bounds = dataDateBounds(all, Date.parse('2026-11-02T12:00:00Z'));
+  assert.deepEqual(bounds, { from: '2026-11-01', through: '2026-11-02' });
+  const range = { from: '2026-11-02', through: '2026-11-02' };
+  const base = searchBase(all, catalog, range.from, range.through);
+  const summary = searchSummary(base, [e1, e2]);
+  const days = historyDays(summary.entries, all, catalog, Date.parse('2026-11-02T12:00:00Z'), {
+    range,
+    contributions: base.contributions,
+    dayTotals: new Map(summary.days.map(d => [d.date, d.seconds])),
+  });
+  assert.ok(days && days.length === 1);
+  assert.equal(days[0].date, '2026-11-02');
+  assert.equal(days[0].seconds, summary.seconds);
+  assert.equal(days[0].rows[0].entry.id, 2);
+  assert.equal(days[0].rows[1].part, 'last');
+  const paged = paginateHistoryDays([
+    { date: '2026-11-02', label: 'A', seconds: 300, rows: [1, 2, 3] },
+    { date: '2026-11-01', label: 'B', seconds: 100, rows: [4, 5] },
+  ], 4);
+  assert.equal(paged.shownRows, 4);
+  assert.equal(paged.totalRows, 5);
+  assert.deepEqual(paged.days.map(d => d.rows), [[1, 2, 3], [4]]);
+  assert.equal(paged.days[1].seconds, 100);
 });

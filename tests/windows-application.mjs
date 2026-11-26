@@ -2511,6 +2511,162 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
+// DEV-41 (PTT-63): History search & date range UI, AC1 ("zolc" → "żółć"), AC2 (total equals report),
+// keyboard Ctrl+F / Esc / "×", privacy (localStorage clean), UI_LAYOUT 1280x720 + 125% DPI, and 10k perf.
+async function verifyHistorySearch(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const setSearch = text => evaluate(`(() => {
+    const input = document.querySelector('#history-search-input');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(text)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const press = async (key, code, windowsVirtualKeyCode, modifiers = 0, text) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode, modifiers, ...(text ? { text } : {}) }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode, modifiers }, sessionId);
+  };
+  let project;
+  {
+    const db = openTestDb({ readOnly: true });
+    try {
+      project = db.prepare(`SELECT p.id AS projectId, p.client_id AS clientId FROM projects p WHERE p.archived=0
+        AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=p.client_id) ORDER BY p.id LIMIT 1`).get();
+      assert.ok(project, 'active project for DEV-41 history search');
+    } finally { db.close(); }
+  }
+  const uniqueA = 'Żółć w raporcie DEV41';
+  const uniqueB = 'Zażółć gęślą jaźń DEV41';
+  await invoke('create_project_manual_entry', {
+    projectId: project.projectId, taskId: null,
+    startedAt: '2026-02-10T08:00:00.000Z', endedAt: '2026-02-10T09:00:00.000Z', description: uniqueA,
+  });
+  await invoke('create_project_manual_entry', {
+    projectId: project.projectId, taskId: null,
+    startedAt: '2026-02-11T08:00:00.000Z', endedAt: '2026-02-11T08:30:00.000Z', description: uniqueB,
+  });
+  await evaluate(`window.dispatchEvent(new Event('focus'))`);
+  await setSearch('zolc dev41');
+  await waitFor('AC1 search returns both Polish-folded entries', () => evaluate(`(() => {
+    const text = document.querySelector('.history-search-summary')?.textContent ?? '';
+    const rows = [...document.querySelectorAll('section.history tbody tr[data-entry-id]')];
+    return text.includes('2 wpisy') && text.includes('01:30:00') && rows.length === 2;
+  })()`));
+  const hitCount = await evaluate(`document.querySelectorAll('section.history mark.search-hit').length`);
+  assert.ok(hitCount >= 2, `expected search highlight marks, got ${hitCount}`);
+  await evaluate(`document.querySelector('.history-search-clear').click()`);
+  await waitFor('clear button resets search and keeps focus', () => evaluate(`document.querySelector('#history-search-input')?.value === '' && document.activeElement?.id === 'history-search-input' && !document.querySelector('.history-search-summary')`));
+
+  // AC2: client name query total matches report sum of matching client entries to the second.
+  const hms = value => [Math.floor(value / 3600), Math.floor(value % 3600 / 60), value % 60].map(part => String(part).padStart(2, '0')).join(':');
+  const secondProjectIds = (() => {
+    const db = openTestDb({ readOnly: true });
+    try { return new Set(db.prepare('SELECT p.id FROM projects p JOIN clients c ON c.id=p.client_id WHERE c.name=?').all(secondClient).map(row => row.id)); }
+    finally { db.close(); }
+  })();
+  const reportSecond = await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } });
+  const expectedSecondEntries = reportSecond.entries.filter(item => secondProjectIds.has(item.project_id));
+  const expectedSecondSec = expectedSecondEntries.reduce((sum, e) => sum + e.duration_seconds, 0);
+  assert.ok(expectedSecondSec > 0, 'second client must have history duration');
+  await setSearch(secondClient);
+  await waitFor('AC2 client query summary matches exact report total', () => evaluate(`(() => {
+    const text = document.querySelector('.history-search-summary')?.textContent ?? '';
+    return text.includes(${JSON.stringify(hms(expectedSecondSec))});
+  })()`));
+
+  // Keyboard Ctrl+F focuses input even from calendar view; Esc clears then blurs.
+  await evaluate(`[...document.querySelectorAll('.view-switch button')].find(b => b.textContent.trim() === 'Kalendarz').click()`);
+  await waitFor('calendar visible before Ctrl+F', () => evaluate(`document.querySelector('.timer-view')?.hidden === true`));
+  await press('f', 'KeyF', 70, 2);
+  await waitFor('Ctrl+F returns to timer view and focuses search', () => evaluate(`!document.querySelector('.timer-view')?.hidden && document.activeElement?.id === 'history-search-input'`));
+  await press('Escape', 'Escape', 27);
+  await waitFor('first Esc clears phrase keeping focus', () => evaluate(`document.querySelector('#history-search-input')?.value === '' && document.activeElement?.id === 'history-search-input'`));
+  await press('Escape', 'Escape', 27);
+  await waitFor('second Esc removes focus', () => evaluate(`document.activeElement?.id !== 'history-search-input'`));
+
+  // Privacy: search phrase never enters localStorage or sessionStorage.
+  await setSearch('sekretna_fraza_dev41');
+  await waitFor('empty search state shown', () => evaluate(`document.querySelector('.history-search-empty')?.textContent.includes('sekretna_fraza_dev41')`));
+  const leaked = await evaluate(`(() => {
+    const dumps = [window.localStorage, window.sessionStorage].flatMap(s => Object.keys(s).map(k => k + '=' + s.getItem(k)));
+    return dumps.some(item => item.includes('sekretna_fraza_dev41') || item.includes('zolc'));
+  })()`);
+  assert.equal(leaked, false, 'search phrase must never be saved to browser storage');
+
+  // UI_LAYOUT at 1280x720 and 1024x576 (125% DPI).
+  for (const [label, metrics] of [['1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }],
+    ['1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
+    try {
+      await waitFor(`history search layout at ${label}`, () => evaluate(`window.innerWidth === ${metrics.width} && window.innerHeight === ${metrics.height}`));
+      await delay(200);
+      const layout = await evaluate(`(() => {
+        const input = document.querySelector('#history-search-input').getBoundingClientRect();
+        const select = document.querySelector('#history-search-range').getBoundingClientRect();
+        const clear = document.querySelector('.history-search-clear').getBoundingClientRect();
+        return { scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth,
+          inputH: Math.round(input.height), selectH: Math.round(select.height), clearW: Math.round(clear.width), clearH: Math.round(clear.height) };
+      })()`);
+      console.log(`UI_LAYOUT history-search-${label} ${JSON.stringify(layout)}`);
+      assert.ok(layout.scrollWidth <= layout.clientWidth, `history search overflows horizontally at ${label}`);
+      assert.ok(layout.inputH >= 40 && layout.selectH >= 40 && layout.clearW >= 40 && layout.clearH >= 40, `history search controls < 40px at ${label}`);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+  await evaluate(`document.querySelector('.history-search-empty button').click()`);
+  await waitFor('empty state reset button clears query', () => evaluate(`document.querySelector('#history-search-input')?.value === ''`));
+
+  // AC3 WebView2 performance: seed 10,000 synthetic completed entries on 2020 dates and measure input -> summary timing.
+  {
+    const db = openTestDb();
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      const insertEntry = db.prepare(`INSERT INTO time_entries (project_id, task_id, started_at, ended_at, duration_seconds, manually_resolved) VALUES (?, NULL, ?, ?, ?, 0)`);
+      const insertDesc = db.prepare(`INSERT INTO entry_descriptions (entry_id, description) VALUES (?, ?)`);
+      const insertBill = db.prepare(`INSERT INTO billable_entries (entry_id, billable) VALUES (?, 0)`);
+      const baseMs = Date.parse('2020-01-01T08:00:00.000Z');
+      for (let i = 0; i < 10_000; i++) {
+        const start = baseMs + i * 3_600_000;
+        const end = start + 1_800_000;
+        const rowId = Number(insertEntry.run(project.projectId, new Date(start).toISOString(), new Date(end).toISOString(), 1800).lastInsertRowid);
+        insertDesc.run(rowId, i < 10 ? `Syntetyczny wpis zółć 10k #${i}` : `Syntetyczny wpis historia #${i}`);
+        insertBill.run(rowId);
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      db.close();
+    }
+  }
+  await evaluate(`window.dispatchEvent(new Event('focus'))`);
+  // AC1: 10k entries might match old entries too; wait specifically until count reflects 12+ and query settled.
+  await setSearch('zolc');
+  await waitFor('10k entries loaded in all-clients report and paginated', () => evaluate(`(() => {
+    const text = document.querySelector('.history-search-summary')?.textContent ?? '';
+    const m = text.match(/^(\\d+)\\s+wpis/);
+    return Boolean(m && Number(m[1]) >= 12);
+  })()`));
+  const perfMs = await evaluate(`await new Promise(resolve => {
+    const input = document.querySelector('#history-search-input');
+    const set = value => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); };
+    set('');
+    requestAnimationFrame(() => {
+      const t0 = performance.now();
+      set('zazolc dev41');
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve(Math.round((performance.now() - t0) * 10) / 10)));
+    });
+  })`);
+  console.log(`PERF_HISTORY_SEARCH_10K elapsedMs=${perfMs}`);
+  assert.ok(perfMs < 2000, `10k search interaction took too long: ${perfMs} ms`);
+  console.log('PASS: DEV-41 history search AC1, AC2, Ctrl+F/Esc, privacy, layout and 10k performance verified');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -2582,7 +2738,7 @@ async function runWindow(port, phase, recovery) {
       if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep', 'history-search'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -2642,6 +2798,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
+    if (phase === 'history-search') await verifyHistorySearch(cdp, sessionId);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -2782,6 +2939,9 @@ try {
   // D4 short sleep (schema v14): last, after T27 restored the profile, so the entry counts asserted above are unaffected.
   await waitForWindowClosed(port);
   await runWindow(port, 'short-sleep', recovery);
+  // DEV-41: history search after all baseline/short-sleep assertions (seeds 10k entries at the end).
+  await waitForWindowClosed(port);
+  await runWindow(port, 'history-search', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

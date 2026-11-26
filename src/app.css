@@ -335,6 +335,20 @@ td small { color: var(--color-text-muted); font-size: var(--text-xs); }
 .duration { font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; overflow-wrap: normal; }
 .duration.pending { color: var(--color-pending-text); font-weight: 600; font-style: italic; text-decoration: underline dashed var(--color-pending-border); text-underline-offset: 3px; }
 .entry-description { display: block; margin-top: var(--space-1); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-text-muted); font-size: var(--text-xs); }
+.history-search { display: grid; gap: var(--space-3); margin: var(--space-3) 0; padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-muted); }
+.history-search-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); }
+.history-search-field { flex: 1 1 280px; min-width: 0; }
+.history-search-input-row { display: flex; gap: var(--space-2); align-items: center; }
+.history-search-input-row input { flex: 1 1 auto; min-width: 0; }
+.app-shell .history-search-clear { flex: 0 0 var(--control-h); width: var(--control-h); min-width: var(--control-h); height: var(--control-h); padding: 0; font-size: var(--text-lg); line-height: 1; }
+.history-search-range { flex: 0 1 210px; min-width: 170px; }
+.history-search-custom { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.history-search-custom label { flex: 0 1 160px; }
+.history-search-meta { display: grid; gap: var(--space-2); }
+.history-search-summary { margin: 0; font-size: var(--text-sm); color: var(--color-text); font-variant-numeric: tabular-nums; }
+.history-search-empty { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+.history-search-more { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); margin-top: var(--space-3); }
+.search-hit { padding: 0 1px; border-radius: var(--radius-sm); background: var(--color-accent-soft); color: var(--color-text); }
 .app-shell li { overflow-wrap: anywhere; margin: var(--space-1) 0; }
 
 /* Alerts: error / success / warning / pending (UIQ-10/12). A plain .alert is pending information. */
