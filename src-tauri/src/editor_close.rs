@@ -66,10 +66,10 @@ pub(super) fn set_entry_editor_guard(state: State<'_, EditorClose>, open: bool) 
         .0
         .lock()
         .map_err(|_| "Nie można ustalić stanu formularza.")?;
-    guard.editor_open = open;
-    if !open {
+    if !guard.editor_open && open {
         guard.waiting = None;
     }
+    guard.editor_open = open;
     Ok(())
 }
 
@@ -112,7 +112,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn guard_clears_waiting_when_closed_and_tracks_sequence() {
+    fn guard_keeps_waiting_when_closed_until_resolved_and_clears_on_reopen() {
         let close = EditorClose::default();
         {
             let mut guard = close.0.lock().unwrap();
@@ -123,10 +123,14 @@ mod tests {
                 action: CloseAction::Hide,
             });
             guard.editor_open = false;
-            guard.waiting = None;
+            assert!(guard.waiting.is_some());
+            if !guard.editor_open {
+                guard.waiting = None;
+            }
+            guard.editor_open = true;
         }
         let guard = close.0.lock().unwrap();
-        assert!(!guard.editor_open);
+        assert!(guard.editor_open);
         assert!(guard.waiting.is_none());
     }
 }

@@ -128,11 +128,11 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     setEditor(value);
   }
 
-  async function dismissEditor() {
+  async function dismissEditor(notifyGuard = true) {
     window.clearTimeout(timer.current);
     setStorageProblem('');
     replaceEditor(null);
-    await onOpenChange(false);
+    if (notifyGuard) await onOpenChange(false);
   }
 
   async function readDrafts(): Promise<DraftList> {
@@ -280,14 +280,14 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     clearListed(draft);
   }
 
-  async function applyEditor() {
+  async function applyEditor(notifyGuard = true) {
       const active = current.current;
       if (!active) return;
       window.clearTimeout(timer.current);
       if (!fieldHasChanges(active)) {
         await pendingWrite.current;
         if (current.current?.saved) await discard(current.current.saved);
-        await dismissEditor();
+        await dismissEditor(notifyGuard);
         return;
       }
       await storeSnapshot(active.session);
@@ -311,11 +311,11 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
       }
       const entryId = await invoke<number>('apply_entry_draft', { entryId: saved.source.entryId, revision: saved.revision, application });
       clearListed(saved);
-      await dismissEditor();
+      await dismissEditor(notifyGuard);
       await onCommitted(entryId);
   }
 
-  async function leaveEditor(keep: boolean) {
+  async function leaveEditor(keep: boolean, notifyGuard = true) {
       const active = current.current;
       if (!active) return;
       window.clearTimeout(timer.current);
@@ -324,7 +324,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
         await pendingWrite.current;
         if (current.current?.saved) await discard(current.current.saved);
       }
-      await dismissEditor();
+      await dismissEditor(notifyGuard);
   }
 
   function updateTarget(target: Target) {
@@ -387,8 +387,8 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
       // The window can be reopened from the tray without reopening a clean form.
       window.clearTimeout(timer.current);
       replaceEditor(null);
-      await onOpenChange(false);
       await answerClose(closeRequest, true);
+      await onOpenChange(false);
     });
   }, [closeRequest, needsCloseChoice, working]);
 
@@ -453,10 +453,10 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
       {error && needsCloseChoice && <p className="alert error" role="alert">{error}</p>}
       <div className="actions">
         <button type="button" className="primary" disabled={working || !enabled} onClick={() => {
-          if (closeRequest) run(async () => { await applyEditor(); await answerClose(closeRequest, true); });
+          if (closeRequest) run(async () => { await applyEditor(false); await answerClose(closeRequest, true); await onOpenChange(false); });
         }}>Zapisz</button>
         <button type="button" className="secondary" disabled={working} onClick={() => {
-          if (closeRequest) run(async () => { await leaveEditor(false); await answerClose(closeRequest, true); });
+          if (closeRequest) run(async () => { await leaveEditor(false, false); await answerClose(closeRequest, true); await onOpenChange(false); });
         }}>Odrzuć zmiany</button>
         <button ref={stay} type="button" className="secondary" disabled={working} onClick={() => {
           if (closeRequest) run(() => answerClose(closeRequest, false));
