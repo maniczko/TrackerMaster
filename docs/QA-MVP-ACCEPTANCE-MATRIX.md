@@ -261,3 +261,12 @@ Szczegółowe kroki i pełne oczekiwane wyniki są w §3. Każdy wynik zapisz we
 - Brak krytycznych `FAIL`/`BLOCKED`. Każdy defekt ma zgłoszenie i ponowny wynik.
 - UIQ-09 (125%/150%) i Narrator bez blokujących usterek (UIQ). Dark mode nie jest kryterium (V1.1).
 - Niezależny recenzent QA potwierdza wyniki. Autor kodu nie zatwierdza wydania samodzielnie (QA-01).
+
+## 8. Rozszerzenie V1.1 — PTT-61 / DEV-39 (Bezczynność i przypomnienia)
+
+- **Dowody automatyczne CI (bez fizycznego Windows 11):**
+  - **Rust (`attention::tests::*`, `attention_settings::tests::*`, `sleep_periods::tests::*`, `power_events::tests::*`):** `I01–I15c`, `I17–I25` (progi 5–60 min, przycinanie początku, zawijanie ticków `u32`, skok zegara, spójność z D4 / wyjątek O5a, `stop_timer_at_idle_start`, D3 Stop/Switch, odzyskiwanie po awarii, harmonogram i DST `Europe/Warsaw`, długi pomiar 4h/8h, uszkodzony `attention-settings.json`, brak zakazanych importów Win32).
+  - **Node (`tests/attentionSchedule.test.ts`, `tests/designTokens.test.mjs`):** reguły harmonogramu IANA DST 23/25h, komunikaty PL, zgodność z tokenami UIQ.
+  - **E2E CI (`tests/windows-application.mjs`, faza `idle-reminders`):** zapis ustawień `attention-settings.json`, okres `idle` i `sleep` w jednej transakcji, odróżnienie „Bezczynność” i „Uśpienie” na liście i w sumach (Historia / Raport / CSV), oraz `stop_timer_at_idle_start`.
+- **Runbook odbioru na Windows 11 x64 (`BLOCKED` do fizycznego wykonania):** W1–W10 z `docs/TECH-12-IDLE-AND-REMINDERS.md` §5.2 (rzeczywista 15-min bezczynność myszy/klawiatury, `Win+L` z PIN-em, sesja RDP, uśpienie S3/Modern Standby + O5a, powiadomienia Windows z pakietu MSIX i Focus Assist).
+

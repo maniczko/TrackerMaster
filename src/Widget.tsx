@@ -5,6 +5,9 @@ import type { Snapshot } from './App';
 import { MiniTimerTaskPicker, TimerIcon } from './MiniTimerPanel';
 import { activeContext, barContext, choicesFor, clockState, createActionSettle, createRequestGate, descriptionCommand, projectColour, projectPath, readLegacyPin, recentChoices, switchChoices, switchCommand, taskName, toggleCommand } from './miniTimerModel';
 import type { DescriptionDraft } from './miniTimerModel';
+import AttentionBanner from './AttentionBanner';
+import { openIdleLabel } from './attentionSchedule';
+import { useAttention } from './useAttention';
 import { defaultShortcut, matchesShortcut, shortcutLabel } from './shortcut';
 import './miniTimer.css';
 
@@ -82,9 +85,13 @@ export default function Widget() {
   const recent = useMemo(() => recentChoices(choices, data?.entries ?? []), [choices, data]);
   const choice = selected ? choices.find(item => item.key === selected) : recent[0];
   const active = data?.active ?? null;
+  const attention = useAttention(Boolean(data), 'Europe/Warsaw', now, async () => { await refresh(true); });
+  const openIdleStartedMs = attention.state.openIdle && active && String(attention.state.openIdle.entryId) === String(active.id) && !active.recovered && !active.uncertain
+    ? attention.state.openIdle.startedMs
+    : null;
   const context = data && active ? activeContext(data, active) : { title: choice ? taskName(choice) : 'Wybierz projekt lub zadanie', path: choice ? projectPath(choice) : data ? 'Gotowy do nowego pomiaru' : 'Mini timer' };
   const bar = barContext(data, active, choice);
-  const clock = clockState(data, now);
+  const clock = clockState(data, now, openIdleStartedMs);
   const retainedEdit = edit !== null && edit.entryId !== String(active?.id);
   const dirtyEdit = edit !== null && edit.value !== edit.expected && !retainedEdit;
   const conflict = dirtyEdit && edit !== null && active?.description !== edit.expected;
@@ -228,6 +235,7 @@ export default function Widget() {
   else if (verify) status = { text: 'Nie potwierdzono zapisu', tone: 'error', action: 'Sprawdź stan', run: () => void checkState() };
   else if (clock.mode === 'unavailable') status = { text: 'Czas jest niedostępny', tone: 'warn', action: 'Otwórz aplikację', run: showApp };
   else if (dirtyEdit) status = { text: conflict ? 'Opis zmieniono w innym oknie' : 'Niezapisany opis', tone: 'warn', action: open ? undefined : 'Pokaż opis', run: () => void setPanel(true) };
+  else if (openIdleStartedMs !== null) status = { text: openIdleLabel(openIdleStartedMs, now, 'Europe/Warsaw'), tone: 'warn' };
   else if (windowError || shortcutError || shortcut?.message) status = { text: windowError || shortcutError || shortcut!.message, tone: 'error' };
   else if (notice) status = { text: notice, tone: 'quiet' };
   const toggleLabel = active ? 'Zatrzymaj pomiar' : 'Rozpocznij pomiar';
@@ -254,6 +262,8 @@ export default function Widget() {
       <span role={status.tone === 'quiet' ? 'status' : 'alert'} title={status.text}>{status.text}</span>
       {status.action && <button type="button" className="qp-text-button" onClick={status.run}>{status.action}</button>}
     </div>}
+    <AttentionBanner compact attention={attention} reportZone="Europe/Warsaw" now={now} hasActiveTimer={Boolean(active)}
+      onOpenApp={showApp} onStartFocus={() => { if (!open) void setPanel(true); else search.current?.focus(); }} />
     {open && <section id="qp-panel" className="qp-panel" aria-label="Panel mini timera">
       <div className="qp-panel-header"><strong>{active ? 'Bieżący pomiar' : 'Nowy pomiar'}</strong><button type="button" className="qp-text-button" onClick={showApp}>Otwórz aplikację</button></div>
       <div className="qp-full" ref={fullContext} tabIndex={-1} aria-label="Pełny kontekst pomiaru">
