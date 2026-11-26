@@ -481,10 +481,22 @@ fn create_backup(app: tauri::AppHandle, state: State<'_, Shared>) -> Cmd<String>
 #[derive(Serialize)]
 struct RestorePreview { token: String, health: storage_safety::DatabaseHealth }
 
+fn is_unc_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _)
+            )
+    )
+}
+
 #[tauri::command]
 fn prepare_backup_restore(state: State<'_, Restore>, path: String) -> Cmd<RestorePreview> {
     let path = std::path::Path::new(path.trim());
     if !path.is_absolute() { return Err("Podaj pełną ścieżkę do pliku kopii.".into()); }
+    if is_unc_path(path) { return Err("Ścieżka sieciowa nie jest obsługiwana. Wskaż lokalny plik kopii.".into()); }
     let prepared = storage_safety::prepare_restore(path)
         .map_err(|_| "Nie można odczytać tej kopii lub jej format jest niezgodny. Bieżące dane nie zostały zmienione.".to_string())?;
     let health = prepared.health.clone();
@@ -1474,9 +1486,14 @@ fn request_quit(app: &tauri::AppHandle) {
     let Some(quit_permit) = app.state::<quit_dialog::QuitDialog>().try_begin() else { return; };
     let shared = app.state::<Shared>();
     let guard = shared.lock();
-    let active = guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
-        .and_then(|tracker| snapshot(tracker).map(|s| s.active));
-    if matches!(active, Ok(None)) { app.exit(0); }
+    let restored = guard.as_ref().is_ok_and(|tracker| tracker.restored);
+    let active = if restored {
+        Ok(None)
+    } else {
+        guard.as_ref().map_err(|_| "Błąd dostępu do danych lokalnych.".to_string())
+            .and_then(|tracker| snapshot(tracker).map(|s| s.active))
+    };
+    if restored || matches!(active, Ok(None)) { app.exit(0); }
     else {
         // Do not hold the tracker lock or block the UI thread during a dialog.
         drop(guard);
@@ -3679,5 +3696,12 @@ mod tests {
         if option_env!("VITE_TRACKER_TEST_MODE") != Some("1") {
             assert_eq!(BUILD_PROFILE_MARKER, "TRACKERMASTER_BUILD_PROFILE=production;");
         }
+    }
+
+    #[test]
+    fn unc_paths_are_rejected_for_backup_restore() {
+        assert!(is_unc_path(Path::new(r"\\server\share\backup.sqlite3")));
+        assert!(is_unc_path(Path::new(r"\\?\UNC\server\share\backup.sqlite3")));
+        assert!(!is_unc_path(Path::new(r"C:\Users\Test\backups\backup.sqlite3")));
     }
 }

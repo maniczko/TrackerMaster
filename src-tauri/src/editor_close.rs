@@ -30,13 +30,14 @@ pub(super) struct EditorClose(Mutex<Guard>);
 pub(super) fn intercept(app: &AppHandle, action: CloseAction) -> bool {
     let state = app.state::<EditorClose>();
     let Ok(mut guard) = state.0.lock() else {
-        return true;
+        return false;
     };
+    if !guard.editor_open {
+        guard.waiting = None;
+        return false;
+    }
     if guard.waiting.is_some() {
         return true;
-    }
-    if !guard.editor_open {
-        return false;
     }
     guard.sequence = guard.sequence.wrapping_add(1);
     let request = CloseRequest {
@@ -52,17 +53,23 @@ pub(super) fn intercept(app: &AppHandle, action: CloseAction) -> bool {
     }
     if app.emit_to("main", "entry-editor-close", request).is_ok() {
         guard.waiting = Some(request);
+        true
+    } else {
+        guard.waiting = None;
+        false
     }
-    true
 }
 
 #[tauri::command]
 pub(super) fn set_entry_editor_guard(state: State<'_, EditorClose>, open: bool) -> Cmd<()> {
-    state
+    let mut guard = state
         .0
         .lock()
-        .map_err(|_| "Nie można ustalić stanu formularza.")?
-        .editor_open = open;
+        .map_err(|_| "Nie można ustalić stanu formularza.")?;
+    guard.editor_open = open;
+    if !open {
+        guard.waiting = None;
+    }
     Ok(())
 }
 
@@ -97,5 +104,29 @@ pub(super) fn resolve_entry_editor_close(
             crate::request_quit(&app);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_clears_waiting_when_closed_and_tracks_sequence() {
+        let close = EditorClose::default();
+        {
+            let mut guard = close.0.lock().unwrap();
+            guard.editor_open = true;
+            guard.sequence = 1;
+            guard.waiting = Some(CloseRequest {
+                id: 1,
+                action: CloseAction::Hide,
+            });
+            guard.editor_open = false;
+            guard.waiting = None;
+        }
+        let guard = close.0.lock().unwrap();
+        assert!(!guard.editor_open);
+        assert!(guard.waiting.is_none());
     }
 }

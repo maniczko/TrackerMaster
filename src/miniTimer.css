@@ -82,7 +82,7 @@
 .qp-status[data-tone='error'] { background: var(--color-error-bg); color: var(--color-error-text); border-top-color: var(--color-error-border); }
 .qp-mini:has(.qp-status):not(:has(.qp-panel)) .qp-bar { min-height: calc(100% - 27px); }
 .qp-mini .qp-text-button { border: 1px solid transparent; border-radius: var(--radius-sm); color: var(--color-accent-strong); background: transparent; min-height: 32px; padding: 2px 6px; font-size: var(--text-xs); font-weight: 650; text-align: left; transition: background-color var(--motion-fast) ease; }
-.qp-mini .qp-status .qp-text-button { min-height: 22px; padding: 0 4px; color: inherit; text-decoration: underline; white-space: nowrap; }
+.qp-mini .qp-status .qp-text-button { min-height: 24px; padding: 0 6px; color: inherit; text-decoration: underline; white-space: nowrap; }
 .qp-mini .qp-text-button:hover:not(:disabled) { background: var(--color-accent-soft); }
 
 /* Expanded panel: continues the same surface below a hairline; content-sized sections. */

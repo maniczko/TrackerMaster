@@ -98,7 +98,7 @@ if (scenario === 'recovered' || scenario === 'sleep') {
 }
 
 const snapshot = () => ({ clients, projects, tasks, active: active && { ...active }, entries: [...entries].reverse() });
-const health = () => ({ schema_version: 14, clients: clients.length, projects: projects.length, tasks: tasks.length, completed_entries: entries.length, open_entries: active ? 1 : 0 });
+const health = () => ({ schema_version: 15, clients: clients.length, projects: projects.length, tasks: tasks.length, completed_entries: entries.length, open_entries: active ? 1 : 0 });
 const close = (end: number) => {
   if (!active) throw 'Brak aktywnego pomiaru.';
   const start = Date.parse(active.started_at);
@@ -166,6 +166,22 @@ const entryHandlers: Record<string, (a: any) => unknown> = {
     return draft;
   },
   discard_entry_draft: a => { if (drafts.get(a.entryId)?.revision === a.revision) drafts.delete(a.entryId); },
+  check_entry_draft_source: a => {
+    const entry = entries.find(item => item.id === a.entryId && item.ended_at);
+    const draft = drafts.get(a.entryId);
+    if (!draft || draft.revision !== a.revision) throw 'Szkic zmienił się w innym oknie. Otwórz go ponownie.';
+    if (!entry) return { status: 'missing', source: draft.source };
+    const current = editSource(a.entryId);
+    const same = current.timeRevision === draft.source.timeRevision
+      && current.descriptionRevision === draft.source.descriptionRevision
+      && current.billingRevision === draft.source.billingRevision
+      && current.startedAt === draft.source.startedAt
+      && current.endedAt === draft.source.endedAt
+      && current.description === draft.source.description
+      && current.billable === draft.source.billable;
+    return same ? { status: 'ready', source: current } : { status: 'changed', source: current };
+  },
+  get_entry_draft_origin: () => null,
   apply_entry_draft: a => {
     const draft = drafts.get(a.entryId);
     if (!draft || draft.revision !== a.revision) throw 'Szkic zmienił się w innym oknie. Otwórz go ponownie.';
