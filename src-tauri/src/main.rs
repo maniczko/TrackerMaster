@@ -405,7 +405,7 @@ fn set_sleep_resume(state: State<'_, Shared>, entry_id: i64, period_id: i64, end
 fn resolve_sleep_period(app: tauri::AppHandle, state: State<'_, Shared>, attention_state: State<'_, attention::SharedAttention>, entry_id: i64, period_id: i64, include: bool) -> Cmd<()> {
     let mut tracker = locked(&state)?;
     sleep_periods::resolve(&mut tracker.db, entry_id, period_id, include, Utc::now().timestamp_millis())
-        .map_err(|_| "Nie można zapisać decyzji. Odśwież listę i spróbuj ponownie.".into())?;
+        .map_err(|_| String::from("Nie można zapisać decyzji. Odśwież listę i spróbuj ponownie."))?;
     drop(tracker);
     if let Some(snapshot) = attention::clear_prompt_for_period(&attention_state, period_id) {
         attention::emit_state(&app, &snapshot);
