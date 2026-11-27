@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useState } from 'react';
 import { exportCsv, formatDuration, localTimestamp, makeClientExportRows, sameExportRows, spreadsheetText } from './reportCsv';
 import type { ExportEntry, ExportRow } from './reportCsv';
+import { exportXlsx } from './reportXlsx';
 import type { ReportScope } from './reportScope';
 
 type ExportData = { client_id: number; client: string; time_zone: string; entries: ExportEntry[] };
@@ -38,32 +39,68 @@ export default function ReportExport({ scope, from, through, zone, expectedRows,
     finally { setBusy(false); }
   }
 
-  function download() {
+  function triggerDownload(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+
+  function downloadCsv() {
     if (!current) return;
     try {
-      const url = URL.createObjectURL(new Blob([current.csv], { type: 'text/csv;charset=utf-8' }));
-      const anchor = document.createElement('a');
-      anchor.href = url; anchor.download = `TrackerMaster-${current.from}-${current.through}.csv`;
-      document.body.appendChild(anchor); anchor.click(); anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      triggerDownload(new Blob([current.csv], { type: 'text/csv;charset=utf-8' }), `TrackerMaster-${current.from}-${current.through}.csv`);
       setError('');
     } catch (e) { setError(`Nie udało się pobrać pliku: ${String(e)}`); }
   }
 
+  function downloadXlsx() {
+    if (!current) return;
+    try {
+      const bytes = exportXlsx(current.rows, {
+        client: current.client,
+        from: current.from,
+        through: current.through,
+        zone: current.zone,
+      });
+      triggerDownload(
+        new Blob([new Uint8Array(bytes)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+        `TrackerMaster-${current.from}-${current.through}.xlsx`,
+      );
+      setError('');
+    } catch (e) { setError(`Nie udało się pobrać pliku XLSX: ${String(e)}`); }
+  }
+
+  function cancelPreview() {
+    setPreview(null);
+    setError('');
+  }
+
   return <section className="report-export" aria-label="Eksport CSV">
-    <h3>Eksport CSV klienta</h3>
+    <h3>Eksport CSV i XLSX klienta</h3>
     <p className="muted">Wybierz jednego klienta i zakres raportu, a następnie sprawdź podgląd. Plik obejmuje zakończone wpisy z rozstrzygniętymi przerwami.</p>
-    <button type="button" className="secondary report-button" disabled={scope.clientId === null || !zone || incomplete || busy} onClick={() => void prepare()}>{busy ? 'Przygotowywanie…' : 'Przygotuj podgląd CSV'}</button>
+    <div className="report-row-actions">
+      <button type="button" className="secondary report-button" disabled={scope.clientId === null || !zone || incomplete || busy} onClick={() => void prepare()}>{busy ? 'Przygotowywanie…' : 'Przygotuj podgląd CSV'}</button>
+      <button type="button" className="secondary report-button" disabled={scope.clientId === null || !zone || incomplete || busy} onClick={() => void prepare()}>{busy ? 'Przygotowywanie…' : 'Przygotuj podgląd XLSX'}</button>
+    </div>
     {error && <div role="alert" className="alert error">{error}</div>}
-    {incomplete && <p className="muted">Przygotowanie CSV będzie możliwe po poprawieniu danych raportu.</p>}
+    {incomplete && <p className="muted">Przygotowanie eksportu będzie możliwe po poprawieniu danych raportu.</p>}
     {preview && !current && <p role="status">Dane w raporcie się zmieniły. Przygotuj nowy podgląd przed pobraniem.</p>}
     {current && <div className="export-preview">
       <p>Klient: <strong>{clientLabel?.endsWith(current.client) ? clientLabel.slice(0, clientLabel.length - current.client.length) : ''}{spreadsheetText(current.client)}</strong> · {current.from} — {current.through} · {current.zone}</p>
       <p>Liczba wpisów: <strong>{current.rows.length}</strong> · Czas w okresie: <strong>{formatDuration(current.total)}</strong></p>
-      <p className="muted">Podgląd i plik zawierają te same zakończone wpisy. Tekst podobny do formuły otrzyma apostrof ochronny.</p>
+      <p className="muted">Podgląd i pobrany plik (CSV albo XLSX) zawierają te same zakończone wpisy. Tekst podobny do formuły otrzyma apostrof ochronny.</p>
       {current.rows.length === 0 && <p className="muted">Brak zakończonych, rozstrzygniętych wpisów spełniających filtry.</p>}
       {current.rows.length > 0 && <div className="table-wrap"><table><thead><tr><th>ID</th><th>Projekt</th><th>Zadanie</th><th>Opis</th><th>Początek</th><th>Koniec</th><th>Rozliczalny</th><th>Cały wpis</th><th>W okresie</th></tr></thead><tbody>{current.rows.map(({ source, contribution }) => <tr key={source.id}><td>{source.id}</td><td>{spreadsheetText(source.project)}</td><td>{spreadsheetText(source.task)}</td><td>{spreadsheetText(source.description)}</td><td>{localTimestamp(source.started_at, current.zone)}</td><td>{localTimestamp(source.ended_at, current.zone)}</td><td>{source.billable ? 'Tak' : 'Nie'}</td><td>{formatDuration(source.duration_seconds)} ({source.duration_seconds} s)</td><td>{formatDuration(contribution)} ({contribution} s)</td></tr>)}</tbody></table></div>}
-      <button type="button" className="secondary report-button" onClick={download}>Potwierdź i pobierz CSV</button>
+      <div className="report-row-actions">
+        <button type="button" className="secondary report-button" onClick={downloadCsv}>Potwierdź i pobierz CSV</button>
+        <button type="button" className="secondary report-button" onClick={downloadXlsx}>Potwierdź i pobierz XLSX</button>
+        <button type="button" className="secondary report-button" onClick={cancelPreview}>Anuluj podgląd</button>
+      </div>
     </div>}
   </section>;
 }

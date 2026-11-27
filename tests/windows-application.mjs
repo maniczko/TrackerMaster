@@ -7,6 +7,7 @@ import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
+import { inspectZipStore } from '../src/zipStore.ts';
 
 // Registry settings are temporary, scoped to the test executable on a disposable runner.
 assert.equal(process.platform, 'win32');
@@ -2610,6 +2611,76 @@ async function runWindow(port, phase, recovery) {
       assert.ok(!rows[1].includes(secondClient) && !rows[1].includes(secondDescription));
       assert.equal(Number(rows[1].split(';')[10].replaceAll('"', '')), seconds);
       console.log('First window: downloaded CSV matched Report Details');
+      // DEV-17: cancel preview leaves no XLSX, failed prepare surfaces error and retries, and confirmed XLSX is a real OOXML ZIP.
+      await cdp.send('Runtime.evaluate', {
+        expression: `[...document.querySelectorAll('.export-preview button')].find(item => item.textContent === 'Anuluj podgląd')?.click()`,
+        returnByValue: true,
+      }, sessionId);
+      await waitFor('cancelled preview disappears', async () => (await cdp.send('Runtime.evaluate', {
+        expression: `!document.querySelector('.export-preview')`,
+        returnByValue: true,
+      }, sessionId)).result.value === true);
+      assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.xlsx')).length, 0);
+
+      await cdp.send('Runtime.evaluate', {
+        expression: `[...document.querySelectorAll('.report-export button')].find(item => item.textContent === 'Przygotuj podgląd XLSX')?.click()`,
+        returnByValue: true,
+      }, sessionId);
+      await waitFor('XLSX preview opened', async () => (await cdp.send('Runtime.evaluate', {
+        expression: `Boolean(document.querySelector('.export-preview tbody'))`,
+        returnByValue: true,
+      }, sessionId)).result.value === true);
+
+      await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          const orig = URL.createObjectURL.bind(URL);
+          URL.createObjectURL = () => {
+            URL.createObjectURL = orig;
+            throw new Error('Symulowany błąd zapisu XLSX');
+          };
+          const button = [...document.querySelectorAll('.export-preview button')].find(item => item.textContent === 'Potwierdź i pobierz XLSX');
+          button.click();
+        })()`,
+        userGesture: true,
+        returnByValue: true,
+      }, sessionId);
+      await waitFor('XLSX error alert shown', async () => (await cdp.send('Runtime.evaluate', {
+        expression: `Boolean(document.querySelector('.report-export [role="alert"]')?.textContent.includes('Symulowany błąd zapisu XLSX'))`,
+        returnByValue: true,
+      }, sessionId)).result.value === true);
+      assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.xlsx')).length, 0);
+
+      const xlsxDownload = await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          const button = [...document.querySelectorAll('.export-preview button')].find(item => item.textContent === 'Potwierdź i pobierz XLSX');
+          if (!button || button.disabled) return false;
+          button.click();
+          return true;
+        })()`,
+        userGesture: true,
+        returnByValue: true,
+      }, sessionId).catch(error => {
+        if (!/Execution context was destroyed/i.test(error.message)) throw error;
+        return null;
+      });
+      if (xlsxDownload) assert.equal(xlsxDownload.result.value, true, 'XLSX confirmation disappeared before download');
+      const xlsxFile = await waitFor('completed XLSX file', async () => (await readdir(csvDirectory)).find(name => name.endsWith('.xlsx')));
+      const xlsxBytes = await readFile(join(csvDirectory, xlsxFile));
+      assert.deepEqual([...xlsxBytes.subarray(0, 4)], [0x50, 0x4b, 0x03, 0x04]);
+      const xlsxParts = inspectZipStore(xlsxBytes);
+      assert.ok(xlsxParts.has('xl/worksheets/sheet1.xml') && xlsxParts.has('xl/worksheets/sheet2.xml'));
+      const xlsxSheet1 = xlsxParts.get('xl/worksheets/sheet1.xml');
+      const xlsxSheet2 = xlsxParts.get('xl/worksheets/sheet2.xml');
+      assert.ok(xlsxSheet1.includes(primaryClient) && xlsxSheet1.includes(primaryDescription));
+      assert.ok(!xlsxSheet1.includes(secondClient) && !xlsxSheet1.includes(secondDescription));
+      assert.ok(xlsxSheet1.includes(`<v>${seconds}</v>`));
+      assert.ok(xlsxSheet2.includes(primaryClient) && xlsxSheet2.includes(`<v>${seconds}</v>`));
+      const zipEntriesCheck = execFileSync('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `Add-Type -AssemblyName System.IO.Compression.FileSystem; $z=[IO.Compression.ZipFile]::OpenRead(${JSON.stringify(join(csvDirectory, xlsxFile))}); try { ($z.Entries | ForEach-Object { $_.FullName }) -join ',' } finally { $z.Dispose() }`,
+      ], { encoding: 'utf8', timeout: 10_000, windowsHide: true }).trim();
+      assert.ok(zipEntriesCheck.includes('xl/worksheets/sheet1.xml') && zipEntriesCheck.includes('xl/workbook.xml'));
+      console.log('First window: downloaded real XLSX matched Report Details and Windows ZIP reader');
       await captureMainLayout(cdp, sessionId, 'idle-with-history');
       console.log(`CSV_DIAGNOSTIC phase=after-read protocol=${JSON.stringify(cdp.downloadEvents)} directory=${JSON.stringify(await csvSnapshot())}`);
     } else {
