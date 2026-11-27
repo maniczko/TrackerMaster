@@ -292,6 +292,18 @@ pub fn get_autostart(app: tauri::AppHandle) -> Result<AutostartStatus, String> {
 
 #[tauri::command]
 pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<AutostartStatus, String> {
+    if option_env!("VITE_TRACKER_TEST_MODE") == Some("1")
+        && app.config().identifier == TEST_IDENTIFIER
+    {
+        use tauri::Manager as _;
+        if let Ok(dir) = app.path().app_data_dir() {
+            let marker = dir.join("fail-autostart-once.flag");
+            if marker.exists() {
+                let _ = std::fs::remove_file(&marker);
+                return Err("Symulowany błąd zapisu autostartu w trybie testowym.".into());
+            }
+        }
+    }
     let name = value_name(&app.config().identifier);
     let exe = std::env::current_exe()
         .map_err(|_| "Nie można odczytać ścieżki aplikacji TrackerMaster.".to_string())?;

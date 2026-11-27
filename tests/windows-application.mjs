@@ -852,19 +852,11 @@ async function verifyAutostart(cdp, mainSession) {
       return box && !box.disabled && !box.checked;
     })()`));
 
-    // Error + Ponów retry path before persistence.
-    await evaluate(`(() => {
-      const orig = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
-      window.__TAURI_INTERNALS__.invoke = (cmd, args) => {
-        if (cmd === 'set_autostart') {
-          window.__TAURI_INTERNALS__.invoke = orig;
-          return Promise.reject('Symulowany błąd rejestru HKCU');
-        }
-        return orig(cmd, args);
-      };
-      document.querySelector(${JSON.stringify(`${section} input[type="checkbox"]`)}).click();
-    })()`);
-    await waitFor('autostart error alert displayed', () => evaluate(`Boolean(document.querySelector(${JSON.stringify(`${section} [role="alert"]`)})?.textContent.includes('Symulowany błąd rejestru HKCU'))`));
+    // Error + Ponów retry path before persistence (one-shot isolated test marker consumed by backend).
+    const failFlag = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'fail-autostart-once.flag');
+    await writeFile(failFlag, '1', 'utf8');
+    await evaluate(`document.querySelector(${JSON.stringify(`${section} input[type="checkbox"]`)}).click()`);
+    await waitFor('autostart error alert displayed', () => evaluate(`Boolean(document.querySelector(${JSON.stringify(`${section} [role="alert"]`)})?.textContent.includes('Symulowany błąd zapisu autostartu'))`));
     assert.equal(queryAutostart(), null, 'Failed autostart write must not write HKCU\\Run');
 
     await evaluate(`document.querySelector(${JSON.stringify(`${section} [role="alert"] button`)}).click()`);
@@ -886,6 +878,7 @@ async function verifyAutostart(cdp, mainSession) {
     assert.equal(queryAutostart(), null, 'Disabling autostart must delete HKCU\\Run value');
     console.log('PASS: DEV-18 per-user Windows autostart toggles HKCU\\Run cleanly, handles error/retry, and --autostart leaves timer stopped');
   } finally {
+    await rm(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'fail-autostart-once.flag'), { force: true });
     try { execFileSync('reg.exe', ['delete', autostartKey, '/v', 'TrackerMasterTest', '/f'], { stdio: 'ignore', windowsHide: true }); } catch {}
   }
 }
