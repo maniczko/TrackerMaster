@@ -1667,10 +1667,10 @@ async function verifyCalendarDrag(cdp, sessionId) {
   await invoke('stop_timer', { expectedActiveId: running.id });
   await waitFor('drag phase timer stopped', () => invoke('get_snapshot').then(snapshot => snapshot.active === null));
   await evaluate(`${viewButton('Timer')}.click()`);
+  console.log(`PASS: DEV-38 drag 09:00–10:00 → 11:00–12:00 (3600 s), end handle → 12:30 (5400 s, report +1800 s), overlap refused and a failed write left the block and the database unchanged with one retry saving one correction (#${a.id}), Alt+arrows kept 1827 s, Esc cancels, click opens the form, totals equal to the second, running timer untouched`);
   } finally {
     await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
   }
-  console.log(`PASS: DEV-38 drag 09:00–10:00 → 11:00–12:00 (3600 s), end handle → 12:30 (5400 s, report +1800 s), overlap refused and a failed write left the block and the database unchanged with one retry saving one correction (#${a.id}), Alt+arrows kept 1827 s, Esc cancels, click opens the form, totals equal to the second, running timer untouched`);
 }
 
 async function verifyRestoreRetry(cdp, sessionId) {
