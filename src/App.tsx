@@ -14,8 +14,8 @@ import EntryMenu from './EntryMenu';
 import { entryTimeRange } from './historyFormat';
 import { defaultShortcut, shortcutLabel } from './shortcut';
 import { MiniTimerTaskPicker } from './MiniTimerPanel';
-import { choicesFor, createActionSettle, createRequestGate, recentChoices } from './miniTimerModel';
-import { mainAction, selectionFor, selectionKey, startBlocked } from './timerChoice';
+import { choicesFor, createActionSettle, createRequestGate, projectColour, projectPath, recentChoices, taskName } from './miniTimerModel';
+import { mainAction, quickRecentBlocked, selectionFor, selectionKey, startBlocked } from './timerChoice';
 import { historyDays, liveTimerTotals, timerTotals, totalsBaseData } from './reportDayModel';
 import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
@@ -203,6 +203,21 @@ export default function App() {
     setClientId(next.clientId); setProjectId(next.projectId); setTaskId(next.taskId);
     timerDescriptionInput.current?.focus();
   }
+  function quickStartRecent(choice: (typeof recent)[number]) {
+    if (quickRecentBlocked(choice, { busy, loaded, active: data.active })) return;
+    setClientId(String(choice.client.id));
+    setProjectId(String(choice.project.id));
+    setTaskId(choice.task ? String(choice.task.id) : '');
+    return execute(
+      () => invoke('start_project_timer', {
+        projectId: Number(choice.project.id),
+        taskId: choice.task ? Number(choice.task.id) : null,
+        expectedActiveId: data.active ? Number(data.active.id) : null,
+        description: '',
+      }),
+      data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.',
+    );
+  }
 
   async function execute(action: () => Promise<unknown>, message: string) {
     if (!writes.beginWrite()) return;
@@ -380,6 +395,23 @@ export default function App() {
           <p className="timer-target" aria-live="polite">{selectedProject ? <>Wybrano: <strong>{selectedTask ? selectedTask.name : 'Bez zadania'}</strong> · {selectedClient ? clientLabelById.get(String(selectedClient.id)) : '—'} / {selectedProject.name}</> : 'Wybierz projekt lub zadanie poniżej.'}</p>
           <div className="timer-picker"><MiniTimerTaskPicker emptyHint="Najpierw dodaj klienta i projekt w sekcji „Dane i ustawienia” poniżej, w tym oknie." input={pickerInput} choices={choices} recent={recent} selected={selectionKey(projectId, taskId)}
             disabled={busy || !loaded || !!data.active?.recovered} onSelect={chooseTimerTarget} /></div>
+          {loaded && recent.length > 0 && <section className="quick-recent" aria-label="Ostatnie zadania">
+            <span className="quick-recent-label">Ostatnie zadania</span>
+            <div className="quick-recent-list">
+              {recent.map(choice => {
+                const blocked = quickRecentBlocked(choice, { busy, loaded, active: data.active });
+                const isRunning = Boolean(data.active && String(data.active.project_id) === String(choice.project.id)
+                  && (choice.task ? String(data.active.task_id) === String(choice.task.id) : data.active.task_id === null));
+                return <button type="button" key={choice.key} className="secondary quick-recent-item" disabled={blocked}
+                  data-key={choice.key} aria-current={isRunning ? 'true' : undefined}
+                  title={isRunning ? 'To zadanie jest już mierzone' : `${taskName(choice)} — ${projectPath(choice)}`}
+                  onClick={() => void quickStartRecent(choice)}>
+                  <span className="qp-dot" data-project-colour={projectColour(choice.project.id)} aria-hidden="true" />
+                  <span><strong>{taskName(choice)}</strong><small>{projectPath(choice)}</small></span>
+                </button>;
+              })}
+            </div>
+          </section>}
           <details className="timer-lists"><summary>Wybierz z list: klient, projekt, zadanie</summary>
           <div className="selectors">
             <label>Klient<select title={selectedClient ? clientLabelById.get(String(selectedClient.id)) : undefined} value={clientId} disabled={busy || !loaded} onChange={e => { setClientId(e.target.value); setProjectId(''); setTaskId(''); }}><option value="">Wybierz klienta</option>{data.clients.filter(c => showArchived || !c.archived).map(c => <option key={c.id} value={c.id}>{clientLabelById.get(String(c.id))}{c.archived ? ' (archiwum)' : ''}</option>)}</select></label>
