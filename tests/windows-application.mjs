@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry' || phase === 'drill-down') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -2511,6 +2511,148 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
+async function verifyDrillDown(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const press = async (key, code, keyCode) => {
+    for (const type of ['keyDown', 'keyUp']) await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: keyCode }, sessionId);
+  };
+  const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(b => b.textContent.trim() === ${JSON.stringify(label)})`;
+  const modeButton = label => `[...document.querySelectorAll('.calendar-mode button')].find(b => b.textContent.trim() === ${JSON.stringify(label)})`;
+  const report = '[aria-label="Raport czasu"]';
+
+  const cA = await invoke('create_client', { name: 'DEV-34 Klient Alfa' });
+  const cB = await invoke('create_client', { name: 'DEV-34 Klient Beta' });
+  const pA = await invoke('create_project', { clientId: cA, name: 'DEV-34 Projekt A' });
+  const pB = await invoke('create_project', { clientId: cB, name: 'DEV-34 Projekt B' });
+  const tA1 = await invoke('create_task', { projectId: pA, name: 'DEV-34 Zadanie A1' });
+  await invoke('create_project_manual_entry', {
+    projectId: pA, taskId: tA1,
+    startedAt: '2026-03-10T09:00:00.000Z', endedAt: '2026-03-10T10:00:00.000Z',
+    description: 'DEV-34 alfa zad1',
+  });
+  await invoke('create_project_manual_entry', {
+    projectId: pB, taskId: null,
+    startedAt: '2026-03-11T11:00:00.000Z', endedAt: '2026-03-11T12:00:00.000Z',
+    description: 'DEV-34 beta wpis',
+  });
+  await invoke('start_project_timer', { projectId: pA, taskId: tA1, expectedActiveId: null, description: 'DEV-34 w tle' });
+  const running = await waitFor('drilldown running timer', () => invoke('get_snapshot').then(s => s.active && { id: s.active.id, startedAt: s.active.started_at }));
+
+  // AC1 & AC3: Calendar Month day -> Week -> Wstecz -> Report Details -> Wstecz.
+  await evaluate(`${viewButton('Kalendarz')}.click()`);
+  await waitFor('calendar visible for drilldown', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"]'))`));
+  await evaluate(`(() => {
+    const selects = [...document.querySelectorAll('.calendar-filters select')];
+    if (selects[0] && selects[0].value !== '') {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(selects[0], '');
+      selects[0].dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (selects[3] && selects[3].value !== 'all') {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(selects[3], 'all');
+      selects[3].dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  })()`);
+  await evaluate(`${modeButton('Miesiąc')}.click()`);
+  await waitFor('month mode visible', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] input[type="month"]'))`));
+  await evaluate(`(() => {
+    const input = document.querySelector('[aria-label="Kalendarz"] input[type="month"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '2026-03');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await waitFor('March 2026 cell rendered', () => evaluate(`(document.querySelector('.month-cell[data-date="2026-03-10"]')?.getAttribute('aria-label') ?? '').includes('01:00:00')`));
+  await evaluate(`document.querySelector('.month-cell[data-date="2026-03-10"]').click()`);
+  await waitFor('month details dialog opened', () => evaluate(`Boolean(document.querySelector('.month-details'))`));
+  await evaluate(`[...document.querySelectorAll('.month-details button')].find(b => b.textContent.trim() === 'Pokaż w szczegółach raportu').click()`);
+  await waitFor('drill from month opened Report Details for 2026-03-10', () => evaluate(`(() => {
+    const dates = [...document.querySelectorAll(${JSON.stringify(report + ' input[type="date"]')})].map(i => i.value);
+    const body = document.querySelector('.report-detail tbody')?.textContent ?? '';
+    return !document.querySelector('.timer-view')?.hidden && dates[0] === '2026-03-10' && dates[1] === '2026-03-10' && body.includes('DEV-34 alfa zad1') && !body.includes('DEV-34 beta wpis');
+  })()`));
+  await evaluate(`document.querySelector(${JSON.stringify(report + ' .drill-back')}).click()`);
+  await waitFor('Wstecz restored Calendar Month', () => evaluate(`document.querySelector('.timer-view')?.hidden === true && ${modeButton('Miesiąc')}.getAttribute('aria-pressed') === 'true'`));
+
+  // AC1 & AC4: Calendar Week day header -> Report Details -> Wstecz -> Timer Report Summary.
+  await evaluate(`${modeButton('Tydzień')}.click()`);
+  await waitFor('week mode visible', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-week-total'))`));
+  await evaluate(`(() => {
+    const input = document.querySelector('[aria-label="Kalendarz"] input[type="date"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '2026-03-10');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await waitFor('March week day header clickable', () => evaluate(`Boolean([...document.querySelectorAll('.calendar-day-head-button')].find(b => b.getAttribute('aria-label')?.includes('10.03')))`));
+  await evaluate(`[...document.querySelectorAll('.calendar-day-head-button')].find(b => b.getAttribute('aria-label')?.includes('10.03')).click()`);
+  await waitFor('week day drill opened Details for 2026-03-10', () => evaluate(`document.querySelector('.report-detail tbody')?.textContent.includes('DEV-34 alfa zad1')`));
+  await evaluate(`document.querySelector(${JSON.stringify(report + ' .drill-back')}).click()`);
+  await waitFor('Wstecz restored Calendar Week', () => evaluate(`Boolean(document.querySelector('[aria-label="Kalendarz"] .calendar-week-total'))`));
+
+  // Summary chart bar via keyboard Enter & Wstecz context restore + AC2 locked client filter.
+  await evaluate(`${viewButton('Timer')}.click()`);
+  await waitFor('Timer view active', () => evaluate(`!document.querySelector('.timer-view')?.hidden`));
+  await evaluate(`(() => {
+    const open = [...document.querySelectorAll(${JSON.stringify(report + ' button')})].find(b => b.textContent.trim() === 'Otwórz raport');
+    if (open) open.click();
+  })()`);
+  await waitFor('Report opened', () => evaluate(`Boolean(document.querySelector('#report-client'))`));
+  await evaluate(`(() => {
+    const sel = document.querySelector('#report-client');
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(sel, '');
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await delay(50);
+  await evaluate(`(() => {
+    const [from] = document.querySelectorAll(${JSON.stringify(report + ' input[type="date"]')});
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(from, '2026-03-01');
+    from.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await delay(50);
+  await evaluate(`(() => {
+    const [, through] = document.querySelectorAll(${JSON.stringify(report + ' input[type="date"]')});
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(through, '2026-03-31');
+    through.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await delay(50);
+  await evaluate(`[...document.querySelectorAll(${JSON.stringify(report + ' button')})].find(b => b.textContent.trim() === 'Podsumowanie')?.click()`);
+  await waitFor('Summary chart for March rendered', () => evaluate(`Boolean(document.querySelector('.report-chart-bar[data-from="2026-03-11"]'))`));
+  await evaluate(`document.querySelector('.report-chart-bar[data-from="2026-03-11"]').focus()`);
+  await press('Enter', 'Enter', 13);
+  await waitFor('Keyboard Enter on bar drilled to 2026-03-11 Details', () => evaluate(`(() => {
+    const dates = [...document.querySelectorAll(${JSON.stringify(report + ' input[type="date"]')})].map(i => i.value);
+    const body = document.querySelector('.report-detail tbody')?.textContent ?? '';
+    return dates[0] === '2026-03-11' && dates[1] === '2026-03-11' && body.includes('DEV-34 beta wpis') && !body.includes('DEV-34 alfa zad1');
+  })()`));
+  await evaluate(`document.querySelector(${JSON.stringify(report + ' .drill-back')}).click()`);
+  await waitFor('Wstecz restored Summary range 2026-03-01..2026-03-31', () => evaluate(`(() => {
+    const dates = [...document.querySelectorAll(${JSON.stringify(report + ' input[type="date"]')})].map(i => i.value);
+    return Boolean(document.querySelector('.report-chart')) && dates[0] === '2026-03-01' && dates[1] === '2026-03-31';
+  })()`));
+
+  // AC2: Filter to Client Alfa (hide Beta), expand & drill task group row -> Details must never expose Beta.
+  await evaluate(`(() => {
+    const sel = document.querySelector('#report-client');
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(sel, ${JSON.stringify(String(cA))});
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor('Summary filtered to Client Alfa', () => evaluate(`(() => {
+    const text = document.querySelector('.report-groups tbody')?.textContent ?? '';
+    return text.includes('DEV-34 Klient Alfa') && !text.includes('DEV-34 Klient Beta');
+  })()`));
+  await evaluate(`[...document.querySelectorAll('.report-groups tbody tr[data-level="project"] .report-group-drill')][0].click()`);
+  await waitFor('Project group drill opened Details locked on Client Alfa', () => evaluate(`(() => {
+    const body = document.querySelector('.report-detail tbody')?.textContent ?? '';
+    return body.includes('DEV-34 alfa zad1') && !body.includes('DEV-34 beta wpis') && document.querySelector('#report-client')?.value === ${JSON.stringify(String(cA))};
+  })()`));
+  assert.ok(await evaluate(`document.documentElement.scrollWidth <= document.documentElement.clientWidth`), 'no horizontal overflow during drilldown');
+  assert.deepEqual(await invoke('get_snapshot').then(s => s.active && { id: s.active.id, startedAt: s.active.started_at }), running, 'drill-down must preserve running timer');
+  await invoke('stop_timer', { expectedActiveId: running.id });
+  await waitFor('drilldown running timer stopped', () => invoke('get_snapshot').then(s => s.active === null));
+  console.log('PASS: DEV-34 drill-down calendar <-> report Summary <-> Detailed, AC1-AC4 Wstecz & active client filter verified');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -2582,7 +2724,7 @@ async function runWindow(port, phase, recovery) {
       if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep', 'drill-down'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -2642,6 +2784,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
+    if (phase === 'drill-down') await verifyDrillDown(cdp, sessionId);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -2782,6 +2925,9 @@ try {
   // D4 short sleep (schema v14): last, after T27 restored the profile, so the entry counts asserted above are unaffected.
   await waitForWindowClosed(port);
   await runWindow(port, 'short-sleep', recovery);
+  // DEV-34: drill-down across Calendar Month/Week, Report Summary and Detailed.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'drill-down', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

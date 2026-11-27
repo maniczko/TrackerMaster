@@ -25,6 +25,8 @@
 .calendar-head, .calendar-canvas { display: grid; grid-template-columns: 56px repeat(7, minmax(0, 1fr)); }
 .calendar-head { position: sticky; top: 0; z-index: 4; border-bottom: 1px solid var(--color-border); background: var(--color-surface-muted); }
 .calendar-day-head { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--space-1); padding: var(--space-1) var(--space-2); border-left: 1px solid var(--color-border); font-size: var(--text-xs); color: var(--color-text-muted); }
+.app-shell .calendar-day-head-button { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--space-1); width: 100%; min-width: 0; min-height: var(--control-h); padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: inherit; font: inherit; text-align: left; }
+.app-shell .calendar-day-head-button:hover:not(:disabled) { background: var(--color-surface); color: var(--color-accent-strong); }
 .calendar-day-head strong { color: var(--color-text); font-size: var(--text-sm); }
 .calendar-day-head.is-today { box-shadow: inset 0 -3px 0 var(--color-accent); }
 .calendar-day-head.is-today strong { color: var(--color-accent-strong); }

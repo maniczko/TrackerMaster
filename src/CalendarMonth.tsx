@@ -18,7 +18,10 @@ import './calendarMonth.css';
 type Props = {
   report: AllClientsReport; catalog: ReportCatalog; loaded: boolean; now: number;
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean;
-  viewSwitch?: ReactNode; onOpenWeek: (date: string) => void;
+  viewSwitch?: ReactNode; backButton?: ReactNode;
+  initialRestore?: { key: number; month?: string; selected?: string | null };
+  onOpenWeek: (date: string, fromMonth?: string) => void;
+  onOpenReport?: (date: string, scope: ReportScope, state: { month?: string; selectedDate?: string | null }) => void;
 };
 
 const weekdays = ['Pon', 'Wt', 'Śr', 'Czw', 'Pt', 'Sob', 'Nd'];
@@ -39,21 +42,30 @@ function entryState(item: MonthCellEntry): string {
   return item.running ? `w trakcie, ${duration(item.seconds)} w tym dniu` : duration(item.seconds);
 }
 
-export default function CalendarMonth({ report, catalog, loaded, now, snapshotActive, snapshotFresh, viewSwitch, onOpenWeek }: Props) {
+export default function CalendarMonth({ report, catalog, loaded, now, snapshotActive, snapshotFresh, viewSwitch, backButton, initialRestore, onOpenWeek, onOpenReport }: Props) {
   const [saved] = useState(readSaved);
   const zone = report.read?.data.time_zone;
   const today = zone ? (() => { try { return dateInZone(now, zone); } catch { return null; } })() : null;
-  const [month, setMonth] = useState<string | null>(validCalendarMonth(saved.month) ? saved.month : null);
+  const [month, setMonth] = useState<string | null>(initialRestore?.month && validCalendarMonth(initialRestore.month) ? initialRestore.month : validCalendarMonth(saved.month) ? saved.month : null);
   const [scope, setScope] = useState<ReportScope>(saved.scope ?? allReportClients);
   const [billable, setBillable] = useState<CalendarBillable>(saved.billable ?? 'all');
-  const [selected, setSelected] = useState<string | null>(null);
-  const [focused, setFocused] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(initialRestore?.selected ?? null);
+  const [focused, setFocused] = useState<string | null>(initialRestore?.selected ?? null);
   const [scopeNotice, setScopeNotice] = useState('');
   const [noteOpen, setNoteOpen] = useState(false);
   const shownMonth = month ?? (today ? monthOf(today) : null);
   const cellRefs = useRef(new Map<string, HTMLButtonElement>());
   const details = useRef<HTMLDivElement>(null);
   const focusAfterRender = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!initialRestore?.key) return;
+    if (initialRestore.month && validCalendarMonth(initialRestore.month)) setMonth(initialRestore.month);
+    if (initialRestore.selected !== undefined) {
+      setSelected(initialRestore.selected);
+      setFocused(initialRestore.selected);
+    }
+  }, [initialRestore?.key]);
 
   useEffect(() => { if (shownMonth) save({ month: shownMonth, scope, billable }); }, [shownMonth, scope, billable]);
 
@@ -108,6 +120,7 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
 
   return <section className="card calendar calendar-month" aria-label="Kalendarz">
     <div className="calendar-toolbar">
+      {backButton}
       {viewSwitch}
       <div className="calendar-nav" role="group" aria-label="Wybór miesiąca">
         <button type="button" className="secondary" aria-label="Poprzedni miesiąc" disabled={!shownMonth} onClick={() => shownMonth && go(shiftMonth(shownMonth, -1))}>‹</button>
@@ -169,7 +182,10 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
                 <small>{item.range} · {entryState(item)}{item.billable ? '' : ' · nierozliczalny'}</small>
               </li>)}
             </ul>}
-          <div className="actions"><button type="button" className="primary" onClick={() => onOpenWeek(chosen.date)}>Pokaż tydzień</button></div>
+          <div className="actions">
+            <button type="button" className="primary" onClick={() => onOpenWeek(chosen.date, shownMonth ?? undefined)}>Pokaż tydzień</button>
+            {onOpenReport && <button type="button" className="secondary" onClick={() => onOpenReport(chosen.date, scope, { month: shownMonth ?? undefined, selectedDate: chosen.date })}>Pokaż w szczegółach raportu</button>}
+          </div>
           <p className="helper">Miesiąc tylko pokazuje wpisy. Dodasz lub poprawisz wpis w tygodniu („Pokaż tydzień”) albo w Historii.</p>
         </div>}
       </>}
