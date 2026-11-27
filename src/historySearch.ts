@@ -10,7 +10,7 @@
 // The phrase is never stored or logged: this module keeps no state between calls.
 import { makeReportView } from './reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from './reportView.ts';
-import { addDaySeconds } from './reportTime.ts';
+import { addDaySeconds, dateInZone, validTimeZone } from './reportTime.ts';
 import type { EntryContribution, ReportDay } from './reportTime.ts';
 import { allReportClients } from './reportScope.ts';
 import type { ReportCatalog } from './reportScope.ts';
@@ -126,3 +126,100 @@ export function searchSummary(base: SearchBase, matched: readonly SearchableEntr
     days: [...days].sort(([a], [b]) => b.localeCompare(a)).map(([date, value]) => ({ date, seconds: value })),
   };
 }
+
+/** Local date range spanning every completed entry (and a resolved active timer), or today when empty. */
+export function dataDateBounds(data: ReportData, now: number): { from: string; through: string } | null {
+  if (!validTimeZone(data.time_zone)) return null;
+  let minMs = Infinity;
+  let maxMs = -Infinity;
+  const check = (startIso: string, endIso: string | null) => {
+    const start = Date.parse(startIso);
+    const end = endIso === null ? NaN : Date.parse(endIso);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return;
+    if (start < minMs) minMs = start;
+    const endTouch = end > start ? end - 1 : start;
+    if (endTouch > maxMs) maxMs = endTouch;
+  };
+  for (const entry of data.entries) check(entry.started_at, entry.ended_at);
+  if (data.active && !data.active.unresolved && data.active.ended_at !== null) {
+    check(data.active.started_at, data.active.ended_at);
+  }
+  if (!Number.isFinite(minMs) || !Number.isFinite(maxMs)) {
+    const today = dateInZone(now, data.time_zone);
+    return { from: today, through: today };
+  }
+  return { from: dateInZone(minMs, data.time_zone), through: dateInZone(maxMs, data.time_zone) };
+}
+
+/** First `limit` rows across day groups, preserving full day totals even when a day spans pages. */
+export function paginateHistoryDays<T, D extends { date: string; label: string; seconds: number; rows: T[] }>(
+  days: readonly D[],
+  limit: number,
+): { days: D[]; shownRows: number; totalRows: number } {
+  const maxRows = Math.max(1, Math.floor(limit));
+  let totalRows = 0;
+  for (const day of days) totalRows += day.rows.length;
+  const visible: D[] = [];
+  let shownRows = 0;
+  for (const day of days) {
+    if (shownRows >= maxRows) break;
+    const remaining = maxRows - shownRows;
+    if (day.rows.length <= remaining) {
+      visible.push(day);
+      shownRows += day.rows.length;
+    } else {
+      visible.push({ ...day, rows: day.rows.slice(0, remaining) });
+      shownRows += remaining;
+    }
+  }
+  return { days: visible, shownRows, totalRows };
+}
+
+export type HighlightPart = { text: string; hit: boolean };
+
+/** Code-point-safe highlight spans matching `terms` under `foldSearchText` (Polish diacritics and `ł`). */
+export function searchHighlightParts(text: string, terms: readonly string[]): HighlightPart[] {
+  if (!text || !terms.length) return text ? [{ text, hit: false }] : [];
+  const spans: [number, number][] = [];
+  let folded = '';
+  for (let index = 0; index < text.length;) {
+    const code = text.codePointAt(index)!;
+    const width = code > 0xffff ? 2 : 1;
+    const piece = foldSearchText(text.slice(index, index + width));
+    for (let j = 0; j < piece.length; j++) spans.push([index, index + width]);
+    folded += piece;
+    index += width;
+  }
+  const ranges: [number, number][] = [];
+  for (const term of terms) {
+    if (!term) continue;
+    let from = 0;
+    while (from <= folded.length - term.length) {
+      const found = folded.indexOf(term, from);
+      if (found < 0) break;
+      const endIndex = found + term.length - 1;
+      if (found < spans.length && endIndex < spans.length) {
+        ranges.push([spans[found][0], spans[endIndex][1]]);
+      }
+      from = found + term.length;
+    }
+  }
+  if (!ranges.length) return [{ text, hit: false }];
+  ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const merged: [number, number][] = [];
+  for (const range of ranges) {
+    const prev = merged[merged.length - 1];
+    if (prev && range[0] <= prev[1]) prev[1] = Math.max(prev[1], range[1]);
+    else merged.push([...range]);
+  }
+  const parts: HighlightPart[] = [];
+  let cursor = 0;
+  for (const [start, end] of merged) {
+    if (start > cursor) parts.push({ text: text.slice(cursor, start), hit: false });
+    if (end > start) parts.push({ text: text.slice(start, end), hit: true });
+    cursor = end;
+  }
+  if (cursor < text.length) parts.push({ text: text.slice(cursor), hit: false });
+  return parts;
+}
+

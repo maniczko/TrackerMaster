@@ -5,6 +5,7 @@ import { Temporal } from '@js-temporal/polyfill';
 import { reportGlance } from './reportGlanceModel.ts';
 import { reportPresetRange } from './reportPresets.ts';
 import { addDaySeconds, dateInZone, validTimeZone } from './reportTime.ts';
+import type { EntryContribution } from './reportTime.ts';
 import { makeReportView } from './reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from './reportView.ts';
 import { allReportClients } from './reportScope.ts';
@@ -96,13 +97,25 @@ const dayLabel = (date: string, today: string) => {
   return text.charAt(0).toUpperCase() + text.slice(1);
 };
 
+export type HistoryDayOptions = {
+  range?: { from: string; through: string };
+  contributions?: ReadonlyMap<number, EntryContribution>;
+  dayTotals?: ReadonlyMap<string, number>;
+};
+
 /**
  * History grouped by day in the reporting zone. An entry that crosses midnight is shown in every day it
  * touches, as in the report's segmentation (TECH-09): "23:30–24:00" on the first day and "00:00–00:45" on the
  * next, each with that day's report seconds. The day header is the report's day total for all clients
  * (it includes a resolved running timer, like "Czas z aktywnym pomiarem"). Returns null when the zone is invalid.
  */
-export function historyDays<E extends HistoryEntry>(entries: readonly E[], data: ReportData, catalog: ReportCatalog, now: number): HistoryDay<E>[] | null {
+export function historyDays<E extends HistoryEntry>(
+  entries: readonly E[],
+  data: ReportData,
+  catalog: ReportCatalog,
+  now: number,
+  options?: HistoryDayOptions,
+): HistoryDay<E>[] | null {
   const zone = data.time_zone;
   if (!validTimeZone(zone)) return null;
   const spans = entries.flatMap(entry => {
@@ -111,20 +124,26 @@ export function historyDays<E extends HistoryEntry>(entries: readonly E[], data:
     return Number.isFinite(start) && Number.isFinite(end) && end >= start ? [{ entry, start, end }] : [];
   });
   if (!spans.length) return [];
-  const first = spans.reduce((min, span) => Math.min(min, span.start), Infinity);
-  const last = spans.reduce((max, span) => Math.max(max, span.end > span.start ? span.end - 1 : span.start), -Infinity);
-  const view = makeReportView(data, catalog, allReportClients, dateInZone(first, zone), dateInZone(last, zone));
-  const dayTotals = new Map(view.liveDays.map(day => [day.date, day.seconds]));
-  const contributions = new Map(view.contributions.map(item => [String(item.id), item]));
+  let dayTotals = options?.dayTotals;
+  let contributionById = options?.contributions;
+  if (!dayTotals || !contributionById) {
+    const first = spans.reduce((min, span) => Math.min(min, span.start), Infinity);
+    const last = spans.reduce((max, span) => Math.max(max, span.end > span.start ? span.end - 1 : span.start), -Infinity);
+    const view = makeReportView(data, catalog, allReportClients, dateInZone(first, zone), dateInZone(last, zone));
+    dayTotals = new Map(view.liveDays.map(day => [day.date, day.seconds]));
+    contributionById = new Map(view.contributions.map(item => [item.id, item]));
+  }
+  const range = options?.range;
   const days = new Map<string, HistoryRow<E>[]>();
   for (const { entry, start, end } of spans) {
-    const contribution = contributions.get(String(entry.id));
+    const contribution = contributionById.get(Number(entry.id));
     // All pieces of one local date are summed with the report's own function (several pieces per date are possible).
     const entryDays = contribution ? addDaySeconds(new Map(), contribution.days) : null;
     const lastDate = dateInZone(end > start ? end - 1 : start, zone);
     const dates: string[] = [];
     for (let date = dateInZone(start, zone); date <= lastDate; date = Temporal.PlainDate.from(date).add({ days: 1 }).toString()) dates.push(date);
     dates.forEach((date, index) => {
+      if (range && (date < range.from || date > range.through)) return;
       const next = dayStartMs(Temporal.PlainDate.from(date).add({ days: 1 }).toString(), zone);
       const pieceStart = Math.max(start, dayStartMs(date, zone));
       const pieceEnd = Math.min(end, next);

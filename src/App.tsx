@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
 import ShortcutSettings from './ShortcutSettings';
@@ -11,6 +11,12 @@ import type { LocalRangeProblem } from './localDateTime';
 import { sentence } from './messageText';
 import { clientLabels } from './clientLabels';
 import EntryMenu from './EntryMenu';
+import HistorySearchBar from './HistorySearchBar';
+import type { HistoryRangeMode } from './HistorySearchBar';
+import { buildSearchIndex, dataDateBounds, matchEntries, paginateHistoryDays, searchBase, searchHighlightParts, searchSummary, searchTerms } from './historySearch';
+import { pluralForm } from './plural';
+import { reportPresetRange } from './reportPresets';
+import { validReportFilter } from './reportFilterStorage';
 import { entryTimeRange } from './historyFormat';
 import { defaultShortcut, shortcutLabel } from './shortcut';
 import { MiniTimerTaskPicker } from './MiniTimerPanel';
@@ -165,6 +171,71 @@ export default function App() {
     try { return timerTotals(baseData, catalog, now); } catch { return null; }
   }, [baseData, catalog, totalsDay]);
   const totals = totalsBase && baseData ? liveTimerTotals(totalsBase, baseData, now, clockActive, now - snapshotAt <= 5000) : null;
+  const historySearchInput = useRef<HTMLInputElement>(null);
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [historyRangeMode, setHistoryRangeMode] = useState<HistoryRangeMode>('all');
+  const [historyCustomRange, setHistoryCustomRange] = useState<{ from: string; through: string }>(() => {
+    const today = new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(Date.now());
+    return { from: today, through: today };
+  });
+  const [historyPageLimit, setHistoryPageLimit] = useState(100);
+  const searchTermsList = useMemo(() => searchTerms(historyQuery), [historyQuery]);
+  const isSearchMode = searchTermsList.length > 0 || historyRangeMode !== 'all';
+  const searchCustomInvalid = historyRangeMode === 'custom' && !validReportFilter({ kind: 'custom', ...historyCustomRange });
+  const searchZone = allClients.read?.data.time_zone ?? 'Europe/Warsaw';
+  const searchToday = useMemo(() => {
+    try { return dateInZone(now, searchZone); } catch { return ''; }
+  }, [now, searchZone]);
+  const searchBounds = useMemo(() => {
+    if (!isSearchMode || !allClients.read) return null;
+    if (historyRangeMode === 'custom') return searchCustomInvalid ? null : historyCustomRange;
+    if (historyRangeMode === 'all') return dataDateBounds(allClients.read.data, allClients.read.at);
+    try { return reportPresetRange(historyRangeMode, now, allClients.read.data.time_zone); }
+    catch { return null; }
+  }, [isSearchMode, allClients.read, historyRangeMode, searchCustomInvalid, historyCustomRange, searchToday]);
+  const boundsKey = searchBounds ? `${searchBounds.from}|${searchBounds.through}` : '';
+  const deferredBoundsKey = useDeferredValue(boundsKey);
+  const searchTotalsPending = isSearchMode && Boolean(boundsKey) && deferredBoundsKey !== boundsKey;
+  const searchIndex = useMemo(
+    () => isSearchMode && allClients.read ? buildSearchIndex(allClients.read.data, catalog) : null,
+    [isSearchMode, allClients.read, catalog],
+  );
+  const searchBaseView = useMemo(() => {
+    if (!isSearchMode || !allClients.read || !deferredBoundsKey) return null;
+    const [from, through] = deferredBoundsKey.split('|');
+    try { return searchBase(allClients.read.data, catalog, from, through); }
+    catch { return null; }
+  }, [isSearchMode, allClients.read, catalog, deferredBoundsKey]);
+  const snapshotById = useMemo(
+    () => new Map(data.entries.map(item => [String(item.id), item])),
+    [data.entries],
+  );
+  const searchView = useMemo(() => {
+    if (!isSearchMode || !allClients.read || !searchIndex || !searchBaseView) return null;
+    const matched = matchEntries(searchIndex, searchTermsList);
+    const summary = searchSummary(searchBaseView, matched);
+    const dayTotals = new Map(summary.days.map(day => [day.date, day.seconds]));
+    const days = historyDays(summary.entries, allClients.read.data, catalog, allClients.read.at, {
+      range: { from: searchBaseView.from, through: searchBaseView.through },
+      contributions: searchBaseView.contributions,
+      dayTotals,
+    }) ?? [];
+    return { summary, paged: paginateHistoryDays(days, historyPageLimit) };
+  }, [isSearchMode, allClients.read, catalog, searchIndex, searchTermsList, searchBaseView, historyPageLimit]);
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'f') {
+        event.preventDefault();
+        if (view !== 'timer') showView('timer');
+        window.setTimeout(() => {
+          historySearchInput.current?.focus();
+          historySearchInput.current?.scrollIntoView({ block: 'nearest' });
+        }, 0);
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [view]);
   const historyGroups = useMemo(() => {
     if (!allClients.read) return null;
     try { return historyDays(entries, allClients.read.data, catalog, allClients.read.at); } catch { return null; }
@@ -300,20 +371,26 @@ export default function App() {
     {shortcutLabel(shortcut.shortcut || defaultShortcut).split(' + ').map((key, index) => <span key={key}>{index > 0 && ' + '}<kbd>{key}</kbd></span>)}
     {!shortcut.registered && <span> · obecnie niedostępny poza aplikacją</span>}</p>;
 
+  const highlightText = (text: string) => {
+    if (!isSearchMode || !searchTermsList.length || !text) return text;
+    return searchHighlightParts(text, searchTermsList).map((part, index) =>
+      part.hit ? <mark key={index} className="search-hit">{part.text}</mark> : part.text);
+  };
   const piecePartText = { whole: '', first: 'Ciąg dalszy następnego dnia', middle: 'Wpis trwa przez cały dzień', last: 'Początek poprzedniego dnia' } as const;
   // One History row; with a day piece (grouped view) it shows that day's clock range and report seconds.
   const historyEntryRow = (e: Entry, piece?: HistoryRow<Entry>) => {
                     const t = data.tasks.find(x => same(x.id, e.task_id)); const p = data.projects.find(x => same(x.id, e.project_id)); const c = data.clients.find(x => same(x.id, p?.client_id));
-          const name = t?.name || 'zadanie'; const when = entryTimeRange(e.started_at, e.ended_at, now);
+          const isRunning = same(e.id, data.active?.id) && !data.active?.recovered && !data.active?.uncertain;
+          const name = t?.name || 'zadanie'; const when = entryTimeRange(e.started_at, isRunning ? null : e.ended_at, now);
           const actions = !piece || piece.part === 'whole' || piece.part === 'first';
           const billingLabel = e.billable ? 'Oznacz jako nierozliczalny' : 'Oznacz jako rozliczalny';
-          return <tr key={piece ? `${e.id}:${piece.date}` : e.id} data-part={piece?.part}><td><strong>{e.task_id === null ? 'Bez zadania' : t?.name || 'Nieznane zadanie'}</strong>{e.description && <small className="entry-description">{e.description}</small>}</td>
-            <td>{c ? clientLabelById.get(String(c.id)) : '—'} / {p?.name || '—'}<small className="entry-billing" data-billable={e.billable}>{e.billable ? 'Rozliczalny' : 'Nierozliczalny'}</small></td>
+          return <tr key={piece ? `${e.id}:${piece.date}` : e.id} data-entry-id={e.id} data-part={piece?.part}><td><strong>{e.task_id === null ? 'Bez zadania' : highlightText(t?.name || 'Nieznane zadanie')}</strong>{e.description && <small className="entry-description">{highlightText(e.description)}</small>}</td>
+            <td>{highlightText(c ? clientLabelById.get(String(c.id)) ?? c.name : '—')} / {highlightText(p?.name || '—')}<small className="entry-billing" data-billable={e.billable}>{e.billable ? 'Rozliczalny' : 'Nierozliczalny'}</small></td>
             <td className="entry-when">{piece
-              ? <><time dateTime={e.started_at} title={formatPreciseDate(e.started_at)}>{piece.start}</time>–{e.ended_at && <time dateTime={e.ended_at} title={formatPreciseDate(e.ended_at)}>{piece.end}</time>}{piece.part !== 'whole' && <small className="entry-part">{piecePartText[piece.part]}{piece.seconds !== null && ` · w tym dniu ${formatDuration(piece.seconds)}`}</small>}{piece.seconds === null && <small className="entry-part">Poza sumą raportu</small>}</>
-              : <><time dateTime={e.started_at} title={formatPreciseDate(e.started_at)}>{when.start}</time>{' – '}{e.ended_at ? <time dateTime={e.ended_at} title={formatPreciseDate(e.ended_at)}>{when.end}</time> : when.end}</>}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td>
-            <td className={e.duration_seconds == null ? 'duration pending' : 'duration'}>{e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td>
-            <td className="entry-actions">{!actions ? <small className="entry-part">Operacje przy dniu rozpoczęcia</small> : <><button type="button" className="secondary" disabled={busy || !loaded || !!data.active?.recovered} aria-label={`Wznów: ${name}`} onClick={() => void execute(() => invoke('resume_entry', { sourceId: Number(e.id), expectedActiveId: data.active ? Number(data.active.id) : null }), 'Pomiar wznowiony.')}>Wznów</button>
+              ? <><time dateTime={e.started_at} title={formatPreciseDate(e.started_at)}>{piece.start}</time>–{isRunning ? 'w toku' : e.ended_at && <time dateTime={e.ended_at} title={formatPreciseDate(e.ended_at)}>{piece.end}</time>}{piece.part !== 'whole' && <small className="entry-part">{piecePartText[piece.part]}{piece.seconds !== null && ` · w tym dniu ${formatDuration(piece.seconds)}`}</small>}{piece.seconds === null && <small className="entry-part">Poza sumą raportu</small>}</>
+              : <><time dateTime={e.started_at} title={formatPreciseDate(e.started_at)}>{when.start}</time>{' – '}{!isRunning && e.ended_at ? <time dateTime={e.ended_at} title={formatPreciseDate(e.ended_at)}>{when.end}</time> : when.end}</>}{e.manually_resolved && <small> (wskazane ręcznie)</small>}</td>
+            <td className={!isRunning && e.duration_seconds == null ? 'duration pending' : 'duration'}>{isRunning ? (piece?.seconds !== null && piece?.seconds !== undefined ? formatDuration(piece.seconds) : 'W toku') : e.duration_seconds == null ? 'Do weryfikacji' : formatDuration(e.duration_seconds)}</td>
+            <td className="entry-actions">{!actions ? <small className="entry-part">Operacje przy dniu rozpoczęcia</small> : isRunning ? <small className="entry-part">Trwa</small> : <><button type="button" className="secondary" disabled={busy || !loaded || !!data.active?.recovered} aria-label={`Wznów: ${name}`} onClick={() => void execute(() => invoke('resume_entry', { sourceId: Number(e.id), expectedActiveId: data.active ? Number(data.active.id) : null }), 'Pomiar wznowiony.')}>Wznów</button>
               <EntryMenu label={`Więcej operacji: ${name}`} items={[
                 { key: 'description', label: 'Zmień opis', ariaLabel: `Zmień opis: ${name}`, disabled: busy || !loaded, onSelect: () => entryEditor.current?.openEntry(Number(e.id), 'description') },
                 { key: 'billing', label: billingLabel, ariaLabel: `${billingLabel}: ${name}`, disabled: busy || !loaded, onSelect: () => void execute(() => invoke('set_entry_billable', { entryId: Number(e.id), expected: e.billable, billable: !e.billable }), 'Zapisano rozliczalność wpisu.') },
@@ -405,7 +482,17 @@ export default function App() {
       <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} summary={allClients} hasUnsavedEdit={hasUnsavedReportEdit}
         onEditEntry={entryId => entryEditor.current?.openEntry(entryId, 'start')}
         onShowHistory={entryId => { void showRevisions(entryId, true); }} />
-      <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
+      <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{isSearchMode && searchView ? `${searchView.summary.entries.length} ${pluralForm(searchView.summary.entries.length, 'wpis', 'wpisy', 'wpisów')}` : entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
+        <HistorySearchBar inputRef={historySearchInput} query={historyQuery}
+          onQueryChange={next => { setHistoryQuery(next); setHistoryPageLimit(100); }}
+          onClearAll={() => { setHistoryQuery(''); setHistoryRangeMode('all'); setHistoryPageLimit(100); historySearchInput.current?.focus(); }}
+          rangeMode={historyRangeMode}
+          onRangeModeChange={next => { setHistoryRangeMode(next); if (next === 'custom' && (!historyCustomRange.from || !historyCustomRange.through) && searchToday) setHistoryCustomRange({ from: searchToday, through: searchToday }); setHistoryPageLimit(100); }}
+          customRange={historyCustomRange}
+          onCustomRangeChange={next => { setHistoryCustomRange(next); setHistoryPageLimit(100); }}
+          customInvalid={searchCustomInvalid}
+          isSearchMode={isSearchMode} loaded={loaded} reportFailed={allClients.failed} reportReady={Boolean(allClients.read)}
+          totalsPending={searchTotalsPending} summary={searchView?.summary ?? null} />
         <p className="muted">Pomiary zapisane przed dodaniem rozliczalności mają domyślnie status nierozliczalny. Możesz go zmienić dla każdego wpisu.</p>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta i projekt powyżej; zadanie jest opcjonalne. Podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
           <form onSubmit={e => { e.preventDefault(); const start = parseLocalDate(manualStart); const end = parseLocalDate(manualEnd); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('create_project_manual_entry', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, startedAt: start.toISOString(), endedAt: end.toISOString(), description: manualDescription }); setManualStart(''); setManualEnd(''); setManualDescription(''); }, 'Wpis czasu został dodany.'); }}>
@@ -424,7 +511,22 @@ export default function App() {
             } catch { setError('Zmiany zostały zapisane. Odśwież historię, aby je zobaczyć.'); }
           }} />
         {deleting && <div className="alert error" role="alert"><strong>Usunąć wpis #{deleting.id}?</strong> {formatPreciseDate(deleting.started_at)} – {deleting.ended_at && formatPreciseDate(deleting.ended_at)}. Nie będzie uwzględniany w zestawieniach; informacja o usunięciu pozostanie w historii. <button type="button" className="danger" disabled={busy || !loaded} onClick={() => void execute(async () => { await invoke('delete_time_entry', { entryId: Number(deleting.id), expectedStart: deleting.started_at, expectedEnd: deleting.ended_at }); setDeleting(null); if (deleted) await loadDeleted(); }, 'Wpis został usunięty z zestawień.')}>Potwierdź usunięcie</button>{' '}<button type="button" disabled={busy} onClick={() => setDeleting(null)}>Anuluj</button></div>}
-        {!loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : historyGroups && historyGroups.length > 0
+        {isSearchMode ? (
+          loaded && allClients.read && !searchCustomInvalid && !searchTotalsPending && searchView && searchView.summary.entries.length > 0 && searchView.paged.days.length > 0 && <>
+            <p className="helper history-zone">Dni w strefie raportu ({allClients.read.data.time_zone}). Suma dnia dotyczy dopasowanych wpisów w wybranym zakresie.</p>
+            <div className="table-wrap history-table"><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead>
+              {searchView.paged.days.map(day => <tbody key={day.date} aria-label={`${day.label}: ${formatDuration(day.seconds)}`}><tr className="history-day"><th scope="rowgroup" colSpan={5}><span>{day.label}</span><span className="history-day-total">{formatDuration(day.seconds)}</span></th></tr>{day.rows.map(row => {
+                const entry = snapshotById.get(String(row.entry.id)) ?? (same(row.entry.id, data.active?.id) && data.active ? data.active : row.entry as Entry);
+                return historyEntryRow(entry, { ...row, entry });
+              })}</tbody>)}</table></div>
+            {searchView.paged.shownRows < searchView.paged.totalRows && <div className="history-search-more">
+              <span className="muted">Wyświetlono {searchView.paged.shownRows} z {searchView.paged.totalRows} wierszy dnia</span>
+              <button type="button" className="secondary" onClick={() => setHistoryPageLimit(limit => limit + 100)}>
+                Pokaż kolejne ({Math.min(100, searchView.paged.totalRows - searchView.paged.shownRows)})
+              </button>
+            </div>}
+          </>
+        ) : !loaded ? <p className="muted">Historia jest niedostępna do czasu ponownego odczytu danych.</p> : entries.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><strong>Tu pojawi się Twoja historia</strong><p>Rozpocznij pierwszy pomiar, aby zobaczyć zapisane wpisy.</p></div> : historyGroups && historyGroups.length > 0
           ? <><p className="helper history-zone">Dni w strefie raportu ({allClients.read?.data.time_zone}). Suma dnia jak w raporcie: wszyscy klienci, z aktywnym pomiarem; wpis przez północ jest w obu dniach.</p><div className="table-wrap history-table"><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead>
             {historyGroups.map(day => <tbody key={day.date} aria-label={`${day.label}: ${formatDuration(day.seconds)}`}><tr className="history-day"><th scope="rowgroup" colSpan={5}><span>{day.label}</span><span className="history-day-total">{formatDuration(day.seconds)}</span></th></tr>{day.rows.map(row => historyEntryRow(row.entry, row))}</tbody>)}</table></div></>
           : <div className="table-wrap history-table"><table><thead><tr><th scope="col">Zadanie</th><th scope="col">Klient / projekt</th><th scope="col">Kiedy</th><th scope="col">Czas</th><th scope="col">Operacje</th></tr></thead><tbody>{entries.map(e => historyEntryRow(e))}</tbody></table></div>}

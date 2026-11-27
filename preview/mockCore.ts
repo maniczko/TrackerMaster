@@ -40,11 +40,11 @@ const tasks = [
 ];
 let nextId = 100;
 const entries: Entry[] = [
-  { id: 1, task_id: 111, project_id: 11, started_at: iso(dayStart), ended_at: iso(dayStart + 1.5 * H), duration_seconds: 5400, billable: true, description: 'Makiety strony głównej',
+  { id: 1, task_id: 111, project_id: 11, started_at: iso(dayStart), ended_at: iso(dayStart + 1.5 * H), duration_seconds: 5400, billable: true, description: 'Makiety strony głównej — żółć i kontrast przycisków',
     // D4 short sleep (v14): a 2-minute sleep observed by the app is work, without a question or a banner.
     sleep_periods: [{ id: 9, entryId: 1, startedMs: dayStart + 0.5 * H, endedMs: dayStart + 0.5 * H + 2 * M, decision: 'auto_included' }] },
   { id: 2, task_id: null, project_id: 12, started_at: iso(dayStart + 1.75 * H), ended_at: iso(dayStart + 2.25 * H), duration_seconds: 1800, billable: false, description: 'Odpowiedź na zgłoszenie' },
-  { id: 3, task_id: 211, project_id: 21, started_at: iso(dayStart - 22 * H), ended_at: iso(dayStart - 19 * H), duration_seconds: 10800, billable: true, description: 'Teksty ulotek — wersja z długim opisem, żeby sprawdzić zawijanie w tabeli' },
+  { id: 3, task_id: 211, project_id: 21, started_at: iso(dayStart - 22 * H), ended_at: iso(dayStart - 19 * H), duration_seconds: 10800, billable: true, description: 'Teksty ulotek — Zażółć gęślą jaźń i sprawdź zawijanie w tabeli' },
 ];
 // Crosses local midnight: History shows it in both days (TECH-09 day pieces).
 const midnight = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); })();
