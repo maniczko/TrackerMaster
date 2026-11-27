@@ -2650,7 +2650,7 @@ async function verifyHistorySearch(cdp, sessionId) {
     const m = text.match(/^(\\d+)\\s+wpis/);
     return Boolean(m && Number(m[1]) >= 12);
   })()`));
-  const perfMs = await evaluate(`await new Promise(resolve => {
+  const perfMs = await evaluate(`new Promise(resolve => {
     const input = document.querySelector('#history-search-input');
     const set = value => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); };
     set('');
