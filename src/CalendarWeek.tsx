@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
-import { calendarWeek, clockText, DAY_MINUTES, MIN_BLOCK_PX, pieceRange, shiftWeek, validCalendarDate, weekLabel, weekStartOf } from './calendarModel';
-import type { CalendarBillable, CalendarBlock, CalendarClockEntry, CalendarFilter } from './calendarModel';
+import { calendarWeek, clockText, DAY_MINUTES, MIN_BLOCK_PX, pieceRange, rangeHeading, shiftDate, shiftWeek, validCalendarDate, weekStartOf } from './calendarModel';
+import type { CalendarBillable, CalendarBlock, CalendarClockEntry, CalendarFilter, CalendarSpan } from './calendarModel';
 import { formatDuration as duration } from './reportCsv';
 import { dateInZone } from './reportTime';
 import { allReportClients, resolveReportScope } from './reportScope';
@@ -16,8 +16,8 @@ import './calendar.css';
 type Props = {
   report: AllClientsReport; catalog: ReportCatalog; loaded: boolean; now: number;
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean;
-  /** DEV-25: open on the week of this day (from the month view); the Tydzień | Miesiąc switch. */
-  initialWeek?: string; viewSwitch?: ReactNode;
+  /** DEV-25 / DEV-37: open on this day/week; timeline span (day | five | week). */
+  initialWeek?: string; viewSwitch?: ReactNode; span?: CalendarSpan;
   /** DEV-26: adding and editing is possible (data current, no other write running). */
   editable: boolean;
   /** DEV-26: after a saved entry; refreshes the shared data (calendar, History, report). Throws when the refresh fails. */
@@ -64,11 +64,13 @@ function blockLabel(block: CalendarBlock): string {
   return `${block.title} — ${block.path}, ${pieceRange(block)}, ${state}`;
 }
 
-export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, initialWeek, viewSwitch, editable, onEntrySaved }: Props) {
+export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, initialWeek, viewSwitch, span = 'week', editable, onEntrySaved }: Props) {
   const [saved] = useState(readSaved);
   const zone = report.read?.data.time_zone;
   const today = zone ? (() => { try { return dateInZone(now, zone); } catch { return null; } })() : null;
-  const [week, setWeek] = useState<string | null>(initialWeek && validCalendarDate(initialWeek) ? weekStartOf(initialWeek) : saved.week ?? null);
+  const initialValid = initialWeek && validCalendarDate(initialWeek) ? initialWeek : undefined;
+  const [week, setWeek] = useState<string | null>(initialValid ? weekStartOf(initialValid) : saved.week ?? null);
+  const [anchorDate, setAnchorDate] = useState<string | null>(initialValid ?? null);
   const [scope, setScope] = useState<ReportScope>(saved.scope ?? allReportClients);
   const [billable, setBillable] = useState<CalendarBillable>(saved.billable ?? 'all');
   const [selected, setSelected] = useState<string | null>(null);
@@ -76,6 +78,11 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const [noteOpen, setNoteOpen] = useState(false);
   const [gridHeight, setGridHeight] = useState<number | null>(null);
   const shownWeek = week ?? (today ? weekStartOf(today) : null);
+  const shownDay = shownWeek
+    ? (anchorDate && validCalendarDate(anchorDate) && weekStartOf(anchorDate) === shownWeek
+        ? anchorDate
+        : today && weekStartOf(today) === shownWeek ? today : shownWeek)
+    : null;
   const blockRefs = useRef(new Map<string, HTMLButtonElement>());
   const body = useRef<HTMLDivElement>(null);
   const dialog = useRef<HTMLDivElement>(null);
@@ -92,17 +99,18 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const filter: CalendarFilter = { scope, billable };
   const view = useMemo(() => {
     if (!report.read || !shownWeek || resolved.problem) return null;
-    try { return calendarWeek({ data: report.read.data, catalog, filter, weekStart: shownWeek, now, snapshotActive, snapshotFresh, minMinutes: MIN_MINUTES }); }
+    try { return calendarWeek({ data: report.read.data, catalog, filter, weekStart: shownWeek, now, snapshotActive, snapshotFresh, minMinutes: MIN_MINUTES, span, anchorDate: shownDay ?? undefined }); }
     catch { return null; }
-  }, [report.read, catalog, scope, billable, shownWeek, now, snapshotActive, snapshotFresh, resolved.problem]);
+  }, [report.read, catalog, scope, billable, shownWeek, shownDay, span, now, snapshotActive, snapshotFresh, resolved.problem]);
   const blocks = view ? view.days.flatMap(day => day.blocks) : [];
   const chosen = blocks.find(block => block.key === selected) ?? null;
   const filtered = scope.clientId !== null || billable !== 'all';
 
-  // Scroll once per week: this week to two hours before now, other weeks to about 08:00.
+  // Scroll once per range: today to two hours before now, other dates to about 08:00.
   useLayoutEffect(() => {
-    if (!view || !body.current || scrolledFor.current === view.from) return;
-    scrolledFor.current = view.from;
+    const scrollKey = `${span}:${view?.from ?? ''}`;
+    if (!view || !body.current || scrolledFor.current === scrollKey) return;
+    scrolledFor.current = scrollKey;
     const minute = view.nowMinute !== null ? view.nowMinute - 120 : 8 * 60 - 30;
     body.current.scrollTop = Math.max(0, minute) * MINUTE_PX;
   });
@@ -130,7 +138,12 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
     if (key) window.setTimeout(() => blockRefs.current.get(key)?.focus(), 0);
   }
   function onDialogKey(event: ReactKeyboardEvent) { if (event.key === 'Escape') { event.preventDefault(); close(); } }
-  function go(next: string | null) { setSelected(null); setWeek(next); }
+  function go(next: string | null) {
+    setSelected(null);
+    if (next === null) { setWeek(null); setAnchorDate(today); return; }
+    setAnchorDate(next);
+    setWeek(weekStartOf(next));
+  }
   function openForm(request: CalendarEntryRequest, from: HTMLElement | null) {
     if (!editable || entryForm) return;
     opener.current = from; setSelected(null); setEntryNote(null); setEntryForm(request);
@@ -162,19 +175,24 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   return <section className="card calendar" aria-label="Kalendarz">
     <div className="calendar-toolbar">
       {viewSwitch}
-      <div className="calendar-nav" role="group" aria-label="Wybór tygodnia">
-        <button type="button" className="secondary" aria-label="Poprzedni tydzień" disabled={!shownWeek} onClick={() => shownWeek && go(shiftWeek(shownWeek, -1))}>‹</button>
-        <button type="button" className="secondary" aria-label="Następny tydzień" disabled={!shownWeek} onClick={() => shownWeek && go(shiftWeek(shownWeek, 1))}>›</button>
-        <button type="button" className="secondary" disabled={!today || (!!shownWeek && !!today && weekStartOf(today) === shownWeek)} onClick={() => go(null)}>Dziś</button>
-        <input type="date" className="calendar-date" aria-label="Przejdź do dnia" title="Przejdź do dnia" value={shownWeek ?? ''} min="1970-01-05"
-          onChange={event => { if (validCalendarDate(event.target.value)) go(weekStartOf(event.target.value)); }} />
+      <div className="calendar-nav" role="group" aria-label={span === 'day' ? 'Wybór dnia' : 'Wybór tygodnia'}>
+        <button type="button" className="secondary" aria-label={span === 'day' ? 'Poprzedni dzień' : 'Poprzedni tydzień'} disabled={span === 'day' ? !shownDay : !shownWeek}
+          onClick={() => { if (span === 'day' && shownDay) go(shiftDate(shownDay, -1)); else if (shownWeek) go(shiftWeek(shownWeek, -1)); }}>‹</button>
+        <button type="button" className="secondary" aria-label={span === 'day' ? 'Następny dzień' : 'Następny tydzień'} disabled={span === 'day' ? !shownDay : !shownWeek}
+          onClick={() => { if (span === 'day' && shownDay) go(shiftDate(shownDay, 1)); else if (shownWeek) go(shiftWeek(shownWeek, 1)); }}>›</button>
+        <button type="button" className="secondary" disabled={!today || (span === 'day' ? shownDay === today : !!shownWeek && weekStartOf(today) === shownWeek)} onClick={() => go(null)}>Dziś</button>
+        <input type="date" className="calendar-date" aria-label="Przejdź do dnia" title="Przejdź do dnia" value={(span === 'day' ? shownDay : shownWeek) ?? ''} min="1970-01-05"
+          onChange={event => { if (validCalendarDate(event.target.value)) go(event.target.value); }} />
         <button type="button" ref={addButton} className="secondary calendar-add" aria-label="Dodaj wpis" title="Dodaj wpis (albo kliknij puste miejsce w kalendarzu)"
-          disabled={!view || !editable || !shownWeek} onClick={event => { if (view && shownWeek) openForm({ mode: 'new', ...keyboardRange(shownWeek, today, now, view.zone) }, event.currentTarget); }}>+ Wpis</button>
+          disabled={!view || !editable || !shownWeek} onClick={event => { if (view && shownWeek) openForm({ mode: 'new', ...keyboardRange(shownWeek, today, now, view.zone, span === 'day' ? shownDay ?? undefined : undefined) }, event.currentTarget); }}>+ Wpis</button>
       </div>
-      <h2 className="calendar-range">{view ? weekLabel(view.from, view.through) : 'Tydzień'}</h2>
+      <h2 className="calendar-range">{view ? rangeHeading(view.from, view.through, span) : span === 'day' ? 'Dzień' : 'Tydzień'}</h2>
       <CalendarFilters catalog={catalog} scope={scope} billable={billable} resolved={resolved}
         onScope={(next, message) => { setScope(next); setScopeNotice(message); }} onBillable={setBillable} />
-      <p className="calendar-total"><span>{filtered ? 'Suma (filtry)' : 'Suma'}</span> <strong className="calendar-week-total" aria-live="off">{view ? duration(view.weekSeconds) : '—'}</strong>
+      <p className="calendar-total">
+        <span>{span === 'day' ? (filtered ? 'Suma dnia (filtry)' : 'Suma dnia') : span === 'five' ? (filtered ? 'Suma 5 dni (filtry)' : 'Suma 5 dni') : (filtered ? 'Suma (filtry)' : 'Suma')}</span>{' '}
+        <strong className="calendar-week-total" aria-live="off">{view ? duration(view.weekSeconds) : '—'}</strong>
+        {view && span !== 'week' && <span className="calendar-week-full" title="Pełna suma całego tygodnia (Pn–Nd); weekend nie jest usunięty.">· tydzień (Pn–Nd) <strong className="calendar-full-week-total">{duration(view.fullWeekSeconds)}</strong></span>}
         <button type="button" className="secondary calendar-info" aria-label="Jak liczone są sumy" aria-expanded={noteOpen} aria-controls="calendar-scope-note" title={scopeNote(filtered, zone)} onClick={() => setNoteOpen(open => !open)}><span aria-hidden="true">i</span></button></p>
     </div>
     {noteOpen && <p id="calendar-scope-note" role="note" className="helper calendar-scope-note">{scopeNote(filtered, zone)}</p>}
@@ -193,13 +211,13 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
         {view.unverifiedActive && <p role="status" className="alert">Aktywny pomiar wymaga weryfikacji. Jest zakreskowany i nie wlicza się do sum.</p>}
         <div className="calendar-grid">
           <div className="calendar-body" ref={body} tabIndex={-1} style={gridHeight ? { height: gridHeight } : undefined}>
-          <div className="calendar-head" aria-hidden="true">
+          <div className="calendar-head" data-cols={view.days.length} aria-hidden="true">
             <span />
             {view.days.map(day => <span key={day.date} className={day.isToday ? 'calendar-day-head is-today' : 'calendar-day-head'}>
               <small>{weekday.format(utc(day.date))}</small> <strong>{dayNumber.format(utc(day.date))}</strong>
               <span className="calendar-day-total">{duration(day.seconds)}</span></span>)}
           </div>
-            <div className="calendar-canvas" style={{ height: DAY_MINUTES * MINUTE_PX }}>
+            <div className="calendar-canvas" data-cols={view.days.length} style={{ height: DAY_MINUTES * MINUTE_PX }}>
               <div className="calendar-hours" aria-hidden="true">{Array.from({ length: 24 }, (_, hour) => <span key={hour} style={{ top: hour * HOUR_PX }}>{String(hour).padStart(2, '0')}:00</span>)}</div>
               {view.days.map(day => <div key={day.date} className={day.isToday ? 'calendar-column is-today' : 'calendar-column'} role="group"
                 aria-label={`${new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }).format(utc(day.date))}: ${duration(day.seconds)}, wpisów ${day.blocks.length}`}

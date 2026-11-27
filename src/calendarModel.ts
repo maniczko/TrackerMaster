@@ -41,6 +41,7 @@ export function weekStartOf(date: string): string {
   return day.subtract({ days: day.dayOfWeek - 1 }).toString();
 }
 export const shiftWeek = (start: string, weeks: number) => nextDate(weekStartOf(start), 7 * weeks);
+export const shiftDate = (date: string, days: number) => nextDate(date, days);
 export const weekDates = (start: string) => Array.from({ length: 7 }, (_, index) => nextDate(weekStartOf(start), index));
 export const validCalendarDate = (value: unknown): value is string => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value) || value < '1970-01-05') return false;
@@ -153,10 +154,16 @@ export type CalendarBlock = Laid<CalendarPiece> & {
   key: string; running: boolean; title: string; path: string; colour: number;
   billable: boolean; entryStartMs: number; entryEndMs: number | null; entrySeconds: number | null;
 };
+export type CalendarSpan = 'day' | 'five' | 'week';
 export type CalendarDay = { date: string; seconds: number; blocks: CalendarBlock[]; isToday: boolean };
 export type CalendarWeek = {
-  from: string; through: string; zone: string; today: string; days: CalendarDay[]; weekSeconds: number;
-  /** Current wall-clock minute when today is in this week, otherwise null. */
+  span: CalendarSpan;
+  from: string; through: string; zone: string; today: string; days: CalendarDay[];
+  /** Displayed sum: all 7 days in 'week', Mon-Fri in 'five', or single day in 'day' (DEV-37). */
+  weekSeconds: number;
+  /** Full 7-day Monday-Sunday sum (preserved even in 5-day / 1-day views). */
+  fullWeekSeconds: number;
+  /** Current wall-clock minute when today is in this view, otherwise null. */
   nowMinute: number | null;
   excludedEntryIds: number[]; missingRelations: boolean; overlapEntryIds: number[];
   pendingPeriodCount: number; pendingSeconds: number; awaitingSeconds: number; unverifiedActive: boolean;
@@ -194,11 +201,15 @@ export function calendarData(data: CalendarReportData, filter: CalendarFilter, s
 export function calendarWeek(input: {
   data: CalendarReportData; catalog: ReportCatalog; filter: CalendarFilter; weekStart: string; now: number;
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean; minMinutes?: number;
+  span?: CalendarSpan; anchorDate?: string;
 }): CalendarWeek | null {
   const { catalog, filter, now, snapshotActive, snapshotFresh } = input;
+  const span: CalendarSpan = input.span ?? 'week';
   const zone = input.data.time_zone;
   if (!validTimeZone(zone) || !validCalendarDate(input.weekStart)) return null;
-  const dates = weekDates(input.weekStart);
+  const anchor = span === 'day' && validCalendarDate(input.anchorDate) ? input.anchorDate : input.weekStart;
+  const effectiveWeekStart = weekStartOf(anchor);
+  const dates = weekDates(effectiveWeekStart);
   const from = dates[0], through = dates[6];
   const data = calendarData(input.data, filter, snapshotActive);
   const view = makeReportView(data, catalog, filter.scope, from, through);
@@ -266,7 +277,7 @@ export function calendarWeek(input: {
 
   const today = dateInZone(now, zone);
   const minMinutes = input.minMinutes ?? MIN_BLOCK_MINUTES;
-  const days = dates.map(date => {
+  const fullDays = dates.map(date => {
     const pieces = raw.filter(piece => piece.date === date);
     const blocks = layoutDay(pieces, minMinutes).map((piece, index): CalendarBlock => {
       const project = catalog.projects.find(item => String(item.id) === String(piece.source.project_id));
@@ -283,12 +294,27 @@ export function calendarWeek(input: {
     });
     return { date, seconds: totals.get(date) ?? 0, blocks, isToday: date === today };
   });
-  const nowMinute = today >= from && today <= through ? wallMinute(now, today, zone) : null;
+  const fullWeekSeconds = fullDays.reduce((sum, day) => sum + day.seconds, 0);
+  const days = span === 'five' ? fullDays.slice(0, 5) : span === 'day' ? fullDays.filter(day => day.date === anchor) : fullDays;
+  const visibleFrom = days[0]?.date ?? from;
+  const visibleThrough = days[days.length - 1]?.date ?? through;
+  const weekSeconds = days.reduce((sum, day) => sum + day.seconds, 0);
+  const nowMinute = today >= visibleFrom && today <= visibleThrough ? wallMinute(now, today, zone) : null;
   return {
-    from, through, zone, today, days, weekSeconds: days.reduce((sum, day) => sum + day.seconds, 0), nowMinute,
+    span, from: visibleFrom, through: visibleThrough, zone, today, days, weekSeconds, fullWeekSeconds, nowMinute,
     excludedEntryIds: view.excludedEntryIds, missingRelations: view.missingRelations, overlapEntryIds: view.overlaps.entryIds,
     pendingPeriodCount: view.pendingPeriodCount, pendingSeconds: view.pendingSeconds, awaitingSeconds: view.awaitingSeconds, unverifiedActive,
   };
+}
+
+/** Heading label for 1-day, 5-day or 7-day calendar span. */
+export function rangeHeading(from: string, through: string, span: CalendarSpan): string {
+  if (span === 'day') {
+    const d = Temporal.PlainDate.from(from);
+    return new Intl.DateTimeFormat('pl-PL', { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' })
+      .format(Date.UTC(d.year, d.month - 1, d.day));
+  }
+  return weekLabel(from, through);
 }
 
 /** "10:15" in the reporting zone. */
