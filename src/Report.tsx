@@ -25,6 +25,8 @@ type Props = ReportCatalog & {
   revision: number;
   /** The main window's shared all-clients read for the closed-report card (one source, no second poll). */
   summary: AllClientsReport;
+  forceOpen?: boolean;
+  onRequestClose?: () => void;
   hasUnsavedEdit: () => boolean;
   onEditEntry: (entryId: number) => void;
   onShowHistory: (entryId: number) => void;
@@ -33,8 +35,9 @@ type Props = ReportCatalog & {
 const defaultZone = 'Europe/Warsaw';
 const archivedName = (name: string, archived?: boolean) => archived ? `${name} (Zarchiwizowany)` : name;
 
-export default function Report({ clients, projects, tasks, loaded, revision, summary, hasUnsavedEdit, onEditEntry, onShowHistory }: Props) {
+export default function Report({ clients, projects, tasks, loaded, revision, summary, forceOpen = false, onRequestClose, hasUnsavedEdit, onEditEntry, onShowHistory }: Props) {
   const [open, setOpen] = useState(false);
+  const expanded = forceOpen || open;
   const [tab, setTab] = useState<'summary' | 'details'>('summary');
   const [initialFilter] = useState(() => { try { return readReportFilter(window.localStorage); } catch { return { filter: null, problem: true }; } });
   const [customRange, setCustomRange] = useState(() => initialFilter.filter?.kind === 'custom'
@@ -62,7 +65,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
   const resolved = useMemo(() => resolveReportScope(reportScope, catalog), [reportScope, catalog]);
   const scopeProblem = scopeReadProblem || (loaded ? resolved.problem : '');
   const customInvalid = preset === 'custom' && !validReportFilter({ kind: 'custom', ...customRange });
-  const canQuery = open && loaded && filterReady && scopeReady && !scopeProblem && !dateReadProblem && !customInvalid;
+  const canQuery = expanded && loaded && filterReady && scopeReady && !scopeProblem && !dateReadProblem && !customInvalid;
   const data = canQuery && snapshot?.request === request ? snapshot.data : null;
   const error = canQuery && failure?.request === request ? failure.message : '';
   const range = preset === 'custom' ? customRange : reportPresetRange(preset, now, lastZone);
@@ -158,7 +161,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
 
   useEffect(() => {
     const zone = data?.time_zone ?? '';
-    if (!open || preset === 'custom' || !zone || !validTimeZone(zone)) return;
+    if (!expanded || preset === 'custom' || !zone || !validTimeZone(zone)) return;
     function updateToday() {
       if (hasUnsavedEdit()) return;
       const current = Date.now();
@@ -173,7 +176,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
       window.removeEventListener('focus', updateToday);
       document.removeEventListener('visibilitychange', updateToday);
     };
-  }, [open, preset, data?.time_zone, hasUnsavedEdit]);
+  }, [expanded, preset, data?.time_zone, hasUnsavedEdit]);
 
   const result = useMemo(() => {
     if (!data) return null;
@@ -223,12 +226,12 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
   }
 
   return <section className="card report" aria-label="Raport czasu">
-    <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div><button type="button" className="secondary report-button" aria-expanded={open} onClick={() => {
-      if (!open && !hasUnsavedEdit()) setNow(Date.now());
+    <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div>{!forceOpen ? <button type="button" className="secondary report-button" aria-expanded={expanded} onClick={() => {
+      if (!expanded && !hasUnsavedEdit()) setNow(Date.now());
       setOpen(!open);
-    }}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
-    {!open && <ReportGlance catalog={catalog} loaded={loaded} summary={summary} />}
-    {open && <>
+    }}>{expanded ? 'Zamknij raport' : 'Otwórz raport'}</button> : onRequestClose && <button type="button" className="secondary report-button" onClick={onRequestClose}>Wróć do timera</button>}</div>
+    {!expanded && <ReportGlance catalog={catalog} loaded={loaded} summary={summary} />}
+    {expanded && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
       {data && <ReportTimezone currentZone={data.time_zone} canChange={allowFilterChange}
         onApply={async (expectedTimeZone, timeZone) => {
