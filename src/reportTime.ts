@@ -29,25 +29,64 @@ function utcEnvelope(from: string, through: string) {
   return { lower: Date.parse(from) - utcDayMs, upper: Date.parse(through) + 2 * utcDayMs };
 }
 
+function daysInCivilMonth(year: number, month: number): number {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+}
+
+function twoDigits(value: string, offset: number): number {
+  const hi = value.charCodeAt(offset) - 48;
+  const lo = value.charCodeAt(offset + 1) - 48;
+  return hi >= 0 && hi <= 9 && lo >= 0 && lo <= 9 ? hi * 10 + lo : -1;
+}
+
+function parseFastUtcMillis(value: string): number {
+  if (
+    value.length !== 24 || value.charCodeAt(4) !== 45 || value.charCodeAt(7) !== 45 ||
+    value.charCodeAt(10) !== 84 || value.charCodeAt(13) !== 58 || value.charCodeAt(16) !== 58 ||
+    value.charCodeAt(19) !== 46 || value.charCodeAt(23) !== 90
+  ) return NaN;
+  const yHi = twoDigits(value, 0), yLo = twoDigits(value, 2);
+  const year = yHi >= 0 && yLo >= 0 ? yHi * 100 + yLo : -1;
+  const month = twoDigits(value, 5), day = twoDigits(value, 8);
+  const hour = twoDigits(value, 11), minute = twoDigits(value, 14), second = twoDigits(value, 17);
+  const m0 = value.charCodeAt(20) - 48, m1 = value.charCodeAt(21) - 48, m2 = value.charCodeAt(22) - 48;
+  if (
+    year < 0 || month < 1 || month > 12 || day < 1 || day > daysInCivilMonth(year, month) ||
+    hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 ||
+    m0 < 0 || m0 > 9 || m1 < 0 || m1 > 9 || m2 < 0 || m2 > 9
+  ) return NaN;
+  return Date.UTC(year, month - 1, day, hour, minute, second, m0 * 100 + m1 * 10 + m2);
+}
+
 function parseReportTimestamp(value: string): number {
+  const fast = parseFastUtcMillis(value);
+  if (Number.isFinite(fast)) return fast;
   if (!/(?:Z|[+-]\d\d:\d\d)$/i.test(value)) return NaN;
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return NaN;
-  // The application normally stores millisecond UTC strings. The round trip also rejects normalized invalid dates.
-  if (value.length === 24 && value.endsWith('Z') && new Date(parsed).toISOString() === value) return parsed;
   try { return Temporal.Instant.from(value).epochMilliseconds; } catch { return NaN; }
 }
+
+type CachedSlice = { until: number; date: string };
+const ZONE_PIECE_CACHE = new Map<string, Map<number, CachedSlice[]>>();
+const MAX_CACHED_ZONE_DAYS = 20_000;
 
 // Cache timezone boundaries per UTC day so the input order does not affect reuse.
 // Splitting at the edge of each cache bucket preserves seconds because all pieces share the anchor.
 function calendarPieces(zone: string) {
-  type Slice = { until: number; date: string };
-  const cache = new Map<number, Slice[]>();
+  let cache = ZONE_PIECE_CACHE.get(zone);
+  if (!cache) {
+    cache = new Map();
+    ZONE_PIECE_CACHE.set(zone, cache);
+  } else if (cache.size > MAX_CACHED_ZONE_DAYS) {
+    cache.clear();
+  }
 
-  function readBucket(day: number): Slice[] {
-    const stored = cache.get(day);
+  function readBucket(day: number): CachedSlice[] {
+    const stored = cache!.get(day);
     if (stored) return stored;
-    const slices: Slice[] = [];
+    const slices: CachedSlice[] = [];
     const stop = day + utcDayMs;
     for (let at = day; at < stop;) {
       const zoned = Temporal.Instant.fromEpochMilliseconds(at).toZonedDateTimeISO(zone);
@@ -65,7 +104,7 @@ function calendarPieces(zone: string) {
       slices.push({ until, date: date.toString() });
       at = until;
     }
-    cache.set(day, slices);
+    cache!.set(day, slices);
     return slices;
   }
 
@@ -198,9 +237,19 @@ export function reportOverlaps(entries: ReportEntry[], from: string, through: st
   const { lower, upper } = utcEnvelope(from, through);
   const pieces = calendarPieces(zone);
   const inRange = (part: ReportDay) => part.date >= from && part.date <= through;
-  const intervals = entries.map(entry => ({ id: entry.id, start: parseReportTimestamp(entry.started_at), end: parseReportTimestamp(entry.ended_at) }))
-    .filter(entry => Number.isFinite(entry.start) && Number.isFinite(entry.end) && entry.start >= 0 && entry.end > entry.start && entry.end - entry.start <= 3660 * 86400_000)
-    .filter(entry => entry.end > lower && entry.start < upper)
+  const candidates: { id: number; start: number; end: number }[] = [];
+  for (const entry of entries) {
+    const start = parseReportTimestamp(entry.started_at);
+    const end = parseReportTimestamp(entry.ended_at);
+    if (
+      Number.isFinite(start) && Number.isFinite(end) &&
+      start >= 0 && end > start && end - start <= 3660 * 86400_000 &&
+      end > lower && start < upper
+    ) {
+      candidates.push({ id: entry.id, start, end });
+    }
+  }
+  const intervals = candidates
     .sort((a, b) => a.start - b.start || a.id - b.id)
     .filter(entry => pieces(entry.start, entry.end).some(inRange));
   const ids = new Set<number>();

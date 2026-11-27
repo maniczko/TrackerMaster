@@ -33,9 +33,24 @@ fn transition_with_power(tracker: &mut crate::Tracker, expected: Option<i64>, at
     };
     if let Some((project_id,task_id,description,_)) = &target { crate::valid_description(description)?; target_billing(&tx,*project_id,*task_id)?; }
     if let Some((id, active_project, active_task, started)) = active {
-        if !resume && target.as_ref().is_some_and(|t| t.0==active_project && t.1==active_task) { return Ok(()); }
         let start = DateTime::parse_from_rfc3339(&started).map_err(|_| "Niepoprawny zapis czasu w bazie.")?;
         let end = DateTime::parse_from_rfc3339(at).map_err(|_| "Niepoprawny czas systemowy.")?;
+        if !resume && target.as_ref().is_some_and(|t| t.0 == active_project && t.1 == active_task) {
+            // Audit M1: validate the active clock before treating repeat Start as a no-op, and apply non-empty description.
+            if crate::active_projection(&tx, tracker.running_since.as_ref(), id, &started, end.with_timezone(&Utc), &power).is_none() {
+                let keep = crate::keeps_clock_for_open_sleep(&tx, id)?;
+                drop(tx);
+                if !keep { tracker.running_since = None; }
+                return Err(crate::unverifiable_timer_message(keep).into());
+            }
+            if let Some((_, _, desc, _)) = &target {
+                if !desc.is_empty() {
+                    tx.execute("INSERT INTO entry_descriptions (entry_id, description) VALUES (?1, ?2) ON CONFLICT(entry_id) DO UPDATE SET description = excluded.description", params![id, desc]).map_err(crate::db_err)?;
+                    tx.commit().map_err(crate::db_err)?;
+                }
+            }
+            return Ok(());
+        }
         // Stop, switch and resume are input: an open idle period of the active entry ends now,
         // in this transaction, and stays pending as its own item (TECH-12 §1.4, §1.7). Any
         // failure below rolls it back with the rest.
@@ -653,5 +668,31 @@ mod tests {
         crate::resolve_recovered(&mut tracker, "2026-01-01T13:00:00Z", now).unwrap();
         let seconds: i64 = tracker.db.query_row("SELECT duration_seconds FROM time_entries WHERE id=41", [], |r| r.get(0)).unwrap();
         assert_eq!(seconds, 9_000);
+    }
+
+    #[test]
+    fn repeat_start_on_same_target_checks_clock_and_updates_non_empty_description() {
+        let mut tracker = running_with_open_idle();
+        let mismatched = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 8_200_000 });
+        let err = transition_with_power(
+            &mut tracker,
+            Some(41),
+            "2026-01-01T13:00:00Z",
+            TimerAction::Start { project_id: 1, task_id: None, description: "Nowy opis" },
+            mismatched,
+        ).unwrap_err();
+        assert_eq!(err, crate::unverifiable_timer_message(false));
+
+        let mut ok_tracker = running_with_open_idle();
+        let aligned = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 11_800_000 });
+        transition_with_power(
+            &mut ok_tracker,
+            Some(41),
+            "2026-01-01T13:00:00Z",
+            TimerAction::Start { project_id: 1, task_id: None, description: "Zaktualizowany opis" },
+            aligned,
+        ).unwrap();
+        let saved: String = ok_tracker.db.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41", [], |r| r.get(0)).unwrap();
+        assert_eq!(saved, "Zaktualizowany opis");
     }
 }

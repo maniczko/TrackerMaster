@@ -68,6 +68,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
   const [sortReadProblem, setSortReadProblem] = useState(false);
   const [closeReady, setCloseReady] = useState(false);
   const [closeRequest, setCloseRequest] = useState<CloseRequest | null>(null);
+  const [confirmDiscard, setConfirmDiscard] = useState<{ kind: 'editor' } | { kind: 'draft'; draft: EntryDraft } | null>(null);
   const current = useRef<Editor | null>(null);
   const sequence = useRef(0);
   const operation = useRef(false);
@@ -134,6 +135,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
 
   function replaceEditor(value: Editor | null) {
     current.current = value;
+    setConfirmDiscard(null);
     setEditor(value);
   }
 
@@ -214,7 +216,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
         return;
       }
       if (current.current?.source.entryId === entryId) {
-        const field = focus === 'description' ? descriptionField : dateField;
+        const field = focus === 'end' ? endField : focus === 'description' ? descriptionField : dateField;
         field.current?.focus();
         return;
       }
@@ -440,9 +442,16 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
           <button type="button" className="secondary" disabled={working} onClick={() => run(() => leaveEditor(true))}>Zachowaj szkic</button>
           <button type="button" className="secondary" disabled={working} onClick={() => {
             if (!fieldHasChanges(editor) && !editor.saved) run(dismissEditor);
-            else if (window.confirm('Odrzucić zmiany i usunąć szkic?')) run(() => leaveEditor(false));
+            else setConfirmDiscard({ kind: 'editor' });
           }}>Odrzuć zmiany</button>
         </div>
+        {confirmDiscard?.kind === 'editor' && <div className="alert error" role="alert">
+          <strong>Odrzucić zmiany i usunąć szkic?</strong>
+          <div className="actions">
+            <button type="button" className="danger" disabled={working} onClick={() => { setConfirmDiscard(null); run(() => leaveEditor(false)); }}>Potwierdź odrzucenie</button>
+            <button type="button" className="secondary" disabled={working} onClick={() => setConfirmDiscard(null)}>Anuluj</button>
+          </div>
+        </div>}
       </form>
     </section>}
     {count > 0 && reminder && <div className="alert entry-draft-reminder" role="status">
@@ -499,9 +508,16 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
         <div className="actions">
           <button type="button" className="secondary" disabled={working || !enabled || !closeReady} onClick={() => { if (canOpenEditor()) run(() => reviewDraft(draft)); }}>Przywróć szkic</button>
           <button type="button" className="secondary" disabled={working || !!editor} onClick={() => {
-            if (window.confirm(`Odrzucić szkic wpisu #${draft.source.entryId}?`)) run(() => discard(draft));
+            setConfirmDiscard({ kind: 'draft', draft });
           }}>Odrzuć</button>
         </div>
+        {confirmDiscard?.kind === 'draft' && confirmDiscard.draft.revision === draft.revision && <div className="alert error" role="alert">
+          <strong>Odrzucić szkic wpisu #{draft.source.entryId}?</strong>
+          <div className="actions">
+            <button type="button" className="danger" disabled={working} onClick={() => { setConfirmDiscard(null); run(() => discard(draft)); }}>Potwierdź odrzucenie</button>
+            <button type="button" className="secondary" disabled={working} onClick={() => setConfirmDiscard(null)}>Anuluj</button>
+          </div>
+        </div>}
       </li>)}</ul>}
       {review && <div className="entry-draft-review">
         <h4>{review.current ? 'Wpis zmienił się od utworzenia szkicu' : 'Oryginalny wpis jest usunięty lub niedostępny'}</h4>

@@ -105,7 +105,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
     scrolledFor.current = view.from;
     const minute = view.nowMinute !== null ? view.nowMinute - 120 : 8 * 60 - 30;
     body.current.scrollTop = Math.max(0, minute) * MINUTE_PX;
-  });
+  }, [view?.from]);
   // The grid fills the rest of the window and scrolls inside; the day header stays on top (sticky).
   useLayoutEffect(() => {
     function fit() {
@@ -120,7 +120,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
     fit();
     window.addEventListener('resize', fit);
     return () => window.removeEventListener('resize', fit);
-  });
+  }, [Boolean(view)]);
   useEffect(() => { if (chosen) dialog.current?.focus(); }, [chosen?.key]);
   useEffect(() => { if (selected && !chosen) setSelected(null); }, [selected, chosen]);
 
@@ -191,6 +191,20 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
         {view.overlapEntryIds.length > 0 && <p role="alert" className="alert error"><strong>Nakładające się pomiary</strong> ({view.overlapEntryIds.join(', ')}) są pokazane obok siebie. Suma może liczyć ten sam czas więcej niż raz.</p>}
         {view.pendingPeriodCount > 0 && <p role="status" className="alert">Uśpienie do rozstrzygnięcia ({view.pendingPeriodCount}) <strong>{duration(view.pendingSeconds)}</strong> jest zakreskowane i nie wlicza się do sum.</p>}
         {view.unverifiedActive && <p role="status" className="alert">Aktywny pomiar wymaga weryfikacji. Jest zakreskowany i nie wlicza się do sum.</p>}
+        {chosen && view && <div className="calendar-details" role="dialog" aria-modal="false" aria-labelledby="calendar-details-title" tabIndex={-1} ref={dialog} onKeyDown={onDialogKey}>
+          <div className="section-top"><h3 id="calendar-details-title">{chosen.title}</h3><button type="button" className="secondary" onClick={close}>Zamknij</button></div>
+          <dl>
+            <dt>Klient / projekt</dt><dd>{chosen.path}</dd>
+            <dt>Wpis</dt><dd>{fullDate(chosen.entryStartMs, view.zone)} – {chosen.entryEndMs === null ? 'trwa' : fullDate(chosen.entryEndMs, view.zone)}</dd>
+            <dt>Czas wpisu</dt><dd>{chosen.entrySeconds === null ? (chosen.kind === 'unverified' ? 'do weryfikacji' : 'w trakcie') : duration(chosen.entrySeconds)}</dd>
+            <dt>Ten dzień</dt><dd>{pieceRange(chosen)}{chosen.kind === 'work' ? ` · ${duration(chosen.seconds)}` : ''}</dd>
+            <dt>Rozliczalność</dt><dd>{chosen.billable ? 'Rozliczalny' : 'Nierozliczalny'}</dd>
+          </dl>
+          {chosen.kind === 'pending' && <p className="alert">Uśpienie do rozstrzygnięcia nie wlicza się do sum. Rozstrzygnij je na liście okresów uśpienia w widoku Timer.</p>}
+          {chosen.kind === 'unverified' && <p className="alert">Pomiar wymaga weryfikacji i nie wlicza się do sum. Rozlicz go w widoku Timer.</p>}
+          {chosen.running && chosen.kind === 'work' && <p className="helper">Pomiar trwa od {clockText(chosen.entryStartMs, view.zone)}. Czas zapisze się przy zatrzymaniu.</p>}
+          <p className="helper">{chosen.running ? 'Trwającego pomiaru nie edytuje się w kalendarzu.' : 'Tego wpisu nie można edytować w kalendarzu, dopóki ma okres do rozstrzygnięcia lub weryfikacji.'}</p>
+        </div>}
         <div className="calendar-grid">
           <div className="calendar-body" ref={body} tabIndex={-1} style={gridHeight ? { height: gridHeight } : undefined}>
           <div className="calendar-head" aria-hidden="true">
@@ -220,20 +234,6 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
           </div>
         </div>
         {blocks.length === 0 && <p className="muted calendar-empty">W tym tygodniu nie ma wpisów{filtered ? ' dla wybranych filtrów' : ''}.</p>}
-        {chosen && view && <div className="calendar-details" role="dialog" aria-modal="false" aria-labelledby="calendar-details-title" tabIndex={-1} ref={dialog} onKeyDown={onDialogKey}>
-          <div className="section-top"><h3 id="calendar-details-title">{chosen.title}</h3><button type="button" className="secondary" onClick={close}>Zamknij</button></div>
-          <dl>
-            <dt>Klient / projekt</dt><dd>{chosen.path}</dd>
-            <dt>Wpis</dt><dd>{fullDate(chosen.entryStartMs, view.zone)} – {chosen.entryEndMs === null ? 'trwa' : fullDate(chosen.entryEndMs, view.zone)}</dd>
-            <dt>Czas wpisu</dt><dd>{chosen.entrySeconds === null ? (chosen.kind === 'unverified' ? 'do weryfikacji' : 'w trakcie') : duration(chosen.entrySeconds)}</dd>
-            <dt>Ten dzień</dt><dd>{pieceRange(chosen)}{chosen.kind === 'work' ? ` · ${duration(chosen.seconds)}` : ''}</dd>
-            <dt>Rozliczalność</dt><dd>{chosen.billable ? 'Rozliczalny' : 'Nierozliczalny'}</dd>
-          </dl>
-          {chosen.kind === 'pending' && <p className="alert">Uśpienie do rozstrzygnięcia nie wlicza się do sum. Rozstrzygnij je na liście okresów uśpienia w widoku Timer.</p>}
-          {chosen.kind === 'unverified' && <p className="alert">Pomiar wymaga weryfikacji i nie wlicza się do sum. Rozlicz go w widoku Timer.</p>}
-          {chosen.running && chosen.kind === 'work' && <p className="helper">Pomiar trwa od {clockText(chosen.entryStartMs, view.zone)}. Czas zapisze się przy zatrzymaniu.</p>}
-          <p className="helper">{chosen.running ? 'Trwającego pomiaru nie edytuje się w kalendarzu.' : 'Tego wpisu nie można edytować w kalendarzu, dopóki ma okres do rozstrzygnięcia lub weryfikacji.'}</p>
-        </div>}
         {entryForm && report.read && <CalendarEntryDialog request={entryForm} zone={view.zone} now={now} catalog={catalog} data={report.read.data}
           active={snapshotActive} enabled={editable} onClose={closeForm} onSaved={entrySaved} />}
       </>}
