@@ -2538,7 +2538,7 @@ async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
   {
     const db = openTestDb();
     try {
-      project = db.prepare(`SELECT id, client_id FROM projects WHERE archived=0 LIMIT 1`).get();
+      project = db.prepare(`SELECT p.id, p.client_id FROM projects p JOIN clients c ON c.id = p.client_id WHERE p.archived=0 AND c.archived=0 LIMIT 1`).get();
       db.exec('BEGIN IMMEDIATE');
       const insertEntry = db.prepare(`INSERT INTO time_entries (project_id, task_id, started_at, ended_at, duration_seconds, manually_resolved) VALUES (?, NULL, ?, ?, ?, 0)`);
       const insertDesc = db.prepare(`INSERT INTO entry_descriptions (entry_id, description) VALUES (?, ?)`);
@@ -2548,8 +2548,6 @@ async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
         const rowId = Number(insertEntry.run(project.id, new Date(s).toISOString(), new Date(s + 1_800_000).toISOString(), 1800).lastInsertRowid);
         insertDesc.run(rowId, `DEV-36 10k #${i + 1}`);
       }
-      const focusId = Number(insertEntry.run(project.id, '2026-04-08T08:00:00.000Z', '2026-04-08T09:00:00.000Z', 3600).lastInsertRowid);
-      insertDesc.run(focusId, 'DEV-36 M8 Focus Block');
       db.exec('COMMIT');
     } catch (error) {
       if (db.isTransaction) db.exec('ROLLBACK');
@@ -2557,20 +2555,18 @@ async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
     } finally { db.close(); }
   }
   await evaluate(`window.dispatchEvent(new Event('focus'))`);
-  await waitFor('10k report loaded into app', () => evaluate(`true`));
   await delay(600);
+
+  // Start a real live timer so clicking its read-only running block opens .calendar-details (M8 DOM order test).
+  await invoke('start_project_timer', { projectId: project.id, taskId: null, expectedActiveId: null, description: 'DEV-36 M8 Focus Block' });
+  const m8Active = await waitFor('DEV-36 M8 running timer', () => invoke('get_snapshot').then(s => s.active));
 
   await evaluate(`[...document.querySelectorAll('.view-switch button')].find(b => b.textContent.trim() === 'Kalendarz').click()`);
   await waitFor('DEV-36 calendar ready', () => evaluate(`Boolean(document.querySelector('.calendar-date')) && !document.querySelector('.calendar-loading')`));
-  await evaluate(`(() => {
-    const d = document.querySelector('.calendar-date');
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(d, '2026-04-06');
-    d.dispatchEvent(new Event('input', { bubbles: true }));
-  })()`);
-  await waitFor('M8 block visible in week 2026-04-06', () => evaluate(`Boolean([...document.querySelectorAll('.calendar-block')].find(b => b.textContent.includes('DEV-36 M8 Focus Block')))`));
+  await waitFor('M8 running block visible on current week', () => evaluate(`Boolean(document.querySelector('.calendar-block[data-running="true"]'))`));
 
   // M8: .calendar-details must precede .calendar-grid in DOM reading order.
-  await evaluate(`[...document.querySelectorAll('.calendar-block')].find(b => b.textContent.includes('DEV-36 M8 Focus Block')).click()`);
+  await evaluate(`document.querySelector('.calendar-block[data-running="true"]').click()`);
   const m8OrderOk = await waitFor('M8 details opened before grid', () => evaluate(`(() => {
     const details = document.querySelector('.calendar-details');
     const grid = document.querySelector('.calendar-grid');
@@ -2582,6 +2578,14 @@ async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
     await cdp.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }, sessionId);
   }
   await waitFor('M8 escape closed details', () => evaluate(`!document.querySelector('.calendar-details')`));
+  await invoke('stop_timer', { expectedActiveId: m8Active.id });
+
+  await evaluate(`(() => {
+    const d = document.querySelector('.calendar-date');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(d, '2026-02-09');
+    d.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await waitFor('DEV-36 10k dense week visible', () => evaluate(`Boolean([...document.querySelectorAll('.calendar-block')].find(b => b.textContent.includes('DEV-36 10k')))`));
 
   // AC3: Measure 25 consecutive period switches with 10,000 entries in WebView2 DOM.
   const samples = [];
