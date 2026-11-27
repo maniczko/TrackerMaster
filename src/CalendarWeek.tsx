@@ -17,7 +17,8 @@ type Props = {
   report: AllClientsReport; catalog: ReportCatalog; loaded: boolean; now: number;
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean;
   /** DEV-25: open on the week of this day (from the month view); the Tydzień | Miesiąc switch. */
-  initialWeek?: string; viewSwitch?: ReactNode;
+  initialWeek?: string; viewSwitch?: ReactNode; backButton?: ReactNode;
+  onOpenReport?: (date: string, scope: ReportScope, currentWeek: string | undefined) => void;
   /** DEV-26: adding and editing is possible (data current, no other write running). */
   editable: boolean;
   /** DEV-26: after a saved entry; refreshes the shared data (calendar, History, report). Throws when the refresh fails. */
@@ -64,7 +65,7 @@ function blockLabel(block: CalendarBlock): string {
   return `${block.title} — ${block.path}, ${pieceRange(block)}, ${state}`;
 }
 
-export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, initialWeek, viewSwitch, editable, onEntrySaved }: Props) {
+export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, initialWeek, viewSwitch, backButton, onOpenReport, editable, onEntrySaved }: Props) {
   const [saved] = useState(readSaved);
   const zone = report.read?.data.time_zone;
   const today = zone ? (() => { try { return dateInZone(now, zone); } catch { return null; } })() : null;
@@ -161,6 +162,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
 
   return <section className="card calendar" aria-label="Kalendarz">
     <div className="calendar-toolbar">
+      {backButton}
       {viewSwitch}
       <div className="calendar-nav" role="group" aria-label="Wybór tygodnia">
         <button type="button" className="secondary" aria-label="Poprzedni tydzień" disabled={!shownWeek} onClick={() => shownWeek && go(shiftWeek(shownWeek, -1))}>‹</button>
@@ -193,11 +195,20 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
         {view.unverifiedActive && <p role="status" className="alert">Aktywny pomiar wymaga weryfikacji. Jest zakreskowany i nie wlicza się do sum.</p>}
         <div className="calendar-grid">
           <div className="calendar-body" ref={body} tabIndex={-1} style={gridHeight ? { height: gridHeight } : undefined}>
-          <div className="calendar-head" aria-hidden="true">
-            <span />
-            {view.days.map(day => <span key={day.date} className={day.isToday ? 'calendar-day-head is-today' : 'calendar-day-head'}>
-              <small>{weekday.format(utc(day.date))}</small> <strong>{dayNumber.format(utc(day.date))}</strong>
-              <span className="calendar-day-total">{duration(day.seconds)}</span></span>)}
+          <div className="calendar-head">
+            <span aria-hidden="true" />
+            {view.days.map(day => <div key={day.date} className={day.isToday ? 'calendar-day-head is-today' : 'calendar-day-head'}>
+              {onOpenReport
+                ? <button type="button" className="calendar-day-head-button"
+                    aria-label={`Pokaż dzień ${dayNumber.format(utc(day.date))} (${duration(day.seconds)}) w szczegółach raportu`}
+                    title="Pokaż ten dzień w szczegółach raportu"
+                    onClick={() => onOpenReport(day.date, scope, shownWeek ?? undefined)}>
+                    <small>{weekday.format(utc(day.date))}</small> <strong>{dayNumber.format(utc(day.date))}</strong>
+                    <span className="calendar-day-total">{duration(day.seconds)}</span>
+                  </button>
+                : <><small>{weekday.format(utc(day.date))}</small> <strong>{dayNumber.format(utc(day.date))}</strong>
+                  <span className="calendar-day-total">{duration(day.seconds)}</span></>}
+            </div>)}
           </div>
             <div className="calendar-canvas" style={{ height: DAY_MINUTES * MINUTE_PX }}>
               <div className="calendar-hours" aria-hidden="true">{Array.from({ length: 24 }, (_, hour) => <span key={hour} style={{ top: hour * HOUR_PX }}>{String(hour).padStart(2, '0')}:00</span>)}</div>
@@ -233,6 +244,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
           {chosen.kind === 'unverified' && <p className="alert">Pomiar wymaga weryfikacji i nie wlicza się do sum. Rozlicz go w widoku Timer.</p>}
           {chosen.running && chosen.kind === 'work' && <p className="helper">Pomiar trwa od {clockText(chosen.entryStartMs, view.zone)}. Czas zapisze się przy zatrzymaniu.</p>}
           <p className="helper">{chosen.running ? 'Trwającego pomiaru nie edytuje się w kalendarzu.' : 'Tego wpisu nie można edytować w kalendarzu, dopóki ma okres do rozstrzygnięcia lub weryfikacji.'}</p>
+          {onOpenReport && <div className="actions"><button type="button" className="secondary" onClick={() => onOpenReport(chosen.date, scope, shownWeek ?? undefined)}>Pokaż dzień w raporcie</button></div>}
         </div>}
         {entryForm && report.read && <CalendarEntryDialog request={entryForm} zone={view.zone} now={now} catalog={catalog} data={report.read.data}
           active={snapshotActive} enabled={editable} onClose={closeForm} onSaved={entrySaved} />}

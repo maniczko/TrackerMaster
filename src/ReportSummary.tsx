@@ -3,8 +3,10 @@ import type { KeyboardEvent } from 'react';
 import { formatDuration as duration } from './reportCsv';
 import { chartScale, formatPercent, summaryChart, summaryGroups, summaryKpis } from './reportSummaryModel';
 import type { ChartBucket, EntryRelations, SummaryGroup } from './reportSummaryModel';
+import { projectDrillTarget, resolveDrillScope, summaryGroupDrillTarget } from './drillDown';
+import type { DrillTarget } from './drillDown';
 import type { makeReportView } from './reportView';
-import type { ReportCatalog } from './reportScope';
+import type { ReportCatalog, ReportScope } from './reportScope';
 
 type View = ReturnType<typeof makeReportView>;
 type Props = {
@@ -15,6 +17,8 @@ type Props = {
   from: string;
   through: string;
   incomplete: boolean;
+  activeScope?: ReportScope;
+  onDrill?: (target: DrillTarget) => void;
 };
 
 const PLOT_HEIGHT = 168;
@@ -22,11 +26,12 @@ const unitCaption = { day: 'Czas według dni', week: 'Czas według tygodni', mon
 const unitHint = { day: 'dzień', week: 'tydzień (od poniedziałku)', month: 'miesiąc' } as const;
 const tickLabel = (seconds: number, step: number) => step >= 3600 ? `${seconds / 3600} h` : `${seconds / 60} min`;
 
-export default function ReportSummary({ view, relations, catalog, clientLabelById, from, through, incomplete }: Props) {
+export default function ReportSummary({ view, relations, catalog, clientLabelById, from, through, incomplete, activeScope, onDrill }: Props) {
   const kpi = useMemo(() => summaryKpis(view), [view]);
   const chart = useMemo(() => summaryChart(view, relations, catalog, clientLabelById, from, through), [view, relations, catalog, clientLabelById, from, through]);
   const groups = useMemo(() => summaryGroups(view, relations, catalog, clientLabelById), [view, relations, catalog, clientLabelById]);
   const live = kpi.liveSeconds !== kpi.totalSeconds;
+  const effectiveScope = activeScope ?? { clientId: null, projectId: null, taskId: null };
   return <>
     <div className="report-summary report-kpis" aria-label="Wskaźniki zatwierdzonego czasu">
       <div><small>Łączny czas{incomplete ? ' · suma niepełna' : ''}</small><strong>{duration(kpi.totalSeconds)}</strong></div>
@@ -42,15 +47,23 @@ export default function ReportSummary({ view, relations, catalog, clientLabelByI
       {kpi.awaitingSeconds > 0 && <> · czeka na decyzję <strong>{duration(kpi.awaitingSeconds)}</strong></>}
     </p>}
     {kpi.totalSeconds === 0 ? <p className="muted report-summary-empty">Brak zatwierdzonego czasu w wybranym zakresie.</p> : <>
-      <ReportChart buckets={chart.buckets} unit={chart.unit} maxSeconds={chart.maxSeconds} legend={chart.legend} />
-      <ReportGroups groups={groups} totalSeconds={kpi.totalSeconds} />
+      <ReportChart buckets={chart.buckets} unit={chart.unit} maxSeconds={chart.maxSeconds} legend={chart.legend}
+        catalog={catalog} from={from} through={through} activeScope={effectiveScope} onDrill={onDrill} />
+      <ReportGroups groups={groups} totalSeconds={kpi.totalSeconds} catalog={catalog} from={from} through={through}
+        activeScope={effectiveScope} onDrill={onDrill} />
     </>}
   </>;
 }
 
-type ChartProps = Pick<ReturnType<typeof summaryChart>, 'buckets' | 'unit' | 'maxSeconds' | 'legend'>;
+type ChartProps = Pick<ReturnType<typeof summaryChart>, 'buckets' | 'unit' | 'maxSeconds' | 'legend'> & {
+  catalog: ReportCatalog;
+  from: string;
+  through: string;
+  activeScope: ReportScope;
+  onDrill?: (target: DrillTarget) => void;
+};
 
-function ReportChart({ buckets, unit, maxSeconds, legend }: ChartProps) {
+function ReportChart({ buckets, unit, maxSeconds, legend, catalog, from, through, activeScope, onDrill }: ChartProps) {
   const [active, setActive] = useState(() => Math.max(0, buckets.findIndex(bucket => bucket.seconds > 0)));
   const [shown, setShown] = useState<number | null>(null);
   const bars = useRef<(SVGGElement | null)[]>([]);
@@ -74,12 +87,16 @@ function ReportChart({ buckets, unit, maxSeconds, legend }: ChartProps) {
   const onKeyDown = (event: KeyboardEvent<SVGSVGElement>) => {
     const keys: Record<string, number> = { ArrowRight: focused + 1, ArrowLeft: focused - 1, Home: 0, End: buckets.length - 1 };
     if (event.key in keys) { event.preventDefault(); move(keys[event.key]); }
+    else if ((event.key === 'Enter' || event.key === ' ') && onDrill && buckets[focused]) {
+      event.preventDefault();
+      onDrill({ from: buckets[focused].from, through: buckets[focused].through, sourceLabel: buckets[focused].longLabel });
+    }
     else if (event.key === 'Escape') setShown(null);
   };
   const tip = shown === null ? null : buckets[shown];
   return <figure className="report-chart">
     <figcaption><h3>{unitCaption[unit]}</h3>
-      <p className="muted">Zatwierdzony czas na każdy {unitHint[unit]}, w podziale na projekty. Strzałki w lewo i w prawo przechodzą między słupkami.</p></figcaption>
+      <p className="muted">Zatwierdzony czas na każdy {unitHint[unit]}, w podziale na projekty. Strzałki w lewo i w prawo przechodzą między słupkami; Enter lub klik otwiera szczegóły.</p></figcaption>
     <div className="report-chart-frame">
       <div className="report-chart-axis" aria-hidden="true">
         {ticks.map(value => <span key={value} style={{ top: `${(1 - value / max) * PLOT_HEIGHT}px` }}>{tickLabel(value, step)}</span>)}
@@ -91,16 +108,26 @@ function ReportChart({ buckets, unit, maxSeconds, legend }: ChartProps) {
           {buckets.map((bucket, index) => {
             let top = PLOT_HEIGHT;
             return <g key={bucket.key} className="report-chart-bar" role="img" tabIndex={index === focused ? 0 : -1} aria-label={describe(bucket)}
-              aria-describedby={shown === index ? tooltipId : undefined} data-seconds={bucket.seconds} data-from={bucket.from}
+              aria-describedby={shown === index ? tooltipId : undefined} data-seconds={bucket.seconds} data-from={bucket.from} data-through={bucket.through}
+              data-drillable={onDrill ? 'true' : undefined}
               ref={element => { bars.current[index] = element; }}
+              onClick={() => onDrill?.({ from: bucket.from, through: bucket.through, sourceLabel: bucket.longLabel })}
               onFocus={() => { setActive(index); setShown(index); }} onBlur={() => setShown(current => current === index ? null : current)}
               onMouseEnter={() => setShown(index)} onMouseLeave={() => setShown(current => current === index ? null : current)}>
               <rect className="report-chart-hit" x={`${index * slot + slot * 0.08}%`} width={`${slot * 0.84}%`} y="0" height={PLOT_HEIGHT} />
               {bucket.segments.map(segment => {
                 const height = segment.seconds / max * PLOT_HEIGHT;
                 top -= height;
-                return <rect key={segment.projectId} className="report-chart-segment" data-project-colour={segment.colour}
-                  x={`${index * slot + slot * 0.18}%`} width={`${slot * 0.64}%`} y={top} height={height} />;
+                return <rect key={segment.projectId} className="report-chart-segment" data-project-colour={segment.colour} data-project-id={segment.projectId}
+                  x={`${index * slot + slot * 0.18}%`} width={`${slot * 0.64}%`} y={top} height={height}
+                  onClick={event => {
+                    if (!onDrill) return;
+                    const target = projectDrillTarget(segment.projectId, bucket.from, bucket.through, catalog);
+                    if (target && resolveDrillScope(activeScope, target, catalog).allowed) {
+                      event.stopPropagation();
+                      onDrill(target);
+                    }
+                  }} />;
               })}
               {index % labelEvery === 0 && <text className="report-chart-label" x={`${(index + 0.5) * slot}%`} y={PLOT_HEIGHT + 17} textAnchor="middle">{bucket.label}</text>}
             </g>;
@@ -118,15 +145,33 @@ function ReportChart({ buckets, unit, maxSeconds, legend }: ChartProps) {
       </div>
     </div>
     <ul className="report-chart-legend" aria-label="Legenda: projekty">
-      {legend.map(item => <li key={item.projectId}>
-        <span className="report-chart-swatch" data-project-colour={item.colour} aria-hidden="true" />
-        <span>{item.name}<small>{item.client}</small></span><span className="duration">{duration(item.seconds)}</span>
-      </li>)}
+      {legend.map(item => {
+        const target = onDrill ? projectDrillTarget(item.projectId, from, through, catalog) : null;
+        const allowed = Boolean(target && resolveDrillScope(activeScope, target, catalog).allowed);
+        const content = <>
+          <span className="report-chart-swatch" data-project-colour={item.colour} aria-hidden="true" />
+          <span>{item.name}<small>{item.client}</small></span><span className="duration">{duration(item.seconds)}</span>
+        </>;
+        return <li key={item.projectId}>
+          {allowed && target && onDrill
+            ? <button type="button" className="report-chart-legend-button" data-project-id={item.projectId}
+                aria-label={`Pokaż szczegóły projektu ${item.name}`} onClick={() => onDrill(target)}>{content}</button>
+            : content}
+        </li>;
+      })}
     </ul>
   </figure>;
 }
 
-function ReportGroups({ groups, totalSeconds }: { groups: SummaryGroup[]; totalSeconds: number }) {
+function ReportGroups({ groups, totalSeconds, catalog, from, through, activeScope, onDrill }: {
+  groups: SummaryGroup[];
+  totalSeconds: number;
+  catalog: ReportCatalog;
+  from: string;
+  through: string;
+  activeScope: ReportScope;
+  onDrill?: (target: DrillTarget) => void;
+}) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set(groups.map(group => group.key)));
   const all = useMemo(() => groups.flatMap(group => [group.key, ...group.children.map(child => child.key)]), [groups]);
   const toggle = (key: string) => setExpanded(current => {
@@ -149,17 +194,23 @@ function ReportGroups({ groups, totalSeconds }: { groups: SummaryGroup[]; totalS
         <button type="button" className="secondary report-button" onClick={() => setExpanded(new Set())}>Zwiń wszystko</button>
       </div></div>
     <div className="table-wrap"><table>
-      <thead><tr><th scope="col">Klient / projekt / zadanie</th><th scope="col">Czas</th><th scope="col">Udział</th></tr></thead>
-      <tbody>{rows.map(({ group, depth }) => <tr key={group.key} data-level={group.level} data-key={group.key}>
-        <th scope="row" className={`report-group-name report-group-depth-${depth}`}>
-          {group.children.length ? <button type="button" className="report-group-toggle" aria-expanded={expanded.has(group.key)} onClick={() => toggle(group.key)}>
-            <span aria-hidden="true">{expanded.has(group.key) ? '▾' : '▸'}</span>{group.name}
-          </button> : <span>{group.name}</span>}
-        </th>
-        <td className="duration">{duration(group.seconds)}</td>
-        <td className="duration">{formatPercent(100 * group.seconds / totalSeconds)}</td>
-      </tr>)}</tbody>
-      <tfoot><tr><th scope="row">Razem</th><td className="duration">{duration(totalSeconds)}</td><td className="duration">100%</td></tr></tfoot>
+      <thead><tr><th scope="col">Klient / projekt / zadanie</th><th scope="col">Czas</th><th scope="col">Udział</th><th scope="col">Wpisy</th></tr></thead>
+      <tbody>{rows.map(({ group, depth }) => {
+        const target = onDrill ? summaryGroupDrillTarget(group.key, group.name, from, through, catalog) : null;
+        const allowed = Boolean(target && resolveDrillScope(activeScope, target, catalog).allowed);
+        return <tr key={group.key} data-level={group.level} data-key={group.key}>
+          <th scope="row" className={`report-group-name report-group-depth-${depth}`}>
+            {group.children.length ? <button type="button" className="report-group-toggle" aria-expanded={expanded.has(group.key)} onClick={() => toggle(group.key)}>
+              <span aria-hidden="true">{expanded.has(group.key) ? '▾' : '▸'}</span>{group.name}
+            </button> : <span>{group.name}</span>}
+          </th>
+          <td className="duration">{duration(group.seconds)}</td>
+          <td className="duration">{formatPercent(100 * group.seconds / totalSeconds)}</td>
+          <td className="report-group-action">{allowed && target && onDrill && <button type="button" className="secondary report-button report-group-drill"
+            aria-label={`Pokaż wpisy: ${group.name}`} onClick={() => onDrill(target)}>Pokaż wpisy</button>}</td>
+        </tr>;
+      })}</tbody>
+      <tfoot><tr><th scope="row">Razem</th><td className="duration">{duration(totalSeconds)}</td><td className="duration">100%</td><td /></tr></tfoot>
     </table></div>
   </section>;
 }

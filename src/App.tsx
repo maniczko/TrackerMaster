@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
+import type { ReportHandle } from './Report';
 import ShortcutSettings from './ShortcutSettings';
 import { SleepNote, SleepPendingList, SleepReadError, usePendingSleep } from './SleepPending';
 import EntryDraftEditor from './EntryDraftEditor';
@@ -21,6 +22,10 @@ import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
 import { snapshotSignature, useAllClientsReport } from './useAllClientsReport';
 import CalendarShell from './CalendarShell';
+import type { CalendarRestore } from './CalendarShell';
+import type { ReportScope } from './reportScope';
+import { drillBackLabel, resolveDrillScope } from './drillDown';
+import type { DrillRouteSnapshot, DrillTarget } from './drillDown';
 import './miniTimer.css';
 
 type Id = number | string;
@@ -90,6 +95,10 @@ export default function App() {
   const revisionsRequest = useRef(0);
   const revisionSection = useRef<HTMLElement>(null);
   const entryEditor = useRef<EntryDraftEditorHandle>(null);
+  const reportRef = useRef<ReportHandle>(null);
+  const drillSeq = useRef(0);
+  const [drillStack, setDrillStack] = useState<DrillRouteSnapshot[]>([]);
+  const [calendarRestore, setCalendarRestore] = useState<CalendarRestore | null>(null);
   const hasUnsavedReportEdit = useCallback(() => entryEditor.current?.hasUnsavedChanges() ?? false, []);
   const descriptionRef = useRef<HTMLElement>(null);
   const [loaded, setLoaded] = useState(false);
@@ -154,6 +163,87 @@ export default function App() {
   // Timer or calendar (DEV-24). Only what is shown changes: the timer, its state and any open edit stay mounted.
   const [view, setView] = useState<'timer' | 'calendar'>(() => { try { return window.localStorage.getItem('trackermaster.view.v1') === 'calendar' ? 'calendar' : 'timer'; } catch { return 'timer'; } });
   const showView = (next: 'timer' | 'calendar') => { setView(next); try { window.localStorage.setItem('trackermaster.view.v1', next); } catch { /* convenience only */ } };
+  const captureRouteSnapshot = (
+    label: string,
+    calendarState?: { mode: 'week' | 'month'; week?: string; month?: string; selectedDate?: string | null },
+  ): DrillRouteSnapshot => {
+    const reportState = reportRef.current?.captureState() ?? {
+      open: false,
+      tab: 'summary' as const,
+      preset: 'today' as const,
+      customRange: { from: dateInZone(now, 'Europe/Warsaw'), through: dateInZone(now, 'Europe/Warsaw') },
+      reportScope: { clientId: null, projectId: null, taskId: null },
+      taskUnassignedOnly: false,
+    };
+    return {
+      id: ++drillSeq.current,
+      label,
+      view,
+      calendarMode: calendarState?.mode ?? 'week',
+      calendarWeek: calendarState?.week,
+      calendarMonth: calendarState?.month,
+      calendarSelectedDate: calendarState?.selectedDate,
+      reportOpen: reportState.open,
+      reportTab: reportState.tab,
+      reportPreset: reportState.preset,
+      reportRange: reportState.customRange,
+      reportScope: reportState.reportScope,
+      taskUnassignedOnly: reportState.taskUnassignedOnly,
+    };
+  };
+  const handleBack = () => {
+    const previous = drillStack[drillStack.length - 1];
+    if (!previous) return;
+    setDrillStack(stack => stack.slice(0, -1));
+    reportRef.current?.restoreState({
+      open: previous.reportOpen,
+      tab: previous.reportTab,
+      preset: previous.reportPreset,
+      customRange: previous.reportRange,
+      reportScope: previous.reportScope,
+      taskUnassignedOnly: previous.taskUnassignedOnly,
+    });
+    if (previous.view === 'calendar') {
+      setCalendarRestore({
+        key: ++drillSeq.current,
+        mode: previous.calendarMode,
+        week: previous.calendarWeek,
+        month: previous.calendarMonth,
+        selectedDate: previous.calendarSelectedDate,
+      });
+    }
+    showView(previous.view);
+  };
+  const handleReportDrill = (target: DrillTarget, currentScope: ReportScope) => {
+    const resolvedTarget = resolveDrillScope(currentScope, target, catalog);
+    if (!resolvedTarget.allowed) {
+      setError('Wybrany element należy do zakresu ukrytego przez aktywny filtr.');
+      return;
+    }
+    const snap = captureRouteSnapshot('Podsumowanie raportu');
+    if (reportRef.current?.applyDrill(target, resolvedTarget.scope, resolvedTarget.taskUnassignedOnly)) {
+      setDrillStack(stack => [...stack, snap]);
+    }
+  };
+  const handleCalendarMonthToWeek = (date: string, fromMonth?: string) => {
+    const snap = captureRouteSnapshot('Kalendarz: miesiąc', { mode: 'month', month: fromMonth, selectedDate: date });
+    setDrillStack(stack => [...stack, snap]);
+  };
+  const handleCalendarToReport = (
+    date: string,
+    calendarScope: ReportScope,
+    calendarState: { mode: 'week' | 'month'; week?: string; month?: string; selectedDate?: string | null },
+  ) => {
+    const resolvedTarget = resolveDrillScope(calendarScope, calendarScope, catalog);
+    const label = calendarState.mode === 'month' ? 'Kalendarz: miesiąc' : 'Kalendarz: tydzień';
+    const snap = captureRouteSnapshot(label, calendarState);
+    if (reportRef.current?.applyDrill({ from: date, through: date, sourceLabel: label }, resolvedTarget.scope, false)) {
+      setDrillStack(stack => [...stack, snap]);
+      showView('timer');
+    }
+  };
+  const topBack = drillStack.length > 0 ? drillStack[drillStack.length - 1] : null;
+  const backButton = topBack ? <button type="button" className="secondary report-button drill-back" onClick={handleBack}>{drillBackLabel(topBack)}</button> : null;
   // Totals run with the clock: the report base (re-read on changes, focus and every 60 s) plus the
   // running timer after its report projection, only while the fresh snapshot shows it resolved.
   const clockActive = data.active ? { id: data.active.id, recovered: data.active.recovered, uncertain: data.active.uncertain } : null;
@@ -402,7 +492,8 @@ export default function App() {
       </section>
       <SleepPendingList sleep={sleep} />
       {describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
-      <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} summary={allClients} hasUnsavedEdit={hasUnsavedReportEdit}
+      <Report ref={reportRef} clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} summary={allClients} hasUnsavedEdit={hasUnsavedReportEdit}
+        backButton={backButton} onDrill={handleReportDrill}
         onEditEntry={entryId => entryEditor.current?.openEntry(entryId, 'start')}
         onShowHistory={entryId => { void showRevisions(entryId, true); }} />
       <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
@@ -451,7 +542,9 @@ export default function App() {
       </div>
       {view === 'calendar' && <CalendarShell report={allClients} catalog={catalog} loaded={loaded} now={now} snapshotFresh={now - snapshotAt <= 5000}
         snapshotActive={data.active ? { id: data.active.id, project_id: data.active.project_id, task_id: data.active.task_id, started_at: data.active.started_at, description: data.active.description, billable: data.active.billable, recovered: data.active.recovered, uncertain: data.active.uncertain } : null}
-        editable={loaded && !busy} onEntrySaved={async () => { setReportRevision(version => version + 1); await refresh(); }} />}
+        editable={loaded && !busy} backButton={backButton} restore={calendarRestore}
+        onMonthToWeek={handleCalendarMonthToWeek} onOpenReport={handleCalendarToReport}
+        onEntrySaved={async () => { setReportRevision(version => version + 1); await refresh(); }} />}
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
     </main>
   </div>;

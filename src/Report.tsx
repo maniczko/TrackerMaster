@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { dateInZone, validTimeZone } from './reportTime';
 import { reportPresetRange, reportPresets } from './reportPresets';
 import type { ReportPreset } from './reportPresets';
@@ -18,6 +19,22 @@ import ReportGlance from './ReportGlance';
 import ReportSummary from './ReportSummary';
 import { entryRelations } from './reportSummaryModel';
 import type { AllClientsReport } from './useAllClientsReport';
+import type { DrillTarget } from './drillDown';
+
+export type ReportRouteState = {
+  open: boolean;
+  tab: 'summary' | 'details';
+  preset: ReportPreset | 'custom';
+  customRange: { from: string; through: string };
+  reportScope: ReportScope;
+  taskUnassignedOnly: boolean;
+};
+
+export type ReportHandle = {
+  captureState: () => ReportRouteState;
+  restoreState: (saved: ReportRouteState) => void;
+  applyDrill: (target: DrillTarget, nextScope: ReportScope, unassignedOnly: boolean) => boolean;
+};
 
 type Data = { entries: CompletedReportEntry[]; active: ActiveReportEntry | null; time_zone: string };
 type Props = ReportCatalog & {
@@ -28,12 +45,18 @@ type Props = ReportCatalog & {
   hasUnsavedEdit: () => boolean;
   onEditEntry: (entryId: number) => void;
   onShowHistory: (entryId: number) => void;
+  backButton?: ReactNode;
+  onDrill?: (target: DrillTarget, currentScope: ReportScope) => void;
 };
 
 const defaultZone = 'Europe/Warsaw';
 const archivedName = (name: string, archived?: boolean) => archived ? `${name} (Zarchiwizowany)` : name;
 
-export default function Report({ clients, projects, tasks, loaded, revision, summary, hasUnsavedEdit, onEditEntry, onShowHistory }: Props) {
+const Report = forwardRef<ReportHandle, Props>(function Report(
+  { clients, projects, tasks, loaded, revision, summary, hasUnsavedEdit, onEditEntry, onShowHistory, backButton, onDrill },
+  ref,
+) {
+  const sectionRef = useRef<HTMLElement>(null);
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<'summary' | 'details'>('summary');
   const [initialFilter] = useState(() => { try { return readReportFilter(window.localStorage); } catch { return { filter: null, problem: true }; } });
@@ -51,6 +74,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
   const [filterChangeBlocked, setFilterChangeBlocked] = useState(false);
   const [now, setNow] = useState(Date.now);
   const [reportScope, setReportScope] = useState(allReportClients);
+  const [taskUnassignedOnly, setTaskUnassignedOnly] = useState(false);
   const [snapshot, setSnapshot] = useState<{ request: string; data: Data } | null>(null);
   const [failure, setFailure] = useState<{ request: string; message: string } | null>(null);
   const [refresh, setRefresh] = useState(0);
@@ -212,9 +236,36 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
 
   function changeScope(field: keyof ReportScope, value: string) {
     if (!allowFilterChange()) return;
+    setTaskUnassignedOnly(false);
     const next = changeReportScope(reportScope, field, value ? Number(value) : null, catalog);
     rememberScope(next.scope, next.message);
   }
+
+  useImperativeHandle(ref, () => ({
+    captureState: () => ({ open, tab, preset, customRange, reportScope, taskUnassignedOnly }),
+    restoreState(saved) {
+      setOpen(saved.open);
+      setTab(saved.tab);
+      setPreset(saved.preset);
+      setCustomRange(saved.customRange);
+      setReportScope(saved.reportScope);
+      setTaskUnassignedOnly(saved.taskUnassignedOnly);
+      setFilterChangeBlocked(false);
+    },
+    applyDrill(target, nextScope, unassignedOnly) {
+      if (!allowFilterChange()) return false;
+      setOpen(true);
+      setTab('details');
+      setPreset('custom');
+      setCustomRange({ from: target.from, through: target.through });
+      setReportScope(nextScope);
+      setTaskUnassignedOnly(unassignedOnly);
+      setDateReadProblem(false);
+      setScopeReadProblem('');
+      window.setTimeout(() => sectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
+      return true;
+    },
+  }));
 
   function allowFilterChange() {
     const blocked = hasUnsavedEdit();
@@ -222,11 +273,24 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
     return !blocked;
   }
 
-  return <section className="card report" aria-label="Raport czasu">
-    <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div><button type="button" className="secondary report-button" aria-expanded={open} onClick={() => {
+  const detailRows = useMemo(() => {
+    if (!view) return [];
+    return taskUnassignedOnly ? view.rows.filter(item => relations.get(item.source.id)?.taskId === null) : view.rows;
+  }, [view, taskUnassignedOnly, relations]);
+  const detailFinalizedSeconds = useMemo(
+    () => !view ? 0 : taskUnassignedOnly ? detailRows.reduce((sum, item) => item.status === 'finalized' ? sum + item.contribution : sum, 0) : view.finalizedSeconds,
+    [view, taskUnassignedOnly, detailRows],
+  );
+  const detailLiveSeconds = useMemo(
+    () => !view ? 0 : taskUnassignedOnly ? detailRows.reduce((sum, item) => sum + item.contribution, 0) : view.liveSeconds,
+    [view, taskUnassignedOnly, detailRows],
+  );
+
+  return <section ref={sectionRef} className="card report" aria-label="Raport czasu">
+    <div className="section-top"><div><p className="section-kicker">PODSUMOWANIE PRACY</p><h2>Raport czasu</h2></div><div className="actions">{backButton}<button type="button" className="secondary report-button" aria-expanded={open} onClick={() => {
       if (!open && !hasUnsavedEdit()) setNow(Date.now());
       setOpen(!open);
-    }}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div>
+    }}>{open ? 'Zamknij raport' : 'Otwórz raport'}</button></div></div>
     {!open && <ReportGlance catalog={catalog} loaded={loaded} summary={summary} />}
     {open && <>
       <p className="muted">Czas według dni w strefie {data?.time_zone || 'raportowania'}. Zmiana strefy komputera nie zmienia raportu.</p>
@@ -274,6 +338,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
       </div>
       <button className="secondary report-button" type="button" disabled={!loaded || !scopeReady || !filterReady} onClick={() => {
         if (!allowFilterChange()) return;
+        setTaskUnassignedOnly(false);
         choosePeriod('today');
         rememberScope(allReportClients);
       }}>Wyczyść filtry</button>
@@ -292,6 +357,7 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
           <li>{resolved.client ? archivedName(selectedClientLabel ?? resolved.client.name, clientArchived) : 'Wszyscy klienci'}</li>
           {resolved.project && <li>{archivedName(resolved.project.name, projectArchived)}</li>}
           {resolved.task && <li>{archivedName(resolved.task.name, projectArchived || resolved.task.archived)}</li>}
+          {taskUnassignedOnly && <li className="report-scope-tag">Tylko: Bez zadania <button type="button" className="secondary report-button" onClick={() => setTaskUnassignedOnly(false)}>Pokaż wszystkie</button></li>}
         </ul>
         {incomplete && <div role="alert" className="alert error">
           <strong>Raport jest niepełny.</strong> {view.excludedEntryIds.length > 0 && <>Nie można bezpiecznie przypisać czasu do dni dla wpisów {view.excludedEntryIds.join(', ')}. </>}
@@ -319,15 +385,20 @@ export default function Report({ clients, projects, tasks, loaded, revision, sum
         </div>
         {tab === 'summary' ? <>
           <ReportSummary key={`summary:${viewKey}`} view={view} relations={relations} catalog={catalog} clientLabelById={clientLabelById}
-            from={range.from} through={range.through} incomplete={incomplete} />
+            from={range.from} through={range.through} incomplete={incomplete} activeScope={reportScope}
+            onDrill={onDrill ? target => onDrill(target, reportScope) : undefined} />
           {view.liveDays.length === 0 ? <p className="muted">Brak czasu pracy w wybranym zakresie.</p> :
-            <div className="table-wrap"><table><thead><tr><th scope="col">Dzień</th><th scope="col">Czas z aktywnym pomiarem</th></tr></thead>
-              <tbody>{view.liveDays.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td></tr>)}</tbody></table></div>}
-        </> : <ReportDetails key={`details:${viewKey}`} rows={view.rows} clientLabelByEntry={clientLabelByEntry}
-          finalizedSeconds={view.finalizedSeconds} liveSeconds={view.liveSeconds} zone={data.time_zone} onEdit={onEditEntry} onHistory={onShowHistory} />}
+            <div className="table-wrap"><table><thead><tr><th scope="col">Dzień</th><th scope="col">Czas z aktywnym pomiarem</th><th scope="col">Wpisy</th></tr></thead>
+              <tbody>{view.liveDays.map(day => <tr key={day.date}><td>{day.date}</td><td className="duration">{duration(day.seconds)}</td>
+                <td>{onDrill && <button type="button" className="secondary report-button" aria-label={`Pokaż wpisy z dnia ${day.date}`} onClick={() => onDrill({ from: day.date, through: day.date, sourceLabel: day.date }, reportScope)}>Pokaż wpisy</button>}</td>
+              </tr>)}</tbody></table></div>}
+        </> : <ReportDetails key={`details:${viewKey}:${taskUnassignedOnly}`} rows={detailRows} clientLabelByEntry={clientLabelByEntry}
+          finalizedSeconds={detailFinalizedSeconds} liveSeconds={detailLiveSeconds} zone={data.time_zone} onEdit={onEditEntry} onHistory={onShowHistory} />}
         <ReportExport key={`export:${viewKey}`} scope={reportScope} from={range.from}
           through={range.through} zone={data.time_zone} expectedRows={view.finalizedRows} incomplete={incomplete} clientLabel={selectedClientLabel} clientName={resolved.client?.name} />
       </>}
     </>}
   </section>;
-}
+});
+
+export default Report;
