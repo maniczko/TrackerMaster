@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'idle-reminders' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -2606,16 +2606,15 @@ async function verifyIdleAndReminders(cdp, sessionId) {
     projectId: project.projectId, taskId: null, expectedActiveId: null, description: 'DEV-39 aktywny cut',
   });
   const activeId = startedSnap.active.id;
-  const activeStartMs = Date.parse(startedSnap.active.started_at);
+  await delay(2500);
   let cutIdleId;
   {
     const db = openTestDb();
     try {
       db.exec('BEGIN IMMEDIATE');
-      // Shift started_at 10 minutes earlier cleanly so idle started_ms at activeStartMs - 5m lies strictly in the past.
-      const shiftedStart = new Date(activeStartMs - 10 * minute).toISOString();
-      db.prepare('UPDATE time_entries SET started_at=? WHERE id=?').run(shiftedStart, activeId);
-      cutIdleId = Number(db.prepare("INSERT INTO sleep_periods(entry_id,source,started_ms) VALUES(?,'idle',?)").run(activeId, activeStartMs - 5 * minute).lastInsertRowid);
+      const row = db.prepare('SELECT started_at FROM time_entries WHERE id=?').get(activeId);
+      const exactStartMs = Date.parse(row.started_at);
+      cutIdleId = Number(db.prepare("INSERT INTO sleep_periods(entry_id,source,started_ms) VALUES(?,'idle',?)").run(activeId, exactStartMs + 2000).lastInsertRowid);
       db.exec('COMMIT');
     } catch (error) {
       if (db.isTransaction) db.exec('ROLLBACK');
@@ -2626,7 +2625,7 @@ async function verifyIdleAndReminders(cdp, sessionId) {
   const afterCutSnap = await invoke('get_snapshot');
   assert.equal(afterCutSnap.active, null, 'entry stopped cleanly at idle start');
   const cutEntry = afterCutSnap.entries.find(e => e.id === activeId);
-  assert.equal(cutEntry?.duration_seconds, 300, 'duration equals exact 5 min work before idle start');
+  assert.equal(cutEntry?.duration_seconds, 2, 'duration equals exact 2 s work before idle start');
   assert.equal((await invoke('get_pending_sleep')).some(p => p.id === cutIdleId), false, 'cut idle period outside entry is hidden');
   console.log('PASS: DEV-39 attention settings persistence, idle/sleep distinction, totals, and stop_timer_at_idle_start verified');
 }
