@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry' || phase === 'quick-recent') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -2511,6 +2511,67 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
+async function verifyQuickRecent(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+
+  // Opening the window never starts any timer automatically.
+  assert.equal((await invoke('get_snapshot')).active, null);
+  const cid = await invoke('create_client', { name: 'DEV-16 Klient' });
+  const pid = await invoke('create_project', { clientId: cid, name: 'DEV-16 Projekt' });
+  const tOpenA = await invoke('create_task', { projectId: pid, name: 'DEV-16 Aktywne A' });
+  const tOpenB = await invoke('create_task', { projectId: pid, name: 'DEV-16 Aktywne B' });
+  const tArch = await invoke('create_task', { projectId: pid, name: 'DEV-16 Archiwum' });
+  const recordNow = async taskId => {
+    await invoke('start_project_timer', { projectId: pid, taskId, expectedActiveId: null, description: `Task ${taskId}` });
+    const s = await waitFor(`DEV-16 seed ${taskId}`, () => invoke('get_snapshot').then(x => x.active));
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await invoke('stop_timer', { expectedActiveId: Number(s.id) });
+    await waitFor(`DEV-16 stopped ${taskId}`, () => invoke('get_snapshot').then(x => x.active === null));
+  };
+  await recordNow(tOpenA);
+  await recordNow(tOpenB);
+  await recordNow(tArch);
+  await invoke('archive_task', { taskId: tArch, archived: true });
+  await evaluate(`window.dispatchEvent(new Event('focus'))`);
+
+  await waitFor('recent tasks list shows active tasks and omits archived', () => evaluate(`(() => {
+    const items = [...document.querySelectorAll('.quick-recent-item')].map(b => b.textContent);
+    return items.some(t => t.includes('DEV-16 Aktywne A')) && items.some(t => t.includes('DEV-16 Aktywne B')) && !items.some(t => t.includes('DEV-16 Archiwum'));
+  })()`));
+
+  // Click B -> starts single timer B and disables button B (single-active rule).
+  await evaluate(`[...document.querySelectorAll('.quick-recent-item')].find(b => b.textContent.includes('DEV-16 Aktywne B')).click()`);
+  await waitFor('B started', () => evaluate(`document.querySelector('.quick-recent-item[aria-current="true"]')?.textContent.includes('DEV-16 Aktywne B') && document.querySelector('.quick-recent-item[aria-current="true"]')?.disabled === true`));
+  let snap = await invoke('get_snapshot');
+  assert.equal(snap.active?.task_id, tOpenB);
+
+  // Unwritable DB error -> alert shown, timer B kept running, retry switches to A cleanly once.
+  const holdWriteLock = () => {
+    const lock = openTestDb();
+    lock.exec('BEGIN EXCLUSIVE');
+    return { release: () => { if (lock.isTransaction) lock.exec('ROLLBACK'); lock.close(); } };
+  };
+  const lock = holdWriteLock();
+  try {
+    await evaluate(`[...document.querySelectorAll('.quick-recent-item')].find(b => b.textContent.includes('DEV-16 Aktywne A')).click()`);
+    await waitFor('error shown on unwritable db quick-start', () => evaluate(`[...document.querySelectorAll('[role="alert"]')].some(n => n.textContent.includes('Nie udało się potwierdzić operacji'))`));
+    assert.equal((await invoke('get_snapshot')).active?.task_id, tOpenB);
+  } finally { lock.release(); }
+
+  await evaluate(`[...document.querySelectorAll('.quick-recent-item')].find(b => b.textContent.includes('DEV-16 Aktywne A')).click()`);
+  await waitFor('retry switched cleanly from B to A', () => evaluate(`document.querySelector('.quick-recent-item[aria-current="true"]')?.textContent.includes('DEV-16 Aktywne A')`));
+  snap = await invoke('get_snapshot');
+  assert.equal(snap.active?.task_id, tOpenA);
+  await invoke('stop_timer', { expectedActiveId: snap.active.id });
+  await waitFor('DEV-16 timer stopped', () => invoke('get_snapshot').then(s => s.active === null));
+  console.log('PASS: DEV-16 recent tasks list omits archived, enforces single active timer, reports error & retries cleanly');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -2582,7 +2643,7 @@ async function runWindow(port, phase, recovery) {
       if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep', 'quick-recent'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -2642,6 +2703,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
+    if (phase === 'quick-recent') await verifyQuickRecent(cdp, sessionId);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -2782,6 +2844,9 @@ try {
   // D4 short sleep (schema v14): last, after T27 restored the profile, so the entry counts asserted above are unaffected.
   await waitForWindowClosed(port);
   await runWindow(port, 'short-sleep', recovery);
+  // DEV-16: dedicated recent-tasks quick-start list.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'quick-recent', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

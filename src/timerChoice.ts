@@ -38,6 +38,23 @@ export function startBlocked(state: {
   return false;
 }
 
+/** DEV-16: One-click start/switch rule for the recent tasks list (never restarts the already running target). */
+export function quickRecentBlocked(
+  choice: Pick<Choice, 'client' | 'project' | 'task'>,
+  state: { busy: boolean; loaded: boolean; active: ActiveEntry | null },
+): boolean {
+  return startBlocked({
+    busy: state.busy,
+    loaded: state.loaded,
+    projectId: String(choice.project.id),
+    taskId: choice.task ? String(choice.task.id) : '',
+    client: choice.client,
+    project: choice.project,
+    task: choice.task ?? undefined,
+    active: state.active,
+  });
+}
+
 export type MainAction = { kind: 'stop' | 'start' | 'choose'; disabled: boolean };
 
 /**

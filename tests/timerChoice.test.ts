@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Snapshot } from '../src/App.tsx';
 import { ACTION_SETTLE_MS, choicesFor, createActionSettle, createRequestGate, recentChoices } from '../src/miniTimerModel.ts';
-import { mainAction, selectionFor, selectionKey, startBlocked } from '../src/timerChoice.ts';
+import { mainAction, quickRecentBlocked, selectionFor, selectionKey, startBlocked } from '../src/timerChoice.ts';
 
 // Synthetic data only. The main window uses the mini timer's own choice model.
 const snapshot: Snapshot = {
@@ -127,4 +127,17 @@ test('double click on the main action does nothing in either direction (Stop →
   assert.match(body, /startTimer\(\)\.finally\(settled\)/, 'Start marks the guard when its write ends');
   assert.equal(widget.match(/settle\.allows\(Date\.now\(\)\)/g)?.length, 2, 'the round toggle (and shortcut) and quick switching are guarded');
   assert.equal(widget.match(/\.finally\(\(\) => settle\.mark\(Date\.now\(\)\)\)/g)?.length, 2);
+});
+
+test('DEV-16 quickRecentBlocked skips archived entries and blocks restarting the active task', () => {
+  const activeTask = choices.find(choice => choice.key === 'task:100')!;
+  const projectOnly = choices.find(choice => choice.key === 'project:10')!;
+  assert.equal(quickRecentBlocked(activeTask, { busy: false, loaded: true, active: null }), false);
+  assert.equal(quickRecentBlocked(activeTask, { busy: true, loaded: true, active: null }), true);
+  assert.equal(quickRecentBlocked(activeTask, { busy: false, loaded: false, active: null }), true);
+  assert.equal(quickRecentBlocked(activeTask, { busy: false, loaded: true, active: { project_id: 10, task_id: 100 } }), true);
+  assert.equal(quickRecentBlocked(projectOnly, { busy: false, loaded: true, active: { project_id: 10, task_id: 100 } }), false);
+  assert.equal(quickRecentBlocked(activeTask, { busy: false, loaded: true, active: { project_id: 10, task_id: null, recovered: true } }), true);
+  const archivedTask = { ...activeTask, task: { id: 101, project_id: 10, name: 'Zamknięte', archived: true } };
+  assert.equal(quickRecentBlocked(archivedTask, { busy: false, loaded: true, active: null }), true);
 });
