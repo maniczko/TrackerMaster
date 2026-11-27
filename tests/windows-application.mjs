@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry' || phase === 'history-search') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
