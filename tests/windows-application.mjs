@@ -7,7 +7,7 @@ import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
-import { inspectZipStore } from '../src/reportXlsx.ts';
+import { inspectZipStore } from '../src/zipStore.ts';
 
 // Registry settings are temporary, scoped to the test executable on a disposable runner.
 assert.equal(process.platform, 'win32');
