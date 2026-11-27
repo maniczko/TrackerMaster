@@ -2560,8 +2560,9 @@ async function verifyQuickRecent(cdp, sessionId) {
   try {
     await evaluate(`[...document.querySelectorAll('.quick-recent-item')].find(b => b.textContent.includes('DEV-16 Aktywne A')).click()`);
     await waitFor('error shown on unwritable db quick-start', () => evaluate(`[...document.querySelectorAll('[role="alert"]')].some(n => n.textContent.includes('Nie udało się potwierdzić operacji'))`));
-    assert.equal((await invoke('get_snapshot')).active?.task_id, tOpenB);
   } finally { lock.release(); }
+  assert.equal((await invoke('get_snapshot')).active?.task_id, tOpenB);
+  await waitFor('quick-start A ready for retry', () => evaluate(`(b => Boolean(b && !b.disabled))([...document.querySelectorAll('.quick-recent-item')].find(b => b.textContent.includes('DEV-16 Aktywne A')))`));
 
   await evaluate(`[...document.querySelectorAll('.quick-recent-item')].find(b => b.textContent.includes('DEV-16 Aktywne A')).click()`);
   await waitFor('retry switched cleanly from B to A', () => evaluate(`document.querySelector('.quick-recent-item[aria-current="true"]')?.textContent.includes('DEV-16 Aktywne A')`));
