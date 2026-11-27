@@ -295,6 +295,8 @@ async function captureMainLayout(cdp, sessionId, state, { requireTimerAction = t
       }
       await saveScreenshot(cdp, sessionId, `main-${state}-${width}x${height}`);
       if (width === 1280) {
+        const brandSvg = await evaluate(`(() => { const svg = document.querySelector('.brand-mark svg'); if (!svg) return null; const r = svg.getBoundingClientRect(); return { w: r.width, h: r.height }; })()`);
+        assert.ok(brandSvg && brandSvg.w >= 24 && brandSvg.h >= 24, `${state}: vector BrandMark SVG missing or undersized (${JSON.stringify(brandSvg)})`);
         const controls = await evaluate(inspectControlSizes);
         console.log(`UI_LAYOUT controls-${state} ${width}x${height} ${JSON.stringify(controls)}`);
         assert.ok(controls.search, `${state}: the project search is missing`);
