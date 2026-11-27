@@ -975,20 +975,28 @@ mod tests {
     // I15 & I15b: D3 Stop/Switch closes open idle period cleanly in one transaction.
     #[test]
     fn i15_and_i15b_switch_closes_open_idle_on_entry_a() {
-        let (mut tracker, start, dir) = setup_tracker("2026-11-25T09:00:00Z", true);
-        let mut rt = AttentionRuntime::new(dir.clone());
-        let idle_at = start + 10 * 60_000;
-        let stop_at = start + 25 * 60_000;
-        step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: stop_at - 60_000, now_tick_ms: 2_000_000, last_input_tick_ms: 2_000_000 - (14 * 60_000) }).unwrap();
-        assert!(rt.open_idle.is_some());
-        let stop_iso = DateTime::from_timestamp_millis(stop_at).unwrap().to_rfc3339_opts(SecondsFormat::Millis, true);
-        tracker.db.execute("INSERT INTO projects(id,client_id,name) VALUES(2,1,'Projekt B')", []).unwrap();
-        optional_task_migration::transition(&mut tracker, Some(1), &stop_iso, optional_task_migration::TimerAction::Start { project_id: 2, task_id: None, description: "B" }).unwrap();
-        let p_a = sleep_periods::list_for_entry(&tracker.db, 1).unwrap();
+        let dir = temp_dir("switch");
+        let mut db = Connection::open_in_memory().unwrap();
+        initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt A'),(2,1,'Projekt B');").unwrap();
+        let mut tracker = Tracker { db, running_since: None, restored: false };
+        let start_dt = Utc::now();
+        let start_iso = start_dt.to_rfc3339_opts(SecondsFormat::Millis, true);
+        optional_task_migration::transition(&mut tracker, None, &start_iso, optional_task_migration::TimerAction::Start { project_id: 1, task_id: None, description: "A" }).unwrap();
+        let entry_a: i64 = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let idle_at = Utc::now().timestamp_millis();
+        let idle_id = sleep_periods::record_idle(&mut tracker.db, entry_a, idle_at).unwrap();
+        assert!(idle_id > 0);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let stop_dt = Utc::now();
+        let stop_at = stop_dt.timestamp_millis();
+        let stop_iso = stop_dt.to_rfc3339_opts(SecondsFormat::Millis, true);
+        optional_task_migration::transition(&mut tracker, Some(entry_a), &stop_iso, optional_task_migration::TimerAction::Start { project_id: 2, task_id: None, description: "B" }).unwrap();
+        let p_a = sleep_periods::list_for_entry(&tracker.db, entry_a).unwrap();
         let active_b: i64 = tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).unwrap();
-        assert_eq!((p_a.len(), p_a[0].ended_ms, p_a[0].decision.as_str()), (1, Some(stop_at), "pending"));
+        assert_eq!((p_a.len(), p_a[0].ended_ms, p_a[0].decision.as_str(), p_a[0].source.as_str()), (1, Some(stop_at), "pending", "idle"));
         assert!(sleep_periods::list_for_entry(&tracker.db, active_b).unwrap().is_empty());
-        let _ = idle_at;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1004,16 +1012,17 @@ mod tests {
             let ev = step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t0 + min * 60_000, now_tick_ms: 5_000_000 + (min * 60_000) as u32, last_input_tick_ms: 5_000_000 - 120_000 }).unwrap();
             assert!(ev.is_empty());
         }
-        // Present for 15 min in work hours -> fires once, repeats after 30 min.
+        // Present for 15 min in work hours (after t0 + 25m so monotonic UTC moves forward past t0 + 20m) -> fires once, repeats after 30 min.
+        let t1 = t0 + 25 * 60_000;
         let tick = 6_000_000u32;
-        assert!(step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t0, now_tick_ms: tick, last_input_tick_ms: tick - 5_000 }).unwrap().is_empty());
-        let ev1 = step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t0 + 15 * 60_000, now_tick_ms: tick + 900_000, last_input_tick_ms: tick + 890_000 }).unwrap();
+        assert!(step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t1, now_tick_ms: tick, last_input_tick_ms: tick - 5_000 }).unwrap().is_empty());
+        let ev1 = step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t1 + 15 * 60_000, now_tick_ms: tick + 900_000, last_input_tick_ms: tick + 890_000 }).unwrap();
         assert_eq!(ev1, vec![OutgoingNotification::NoTimerWorking]);
         // Repeat before 30 min -> silent.
-        let ev_early = step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t0 + 44 * 60_000, now_tick_ms: tick + 2_640_000, last_input_tick_ms: tick + 2_635_000 }).unwrap();
+        let ev_early = step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t1 + 44 * 60_000, now_tick_ms: tick + 2_640_000, last_input_tick_ms: tick + 2_635_000 }).unwrap();
         assert!(ev_early.is_empty());
         // Repeat after 30 min -> fires again.
-        let ev2 = step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t0 + 45 * 60_000, now_tick_ms: tick + 2_700_000, last_input_tick_ms: tick + 2_695_000 }).unwrap();
+        let ev2 = step_with_sample(&mut tracker, &mut rt, InputSample { now_utc_ms: t1 + 45 * 60_000, now_tick_ms: tick + 2_700_000, last_input_tick_ms: tick + 2_695_000 }).unwrap();
         assert_eq!(ev2, vec![OutgoingNotification::NoTimerWorking]);
 
         // I20: Autumn DST Sunday 2026-10-25 (with Sunday allowed): 16:59 CET = 15:59Z (in hours), 17:00 CET = 16:00Z (out).
