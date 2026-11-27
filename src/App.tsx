@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
+import BrandMark from './BrandMark';
 import ShortcutSettings from './ShortcutSettings';
 import { SleepNote, SleepPendingList, SleepReadError, usePendingSleep } from './SleepPending';
 import EntryDraftEditor from './EntryDraftEditor';
@@ -325,7 +326,7 @@ export default function App() {
   if (restoreDone) return <div className="app-shell"><main><section className="card"><h1>Kopia została przywrócona</h1><p>Ze względów bezpieczeństwa zamknij aplikację i uruchom ją ponownie. Jeśli kopia zawierała otwarty pomiar, po uruchomieniu będzie on wymagał weryfikacji.</p><p>Kopia danych sprzed przywrócenia: <code>{restoreDone}</code>. Nie jest szyfrowana.</p>{error && <div role="alert" className="alert error">{error}</div>}<button className="primary" onClick={() => invoke('exit_after_restore').catch(e => setError(`Nie udało się zamknąć aplikacji: ${String(e)}`))}>Zamknij aplikację</button></section></main></div>;
 
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><span className="brand-mark">T</span><div><strong>TrackerMaster</strong><small>Twój czas, pod kontrolą</small></div></div>
+    <header className="topbar"><div className="brand"><BrandMark size={36} /><div><strong>TrackerMaster</strong><small>Twój czas, pod kontrolą</small></div></div>
       <div className="view-switch" role="group" aria-label="Widok"><button type="button" aria-pressed={view === 'timer'} onClick={() => showView('timer')}>Timer</button><button type="button" aria-pressed={view === 'calendar'} onClick={() => showView('calendar')}>Kalendarz</button></div>
       <div className="topbar-actions"><button className="widget-open" onClick={() => invoke('open_widget').catch(e => setError(`Nie udało się otworzyć widgetu: ${String(e)}`))}>Otwórz widget</button><span className="local-pill"><span /> Lokalnie na tym komputerze</span></div></header>
     <main>
