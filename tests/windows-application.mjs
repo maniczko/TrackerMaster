@@ -2627,14 +2627,12 @@ async function verifyHistorySearch(cdp, sessionId) {
       db.exec('BEGIN IMMEDIATE');
       const insertEntry = db.prepare(`INSERT INTO time_entries (project_id, task_id, started_at, ended_at, duration_seconds, manually_resolved) VALUES (?, NULL, ?, ?, ?, 0)`);
       const insertDesc = db.prepare(`INSERT INTO entry_descriptions (entry_id, description) VALUES (?, ?)`);
-      const insertBill = db.prepare(`INSERT INTO billable_entries (entry_id, billable) VALUES (?, 0)`);
       const baseMs = Date.parse('2020-01-01T08:00:00.000Z');
       for (let i = 0; i < 10_000; i++) {
         const start = baseMs + i * 3_600_000;
         const end = start + 1_800_000;
         const rowId = Number(insertEntry.run(project.projectId, new Date(start).toISOString(), new Date(end).toISOString(), 1800).lastInsertRowid);
         insertDesc.run(rowId, i < 10 ? `Syntetyczny wpis zółć 10k #${i}` : `Syntetyczny wpis historia #${i}`);
-        insertBill.run(rowId);
       }
       db.exec('COMMIT');
     } catch (error) {
