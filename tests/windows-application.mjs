@@ -2532,12 +2532,12 @@ async function verifyCalendarModes(cdp, sessionId) {
     await invoke('create_project_manual_entry', { projectId: pid, taskId: null, startedAt: `2026-04-${d}T07:00:00.000Z`, endedAt: `2026-04-${d}T09:00:00.000Z`, description: `DEV-37 pn-pt ${d}` });
   }
   await invoke('create_project_manual_entry', { projectId: pid, taskId: null, startedAt: '2026-04-11T08:00:00.000Z', endedAt: '2026-04-11T10:00:00.000Z', description: 'DEV-37 sobota 2h' });
-  // AC2: 15 short overlapping entries on 2026-04-13.
+  // AC2: 15 short dense entries on 2026-04-13 (non-overlapping 4-min entries in a 75-min window).
   for (let i = 0; i < 15; i++) {
-    const startMs = Date.parse('2026-04-13T08:00:00.000Z') + i * 60_000;
+    const startMs = Date.parse('2026-04-13T08:00:00.000Z') + i * 300_000;
     await invoke('create_project_manual_entry', {
       projectId: pid, taskId: null,
-      startedAt: new Date(startMs).toISOString(), endedAt: new Date(startMs + 600_000).toISOString(),
+      startedAt: new Date(startMs).toISOString(), endedAt: new Date(startMs + 240_000).toISOString(),
       description: `DEV-37 gęsty #${i + 1}`,
     });
   }
