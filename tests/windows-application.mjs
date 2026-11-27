@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry' || phase === 'sidebar-shell') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -2511,6 +2511,147 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
+// DEV-23: shared sidebar/topbar shell, live persistent timer across all sections, keyboard Tab/Arrow/Esc, responsive viewports.
+async function verifySidebarShell(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const press = async (key, code, windowsVirtualKeyCode) => {
+    for (const type of ['keyDown', 'keyUp']) {
+      await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode }, sessionId);
+    }
+  };
+  const setField = async (selector, value, event = 'input') => {
+    const ok = await evaluate(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el || el.disabled) return false;
+      const proto = el.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, ${JSON.stringify(value)});
+      el.dispatchEvent(new Event(${JSON.stringify(event)}, { bubbles: true }));
+      return true;
+    })()`);
+    assert.equal(ok, true, `field not editable: ${selector}`);
+  };
+  const assertViewport = async (width, height, deviceScaleFactor, screenshotName) => {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor, mobile: false }, sessionId);
+    try {
+      await waitFor(`viewport ${width}x${height}@${deviceScaleFactor}`, () => evaluate(`window.innerWidth === ${width}`));
+      await delay(250);
+      const metrics = await evaluate(`({
+        scrollWidth: document.documentElement.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+        sidebarVisible: Boolean(document.querySelector('.app-sidebar')?.getBoundingClientRect().height > 0),
+        topbarVisible: Boolean(document.querySelector('.global-timer-strip')?.getBoundingClientRect().height > 0),
+      })`);
+      assert.ok(metrics.scrollWidth <= metrics.clientWidth, `${screenshotName}: horizontal overflow (${metrics.scrollWidth} > ${metrics.clientWidth})`);
+      assert.equal(metrics.sidebarVisible, true, `${screenshotName}: sidebar not visible`);
+      assert.equal(metrics.topbarVisible, true, `${screenshotName}: topbar timer strip not visible`);
+      if (screenshotName) await saveScreenshot(cdp, sessionId, screenshotName);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  };
+
+  assert.equal(await evaluate(`document.querySelector('.app-sidebar-btn[aria-current="page"]')?.dataset.section`), 'timer');
+  await captureMainLayout(cdp, sessionId, 'sidebar-timer');
+
+  // Navigate to Klienci, create client, test rename + Escape cancel.
+  await evaluate(`document.querySelector('.app-sidebar-btn[data-section="clients"]').click()`);
+  await waitFor('Klienci section opened', () => evaluate(`Boolean(document.querySelector('[aria-label="Katalog klientów"]'))`));
+  const clientName = 'Klient Shell DEV-23';
+  await setField('[aria-label="Katalog klientów"] form input', clientName);
+  await evaluate(`document.querySelector('[aria-label="Katalog klientów"] form button[type="submit"]').click()`);
+  const clientRowExpr = `[...document.querySelectorAll('[aria-label="Katalog klientów"] .directory-row')].find(r => r.textContent.includes(${JSON.stringify(clientName)}))`;
+  await waitFor('new client appears in directory', () => evaluate(`Boolean(${clientRowExpr})`));
+  await evaluate(`[...${clientRowExpr}.querySelectorAll('button')].find(b => b.textContent.trim() === 'Zmień nazwę').click()`);
+  await waitFor('rename form visible', () => evaluate(`Boolean(document.querySelector('form[aria-label="Zmiana nazwy"] input'))`));
+  await press('Escape', 'Escape', 27);
+  await waitFor('Escape cancels rename form', () => evaluate(`!document.querySelector('form[aria-label="Zmiana nazwy"]')`));
+
+  // Navigate to Projekty, create project, verify colour badge and jump to Timer.
+  await evaluate(`document.querySelector('.app-sidebar-btn[data-section="projects"]').click()`);
+  await waitFor('Projekty section opened', () => evaluate(`Boolean(document.querySelector('[aria-label="Katalog projektów"]'))`));
+  const projectName = 'Projekt Shell DEV-23';
+  await evaluate(`(() => {
+    const select = document.querySelector('[aria-label="Katalog projektów"] select');
+    const option = [...select.options].find(o => o.textContent.includes(${JSON.stringify(clientName)}));
+    if (!option) throw new Error('Client option missing');
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, option.value);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await setField('[aria-label="Katalog projektów"] input[placeholder*="Redesign"]', projectName);
+  await evaluate(`document.querySelector('[aria-label="Katalog projektów"] form button[type="submit"]').click()`);
+  const projectRowExpr = `[...document.querySelectorAll('[aria-label="Katalog projektów"] .directory-row')].find(r => r.textContent.includes(${JSON.stringify(projectName)}))`;
+  await waitFor('new project appears with colour badge', () => evaluate(`Boolean(${projectRowExpr}?.querySelector('[data-project-colour]'))`));
+  await assertViewport(1280, 720, 1, 'sidebar-projects-1280x720');
+  await evaluate(`[...${projectRowExpr}.querySelectorAll('button')].find(b => b.textContent.trim() === 'Wybierz w timerze').click()`);
+  await waitFor('returned to timer with project selected', () => evaluate(`
+    document.querySelector('.app-sidebar-btn[aria-current="page"]')?.dataset.section === 'timer'
+    && document.querySelector('.timer-target')?.textContent.includes(${JSON.stringify(projectName)})
+  `));
+
+  // Start timer and verify persistent live topbar + DB entry across every navigation screen.
+  await evaluate(`document.querySelector('[aria-label="Pomiar czasu"] .timer-start button').click()`);
+  await waitFor('global timer bar is running (>= 2s)', () => evaluate(`(() => {
+    const status = document.querySelector('[data-global-status]')?.dataset.globalStatus;
+    const clock = document.querySelector('.global-timer-clock')?.textContent.trim() ?? '';
+    const secs = clock.split(':').map(Number).reduce((a, b) => a * 60 + b, 0);
+    return status === 'running' && Number.isFinite(secs) && secs >= 2;
+  })()`));
+  const readActiveDb = () => {
+    const db = openTestDb({ readOnly: true });
+    try { return db.prepare('SELECT id, started_at, ended_at, duration_seconds FROM time_entries WHERE ended_at IS NULL').all(); }
+    finally { db.close(); }
+  };
+  const activeBefore = readActiveDb();
+  assert.equal(activeBefore.length, 1, 'expected one running entry in SQLite');
+  const activeId = activeBefore[0].id;
+  await captureMainLayout(cdp, sessionId, 'sidebar-running');
+
+  await evaluate(`document.querySelector('.app-sidebar-btn[data-section="calendar"]').click()`);
+  await waitFor('calendar visible while timer running', () => evaluate(`Boolean(document.querySelector('.calendar')) && document.querySelector('[data-global-status]')?.dataset.globalStatus === 'running'`));
+  await assertViewport(1280, 720, 1, null);
+  await assertViewport(1024, 576, 1.25, null);
+
+  await evaluate(`document.querySelector('.app-sidebar-btn[data-section="reports"]').click()`);
+  await waitFor('reports auto-opened while timer running', () => evaluate(`Boolean(document.querySelector('.report-kpis')) && document.querySelector('[data-global-status]')?.dataset.globalStatus === 'running'`));
+  await assertViewport(1280, 720, 1, 'sidebar-reports-1280x720');
+  await assertViewport(1920, 1080, 1, null);
+  await assertViewport(1024, 576, 1.25, 'sidebar-reports-125pct-1024x576');
+
+  // Keyboard navigation: focus Clients button, ArrowDown -> Settings, Enter, Tab stays responsive, active timer unchanged.
+  await evaluate(`document.querySelector('.app-sidebar-btn[data-section="clients"]').click()`);
+  await waitFor('clients active before keyboard nav', () => evaluate(`document.querySelector('.app-sidebar-btn[aria-current="page"]')?.dataset.section === 'clients'`));
+  await evaluate(`document.querySelector('.app-sidebar-btn[data-section="clients"]').focus()`);
+  await press('ArrowDown', 'ArrowDown', 40);
+  await waitFor('ArrowDown moves focus to settings', () => evaluate(`document.activeElement?.dataset?.section === 'settings'`));
+  await press('Enter', 'Enter', 13);
+  await waitFor('Enter opens settings with shortcut & backup cards', () => evaluate(`
+    document.querySelector('.app-sidebar-btn[aria-current="page"]')?.dataset.section === 'settings'
+    && Boolean(document.querySelector('[aria-label="Skrót klawiaturowy"]'))
+    && Boolean(document.querySelector('[aria-label="Bezpieczeństwo danych"]'))
+  `));
+  await press('Tab', 'Tab', 9);
+  assert.equal(await evaluate(`document.activeElement !== document.body`), true, 'Tab focuses next interactive control');
+  assert.deepEqual(readActiveDb().map(row => row.id), [activeId], 'navigation did not stop or restart active entry');
+
+  // Stop timer directly from persistent global topbar button and verify DB save + History row.
+  await evaluate(`document.querySelector('.global-bar-stop').click()`);
+  await waitFor('global timer bar stopped cleanly', () => evaluate(`document.querySelector('[data-global-status]')?.dataset.globalStatus === 'idle'`));
+  const db = openTestDb({ readOnly: true });
+  try {
+    const saved = db.prepare('SELECT ended_at, duration_seconds FROM time_entries WHERE id = ?').get(activeId);
+    assert.ok(saved?.ended_at && saved.duration_seconds >= 2, `stopped entry not finalized: ${JSON.stringify(saved)}`);
+  } finally {
+    db.close();
+  }
+  await evaluate(`document.querySelector('.global-bar-goto').click()`);
+  await waitFor('timer view shows stopped measurement', () => evaluate(`document.querySelector('.app-sidebar-btn[aria-current="page"]')?.dataset.section === 'timer'`));
+  console.log('PASS: DEV-23 sidebar/topbar shell kept running timer live across all screens, handled Tab/Arrow/Esc keyboard navigation, and rendered cleanly at 1280x720, 1920x1080 and 125% DPI');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -2582,7 +2723,7 @@ async function runWindow(port, phase, recovery) {
       if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep', 'sidebar-shell'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -2642,6 +2783,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
+    if (phase === 'sidebar-shell') await verifySidebarShell(cdp, sessionId);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -2782,6 +2924,9 @@ try {
   // D4 short sleep (schema v14): last, after T27 restored the profile, so the entry counts asserted above are unaffected.
   await waitForWindowClosed(port);
   await runWindow(port, 'short-sleep', recovery);
+  // DEV-23: shared sidebar/topbar shell and global timer across screens.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'sidebar-shell', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

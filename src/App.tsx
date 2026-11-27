@@ -21,6 +21,15 @@ import { dateInZone } from './reportTime';
 import type { HistoryRow } from './reportDayModel';
 import { snapshotSignature, useAllClientsReport } from './useAllClientsReport';
 import CalendarShell from './CalendarShell';
+import DirectoryViews from './DirectoryViews';
+import { AppSidebar, GlobalTimerBar, SectionHeading } from './SidebarShell';
+import {
+  buildGlobalTimerSummary,
+  parseStoredSection,
+  resolveWorkspaceVisibility,
+  SECTION_STORAGE_KEY,
+} from './shellModel';
+import type { AppSection } from './shellModel';
 import './miniTimer.css';
 
 type Id = number | string;
@@ -106,7 +115,7 @@ export default function App() {
   const needsStructure = loaded && data.clients.length === 0;
   // A first run needs the structure forms; keep the section open once it was shown.
   useEffect(() => { if (needsStructure) setSettingsOpen(true); }, [needsStructure]);
-  const openStructure = () => { setSettingsOpen(true); window.setTimeout(() => document.getElementById('new-client')?.focus(), 0); };
+  const openStructure = () => { setSection('timer'); setSettingsOpen(true); window.setTimeout(() => document.getElementById('new-client')?.focus(), 0); };
   useEffect(() => { if (describe) descriptionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [describe?.id]);
   useEffect(() => { if (revisions?.reveal) revisionSection.current?.scrollIntoView({ block: 'start' }); }, [revisions]);
   const refresh = useCallback(async () => {
@@ -151,9 +160,15 @@ export default function App() {
   // e.g. a start or stop from the mini timer; the open report itself still follows reportRevision only.
   const shownData = useMemo(() => snapshotSignature(data.entries, data.active), [data.entries, data.active]);
   const allClients = useAllClientsReport(loaded, `${reportRevision}|${shownData}`);
-  // Timer or calendar (DEV-24). Only what is shown changes: the timer, its state and any open edit stay mounted.
-  const [view, setView] = useState<'timer' | 'calendar'>(() => { try { return window.localStorage.getItem('trackermaster.view.v1') === 'calendar' ? 'calendar' : 'timer'; } catch { return 'timer'; } });
-  const showView = (next: 'timer' | 'calendar') => { setView(next); try { window.localStorage.setItem('trackermaster.view.v1', next); } catch { /* convenience only */ } };
+  // Active navigation section (DEV-23). Keeps Timer, Draft, and Report mounted so navigation never interrupts tracking.
+  const [section, setSection] = useState<AppSection>(() => {
+    try { return parseStoredSection(window.localStorage.getItem(SECTION_STORAGE_KEY)); } catch { return 'timer'; }
+  });
+  const showSection = (next: AppSection) => {
+    setSection(next);
+    try { window.localStorage.setItem(SECTION_STORAGE_KEY, next); } catch { /* convenience only */ }
+  };
+  const vis = resolveWorkspaceVisibility(section);
   // Totals run with the clock: the report base (re-read on changes, focus and every 60 s) plus the
   // running timer after its report projection, only while the fresh snapshot shows it resolved.
   const clockActive = data.active ? { id: data.active.id, recovered: data.active.recovered, uncertain: data.active.uncertain } : null;
@@ -202,6 +217,11 @@ export default function App() {
     if (!next) return;
     setClientId(next.clientId); setProjectId(next.projectId); setTaskId(next.taskId);
     timerDescriptionInput.current?.focus();
+  }
+  function stopFromGlobalBar() {
+    if (busy || !loaded || !data.active || data.active.recovered || data.active.uncertain || !mainSettle.allows(Date.now())) return;
+    mainSettle.mark(Date.now());
+    void execute(() => invoke('stop_timer', { expectedActiveId: Number(data.active!.id) }), 'Pomiar zatrzymany.').finally(() => mainSettle.mark(Date.now()));
   }
 
   async function execute(action: () => Promise<unknown>, message: string) {
@@ -322,15 +342,27 @@ export default function App() {
                 { key: 'delete', label: 'Usuń wpis', ariaLabel: `Usuń wpis: ${name}`, danger: true, disabled: busy || !e.ended_at, onSelect: () => setDeleting(e) },
               ]} /></>}</td></tr>;
   };
+  const todayText = new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date());
+  const globalSummary = buildGlobalTimerSummary({
+    loaded,
+    active: data.active,
+    clientLabel: activeClient ? clientLabelById.get(String(activeClient.id)) : undefined,
+    projectName: activeProject?.name,
+    taskName: activeTask?.name,
+    clockText: formatDuration(displayElapsed),
+  });
   if (restoreDone) return <div className="app-shell"><main><section className="card"><h1>Kopia została przywrócona</h1><p>Ze względów bezpieczeństwa zamknij aplikację i uruchom ją ponownie. Jeśli kopia zawierała otwarty pomiar, po uruchomieniu będzie on wymagał weryfikacji.</p><p>Kopia danych sprzed przywrócenia: <code>{restoreDone}</code>. Nie jest szyfrowana.</p>{error && <div role="alert" className="alert error">{error}</div>}<button className="primary" onClick={() => invoke('exit_after_restore').catch(e => setError(`Nie udało się zamknąć aplikacji: ${String(e)}`))}>Zamknij aplikację</button></section></main></div>;
 
   return <div className="app-shell">
     <header className="topbar"><div className="brand"><span className="brand-mark">T</span><div><strong>TrackerMaster</strong><small>Twój czas, pod kontrolą</small></div></div>
-      <div className="view-switch" role="group" aria-label="Widok"><button type="button" aria-pressed={view === 'timer'} onClick={() => showView('timer')}>Timer</button><button type="button" aria-pressed={view === 'calendar'} onClick={() => showView('calendar')}>Kalendarz</button></div>
+      <div className="view-switch" role="group" aria-label="Widok"><button type="button" aria-pressed={section === 'timer'} onClick={() => showSection('timer')}>Timer</button><button type="button" aria-pressed={section === 'calendar'} onClick={() => showSection('calendar')}>Kalendarz</button></div>
+      <GlobalTimerBar summary={globalSummary} busy={busy} onStop={stopFromGlobalBar} onFocusTimer={() => showSection('timer')} />
       <div className="topbar-actions"><button className="widget-open" onClick={() => invoke('open_widget').catch(e => setError(`Nie udało się otworzyć widgetu: ${String(e)}`))}>Otwórz widget</button><span className="local-pill"><span /> Lokalnie na tym komputerze</span></div></header>
+    <AppSidebar section={section} onSelect={showSection} />
     <main>
       {import.meta.env.VITE_TRACKER_TEST_MODE === '1' && <div role="note" className="alert warning"><strong>Wersja testowa.</strong> Korzysta z osobnej bazy na tym komputerze. Wprowadzaj wyłącznie fikcyjne dane.</div>}
-      <div className="heading" hidden={view !== 'timer'}><div><h1>Rejestracja czasu</h1><p className="subtitle">Wybierz projekt i skup się na pracy. Resztą zajmie się licznik.</p></div><div className="date">{new Intl.DateTimeFormat('pl-PL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())}</div></div>
+      <div className="heading" hidden={!vis.showTimerHeading}><div><h1>Rejestracja czasu</h1><p className="subtitle">Wybierz projekt i skup się na pracy. Resztą zajmie się licznik.</p></div><div className="date">{todayText}</div></div>
+      {vis.showSectionHeading && <SectionHeading section={section} dateText={todayText} />}
       {error && <div role="alert" className="alert error">{error}</div>}
       {!loaded && <div role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie przed wykonaniem kolejnej operacji. <button type="button" disabled={busy} onClick={retryRefresh}>Ponów odczyt</button></div>}
       {/* One compact review banner (UIQ-01): title and one sentence, the end-time form, the sleep note with the
@@ -351,8 +383,8 @@ export default function App() {
       {loaded && !data.active?.recovered && !data.active?.uncertain && sleep.items.length > 0 && <div role="status" className="alert timer-review"><SleepNote sleep={sleep} /></div>}
       <SleepReadError sleep={sleep} />
       {notice && <div role="status" className="alert success">{notice}</div>}
-      <div className="timer-view" hidden={view !== 'timer'}>
-      <section className="timer card" aria-label="Pomiar czasu">
+      <div className="timer-view" hidden={!vis.showTimerWorkspace}>
+      <section className="timer card" aria-label="Pomiar czasu" hidden={!vis.showTimerCard}>
         <div className="timer-layout">
           <div className="timer-now">
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered && !data.active.uncertain ? 'running' : loaded && (data.active?.recovered || data.active?.uncertain) ? 'pending' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered || data.active?.uncertain ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
@@ -400,12 +432,14 @@ export default function App() {
           </div>
         </div>
       </section>
-      <SleepPendingList sleep={sleep} />
-      {describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
-      <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} summary={allClients} hasUnsavedEdit={hasUnsavedReportEdit}
-        onEditEntry={entryId => entryEditor.current?.openEntry(entryId, 'start')}
-        onShowHistory={entryId => { void showRevisions(entryId, true); }} />
-      <section className="card history"><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
+      {vis.showSleepPending && <SleepPendingList sleep={sleep} />}
+      {vis.showDescribeCard && describe && <section ref={descriptionRef} className="card history" aria-label="Edycja opisu"><form onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('set_entry_description', { entryId: Number(describe.id), expected: describe.expected, description: describe.value }); const id = describe.id; setDescribe(null); if (revisions && same(revisions.entryId, id)) await showRevisions(id); }, 'Opis został zapisany.'); }}><h2>Opis wpisu #{describe.id}</h2><label>Opis (opcjonalnie)<textarea value={describe.value} maxLength={2000} rows={3} onChange={e => setDescribe({ ...describe, value: e.target.value })} /></label><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded}>Zapisz opis</button><button className="secondary" type="button" disabled={busy} onClick={() => setDescribe(null)}>Anuluj</button></div></form></section>}
+      <div className="report-host" hidden={!vis.showReportCard}>
+        <Report clients={data.clients} projects={data.projects} tasks={data.tasks} loaded={loaded} revision={reportRevision} summary={allClients} forceOpen={vis.forceReportOpen} onRequestClose={() => showSection('timer')} hasUnsavedEdit={hasUnsavedReportEdit}
+          onEditEntry={entryId => { if (section !== 'timer') { showSection('timer'); window.setTimeout(() => entryEditor.current?.openEntry(entryId, 'start'), 0); } else entryEditor.current?.openEntry(entryId, 'start'); }}
+          onShowHistory={entryId => { if (section !== 'timer') showSection('timer'); void showRevisions(entryId, true); }} />
+      </div>
+      <section className="card history" hidden={!vis.showHistoryCard}><div className="section-top"><div><p className="section-kicker">TWOJA AKTYWNOŚĆ</p><h2>Historia pomiarów</h2></div>{loaded && <span className="count">{entries.length === 500 ? 'Ostatnie 500 wpisów' : `${entries.length} wpisów`}</span>}</div>
         <p className="muted">Pomiary zapisane przed dodaniem rozliczalności mają domyślnie status nierozliczalny. Możesz go zmienić dla każdego wpisu.</p>
         <details><summary>Dodaj czas ręcznie</summary><p className="muted">Wybierz klienta i projekt powyżej; zadanie jest opcjonalne. Podaj czas rozpoczęcia i zakończenia w strefie czasowej komputera.</p>
           <form onSubmit={e => { e.preventDefault(); const start = parseLocalDate(manualStart); const end = parseLocalDate(manualEnd); if (!start || !end) { setError('Sprawdź daty i godziny. Godzina nie może być nieistniejąca ani występować dwukrotnie przy zmianie czasu.'); return; } void execute(async () => { await invoke('create_project_manual_entry', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, startedAt: start.toISOString(), endedAt: end.toISOString(), description: manualDescription }); setManualStart(''); setManualEnd(''); setManualDescription(''); }, 'Wpis czasu został dodany.'); }}>
@@ -431,10 +465,10 @@ export default function App() {
         <details onToggle={e => { if (e.currentTarget.open) void loadDeleted(); }}><summary>Usunięte wpisy</summary><p className="muted">Te wpisy nie są uwzględniane w aktywnej historii. Zachowano je wraz z historią zmian.</p><button type="button" className="secondary" onClick={() => void loadDeleted()}>Odśwież listę</button>{deleted === null ? <p className="muted">Odczytywanie lub brak dostępu do listy.</p> : deleted.length === 0 ? <p className="muted">Brak usuniętych wpisów.</p> : <ul>{deleted.map(entry => <li key={entry.id}><strong>{entry.task_id === null ? 'Bez zadania' : data.tasks.find(task => same(task.id, entry.task_id))?.name || 'Nieznane zadanie'}</strong> · {formatPreciseDate(entry.started_at)} – {formatPreciseDate(entry.ended_at)} · {formatDuration(entry.duration_seconds)} · usunięto {formatPreciseDate(entry.deleted_at)}{' '}<button type="button" className="secondary" onClick={() => void showRevisions(entry.id)}>Historia zmian</button></li>)}</ul>}{deleted?.length === 500 && <p className="muted">Wyświetlono ostatnie 500 usuniętych wpisów.</p>}</details>
         {revisions && <section ref={revisionSection} aria-label="Historia korekt"><div className="section-top"><h3>Historia zmian wpisu #{revisions.entryId}</h3><button className="secondary" type="button" onClick={() => { revisionsRequest.current++; setRevisions(null); }}>Zamknij</button></div>{revisions.origin && <p>Wpis powstał z odzyskanego szkicu wpisu #{revisions.origin.sourceEntryId} · {formatPreciseDate(revisions.origin.createdAt)}</p>}{!revisions.origin && revisions.items.length === 0 && revisions.billing.length === 0 && revisions.descriptions.length === 0 && <p className="muted">Ten wpis nie ma zapisanych zmian.</p>}{revisions.items.length > 0 && <ul>{revisions.items.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {formatPreciseDate(revision.before_start)} – {formatPreciseDate(revision.before_end)} ({formatDuration(revision.before_seconds)}) → {formatPreciseDate(revision.after_start)} – {formatPreciseDate(revision.after_end)} ({formatDuration(revision.after_seconds)})</li>)}</ul>}{revisions.billing.length > 0 && <ul>{revisions.billing.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_billable ? 'Rozliczalny' : 'Nierozliczalny'} → {revision.after_billable ? 'Rozliczalny' : 'Nierozliczalny'}</li>)}</ul>}{revisions.descriptions.length > 0 && <ul>{revisions.descriptions.map(revision => <li key={revision.id}><strong>{formatPreciseDate(revision.changed_at)}</strong>: {revision.before_description || 'Bez opisu'} → {revision.after_description || 'Bez opisu'}</li>)}</ul>}</section>}
       </section>
-      <details className="admin-panel" id="dane-i-ustawienia" open={settingsOpen || needsStructure} onToggle={e => { const open = e.currentTarget.open; if (!needsStructure) setSettingsOpen(open); }}>
-        <summary><span><strong>Dane i ustawienia</strong><small>Klienci i projekty, skrót klawiaturowy, kopia zapasowa i diagnostyka</small></span></summary>
+      <details className="admin-panel" id="dane-i-ustawienia" open={vis.forceSettingsOpen || settingsOpen || needsStructure} hidden={!vis.showSettingsPanel} onToggle={e => { const open = e.currentTarget.open; if (!needsStructure && !vis.forceSettingsOpen) setSettingsOpen(open); }}>
+        <summary hidden={vis.forceSettingsOpen}><span><strong>Dane i ustawienia</strong><small>Klienci i projekty, skrót klawiaturowy, kopia zapasowa i diagnostyka</small></span></summary>
         <div className="admin-grid">
-        <aside className="card setup"><div className="section-top"><div><p className="section-kicker">UPORZĄDKUJ PRACĘ</p><h2>Twoja struktura</h2></div><span className="outline-icon">＋</span></div><p className="muted">Dodaj klienta i projekt. Zadania możesz utworzyć później.</p>
+        <aside className="card setup" hidden={!vis.showSetupCard}><div className="section-top"><div><p className="section-kicker">UPORZĄDKUJ PRACĘ</p><h2>Twoja struktura</h2></div><span className="outline-icon">＋</span></div><p className="muted">Dodaj klienta i projekt. Zadania możesz utworzyć później.</p>
           {(['client', 'project', 'task'] as const).map((kind, index) => { const namesPL = { client: 'Klient', project: 'Projekt', task: 'Zadanie' }; const disabled = busy || !loaded || (kind === 'project' && (!clientId || selectedClient?.archived)) || (kind === 'task' && (!projectId || selectedProject?.archived || selectedClient?.archived)); return <form key={kind} className="create-form" onSubmit={create(kind)}><div className="form-label"><span className="step">0{index + 1}</span><label htmlFor={`new-${kind}`}>{namesPL[kind]}</label></div><div className="input-row"><input id={`new-${kind}`} value={names[kind]} disabled={disabled} onChange={e => setNames(old => ({ ...old, [kind]: e.target.value }))} placeholder={`Nazwa: ${namesPL[kind].toLowerCase()}`} maxLength={200} /><button disabled={disabled || !names[kind].trim()} aria-label={`Dodaj ${namesPL[kind].toLowerCase()}`}>＋</button></div>{kind === 'project' && !clientId && <small>Najpierw wybierz klienta</small>}{kind === 'task' && !projectId && <small>Najpierw wybierz projekt</small>}</form>; })}
           <details><summary>Zmień nazwę</summary><p className="muted">Wybierz klienta, projekt lub zadanie w timerze, a następnie popraw jego nazwę. Historia pomiarów zostanie zachowana.</p><div className="actions">{([{ kind: 'client', item: selectedClient, label: 'Klient' }, { kind: 'project', item: selectedProject, label: 'Projekt' }, { kind: 'task', item: selectedTask, label: 'Zadanie' }] as const).map(({ kind, item, label }) => <button type="button" className="secondary" key={kind} disabled={busy || !loaded || !item} onClick={() => item && setRename({ kind, id: item.id, expected: item.name, name: item.name })}>{label}</button>)}</div>
             {rename && <form className="create-form" onSubmit={e => { e.preventDefault(); void execute(async () => { await invoke('rename_item', { kind: rename.kind, id: Number(rename.id), expectedName: rename.expected, name: rename.name }); setRename(null); }, 'Nazwa została zmieniona.'); }}><label htmlFor="rename-item">Nowa nazwa dla: {rename.expected}</label><input id="rename-item" value={rename.name} maxLength={200} onChange={e => setRename({ ...rename, name: e.target.value })} /><div className="actions"><button className="secondary" type="submit" disabled={busy || !loaded || !rename.name.trim()}>Zapisz nazwę</button><button className="secondary" type="button" disabled={busy} onClick={() => setRename(null)}>Anuluj</button></div></form>}
@@ -449,7 +483,27 @@ export default function App() {
         </div>
       </details>
       </div>
-      {view === 'calendar' && <CalendarShell report={allClients} catalog={catalog} loaded={loaded} now={now} snapshotFresh={now - snapshotAt <= 5000}
+      {vis.directoryMode && (
+        <DirectoryViews
+          mode={vis.directoryMode}
+          clients={data.clients}
+          projects={data.projects}
+          tasks={data.tasks}
+          clientLabelById={clientLabelById}
+          loaded={loaded}
+          busy={busy}
+          selectedClientId={clientId}
+          selectedProjectId={projectId}
+          onSelectTarget={(nextClientId, nextProjectId, nextTaskId) => {
+            setClientId(nextClientId);
+            setProjectId(nextProjectId);
+            setTaskId(nextTaskId);
+          }}
+          onRunCommand={execute}
+          onOpenTimer={() => showSection('timer')}
+        />
+      )}
+      {vis.showCalendar && <CalendarShell report={allClients} catalog={catalog} loaded={loaded} now={now} snapshotFresh={now - snapshotAt <= 5000}
         snapshotActive={data.active ? { id: data.active.id, project_id: data.active.project_id, task_id: data.active.task_id, started_at: data.active.started_at, description: data.active.description, billable: data.active.billable, recovered: data.active.recovered, uncertain: data.active.uncertain } : null}
         editable={loaded && !busy} onEntrySaved={async () => { setReportRevision(version => version + 1); await refresh(); }} />}
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
