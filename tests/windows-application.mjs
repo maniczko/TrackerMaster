@@ -843,7 +843,8 @@ async function verifyAutostart(cdp, mainSession) {
   try { execFileSync('reg.exe', ['delete', autostartKey, '/v', 'TrackerMasterTest', '/f'], { stdio: 'ignore', windowsHide: true }); } catch {}
   try {
     // Launch with --autostart must never start an active timer automatically.
-    assert.equal(await evaluate(`document.querySelector('.timer .clock')?.textContent?.trim()`), '—:—:—');
+    assert.equal(await evaluate(`document.querySelector('.timer .clock')?.textContent?.trim()`), '00:00:00');
+    assert.equal(await evaluate(`window.__TAURI_INTERNALS__.invoke('get_snapshot').then(s => s.active)`), null);
     await evaluate(`(() => { const d = document.querySelector('#dane-i-ustawienia'); if (d) d.open = true; })()`);
     const section = '[aria-label="Autostart Windows"]';
     await waitFor('autostart checkbox loaded', () => evaluate(`(() => {
