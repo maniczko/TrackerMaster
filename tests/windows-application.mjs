@@ -2520,7 +2520,7 @@ async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
   const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
 
   // M7: EntryDraftEditor inline discard confirmation (no blocking window.confirm).
-  await waitFor('M7 history row ready', () => evaluate(`Boolean([...document.querySelectorAll('section.history tbody tr')].find(r => r.textContent.includes(${JSON.stringify(recoveryDescription)}) && r.querySelector('[role="menuitem"][aria-label^="Popraw wpis:"]')))`));
+  await waitFor('M7 history row ready', () => evaluate(`Boolean([...document.querySelectorAll('section.history tbody tr')].find(r => r.textContent.includes(${JSON.stringify(recoveryDescription)}) && r.querySelector('.entry-menu-trigger')))`));
   await chooseFromEntryMenu(cdp, sessionId, evaluate, recoveryDescription, 'Popraw wpis:', 'mouse');
   await waitFor('M7 draft editor open', () => evaluate(`Boolean(document.querySelector('#entry-draft-description'))`));
   await evaluate(`(() => {
@@ -2760,7 +2760,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
-    if (phase === 'dev36-polish') await verifyDev36Polish(cdp, sessionId, recovery.description);
+    if (phase === 'dev36-polish') await verifyDev36Polish(cdp, sessionId, interruptedDescription);
     return seconds;
   } finally {
     if (phase === 'initial') {
