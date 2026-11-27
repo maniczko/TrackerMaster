@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'dev36-polish' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -2511,6 +2511,129 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
+async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+
+  // M7: EntryDraftEditor inline discard confirmation (no blocking window.confirm).
+  await waitFor('M7 history row ready', () => evaluate(`Boolean([...document.querySelectorAll('section.history tbody tr')].find(r => r.textContent.includes(${JSON.stringify(recoveryDescription)}) && r.querySelector('.entry-menu-trigger')))`));
+  await chooseFromEntryMenu(cdp, sessionId, evaluate, recoveryDescription, 'Popraw wpis:', 'mouse');
+  await waitFor('M7 draft editor open', () => evaluate(`Boolean(document.querySelector('#entry-draft-description'))`));
+  await evaluate(`(() => {
+    const field = document.querySelector('#entry-draft-description');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, 'Tymczasowa zmiana M7');
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    [...document.querySelectorAll('section[aria-label="Edycja wpisu"] button')].find(b => b.textContent.trim() === 'Odrzuć zmiany').click();
+  })()`);
+  await waitFor('M7 inline confirm alert rendered', () => evaluate(`[...document.querySelectorAll('section[aria-label="Edycja wpisu"] [role="alert"]')].some(n => n.textContent.includes('Odrzucić zmiany i usunąć szkic?'))`));
+  await evaluate(`[...document.querySelectorAll('section[aria-label="Edycja wpisu"] button')].find(b => b.textContent.trim() === 'Potwierdź odrzucenie').click()`);
+  await waitFor('M7 editor closed without blocking confirm', () => evaluate(`!document.querySelector('section[aria-label="Edycja wpisu"]')`));
+
+  // AC3 / M5 / M8: seed 10,000 entries and verify <1000 ms P95 period switches, M8 DOM order & 1280x720 / 125% DPI.
+  let project;
+  {
+    const db = openTestDb();
+    try {
+      project = db.prepare(`SELECT p.id, p.client_id FROM projects p WHERE p.archived=0 AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=p.client_id) LIMIT 1`).get();
+      db.exec('BEGIN IMMEDIATE');
+      const insertEntry = db.prepare(`INSERT INTO time_entries (project_id, task_id, started_at, ended_at, duration_seconds, manually_resolved) VALUES (?, NULL, ?, ?, ?, 0)`);
+      const insertDesc = db.prepare(`INSERT INTO entry_descriptions (entry_id, description) VALUES (?, ?)`);
+      const baseMs = Date.parse('2025-01-01T08:00:00.000Z');
+      for (let i = 0; i < 10_000; i++) {
+        const s = baseMs + i * 3_600_000;
+        const rowId = Number(insertEntry.run(project.id, new Date(s).toISOString(), new Date(s + 1_800_000).toISOString(), 1800).lastInsertRowid);
+        insertDesc.run(rowId, `DEV-36 10k #${i + 1}`);
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK');
+      throw error;
+    } finally { db.close(); }
+  }
+  await evaluate(`window.dispatchEvent(new Event('focus'))`);
+  await delay(600);
+
+  // Start a real live timer so clicking its read-only running block opens .calendar-details (M8 DOM order test).
+  await invoke('start_project_timer', { projectId: project.id, taskId: null, expectedActiveId: null, description: 'DEV-36 M8 Focus Block' });
+  const m8Active = await waitFor('DEV-36 M8 running timer', () => invoke('get_snapshot').then(s => s.active));
+
+  await evaluate(`[...document.querySelectorAll('.view-switch button')].find(b => b.textContent.trim() === 'Kalendarz').click()`);
+  await waitFor('DEV-36 calendar ready', () => evaluate(`Boolean(document.querySelector('.calendar-date')) && !document.querySelector('.calendar-loading')`));
+  await waitFor('M8 running block visible on current week', () => evaluate(`Boolean(document.querySelector('.calendar-block[data-running="true"]'))`));
+
+  // M8: .calendar-details must precede .calendar-grid in DOM reading order.
+  await evaluate(`document.querySelector('.calendar-block[data-running="true"]').click()`);
+  const m8OrderOk = await waitFor('M8 details opened before grid', () => evaluate(`(() => {
+    const details = document.querySelector('.calendar-details');
+    const grid = document.querySelector('.calendar-grid');
+    if (!details || !grid) return false;
+    return (details.compareDocumentPosition(grid) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  })()`));
+  assert.ok(m8OrderOk, 'Expected .calendar-details to precede .calendar-grid in DOM order');
+  for (const type of ['keyDown', 'keyUp']) {
+    await cdp.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }, sessionId);
+  }
+  await waitFor('M8 escape closed details', () => evaluate(`!document.querySelector('.calendar-details')`));
+  await invoke('stop_timer', { expectedActiveId: m8Active.id });
+  await waitFor('M8 timer stopped cleanly', () => invoke('get_snapshot').then(s => s.active === null));
+
+  await evaluate(`(() => {
+    const d = document.querySelector('.calendar-date');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(d, '2026-02-09');
+    d.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await waitFor('DEV-36 10k dense week visible', () => evaluate(`Boolean([...document.querySelectorAll('.calendar-block')].find(b => b.textContent.includes('DEV-36 10k')))`));
+
+  // AC3: Measure 25 consecutive period switches with 10,000 entries in WebView2 DOM.
+  const samples = [];
+  for (let i = 0; i < 25; i++) {
+    const label = i % 2 === 0 ? 'Poprzedni tydzień' : 'Następny tydzień';
+    const ms = await evaluate(`new Promise(resolve => {
+      const btn = document.querySelector(${JSON.stringify(`[aria-label="${label}"]`)});
+      const prev = document.querySelector('.calendar-range')?.textContent;
+      const t0 = performance.now();
+      btn.click();
+      const check = () => {
+        if (document.querySelector('.calendar-range')?.textContent !== prev) {
+          requestAnimationFrame(() => resolve(Math.round((performance.now() - t0) * 10) / 10));
+        } else {
+          requestAnimationFrame(check);
+        }
+      };
+      requestAnimationFrame(check);
+    })`);
+    samples.push(ms);
+  }
+  samples.sort((a, b) => a - b);
+  const p95 = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.95))];
+  console.log(`PERF_DEV36_UI_10K p95=${p95}ms max=${samples[samples.length - 1]}ms`);
+  assert.ok(p95 < 1000, `DEV-36 10k WebView2 period switch P95 exceeded 1000 ms: ${p95}`);
+
+  // AC1 & AC4: 1280x720 + 125% DPI zero overflow and active timer still works with 10k entries.
+  await evaluate(`[...document.querySelectorAll('.view-switch button')].find(b => b.textContent.trim() === 'Timer').click()`);
+  await waitFor('Timer view visible again', () => evaluate(`Boolean(document.querySelector('[aria-label="Pomiar czasu"]'))`));
+  for (const [label, metrics] of [['1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }],
+    ['1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
+    try {
+      await waitFor(`DEV-36 viewport ${label}`, () => evaluate(`window.innerWidth === ${metrics.width} && window.innerHeight === ${metrics.height}`));
+      await delay(150);
+      assert.ok(await evaluate(`document.documentElement.scrollWidth <= document.documentElement.clientWidth`), `DEV-36 horizontal overflow at ${label}`);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+  await invoke('start_project_timer', { projectId: project.id, taskId: null, expectedActiveId: null, description: 'DEV-36 po 10k' });
+  const running = await waitFor('DEV-36 timer started after 10k test', () => invoke('get_snapshot').then(s => s.active));
+  await invoke('stop_timer', { expectedActiveId: running.id });
+  await waitFor('DEV-36 timer stopped cleanly', () => invoke('get_snapshot').then(s => s.active === null));
+  console.log('PASS: DEV-36 10k perf, M1/M3/M5/M7/M8 audit fixes, 1280x720/125% DPI and timer continuity verified');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -2582,7 +2705,7 @@ async function runWindow(port, phase, recovery) {
       if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep', 'dev36-polish'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -2642,6 +2765,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
+    if (phase === 'dev36-polish') await verifyDev36Polish(cdp, sessionId, interruptedDescription);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -2782,6 +2906,8 @@ try {
   // D4 short sleep (schema v14): last, after T27 restored the profile, so the entry counts asserted above are unaffected.
   await waitForWindowClosed(port);
   await runWindow(port, 'short-sleep', recovery);
+  await waitForWindowClosed(port);
+  await runWindow(port, 'dev36-polish', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

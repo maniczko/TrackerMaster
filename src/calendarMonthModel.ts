@@ -94,11 +94,22 @@ export function calendarMonth(input: {
   const { data, catalog, filter, month, now, snapshotActive, snapshotFresh } = input;
   if (!validTimeZone(data.time_zone) || !validCalendarMonth(month)) return null;
   const from = monthFirst(month), through = monthLast(month);
+  const gridDates = monthGrid(month);
+  const gridLower = Date.parse(gridDates[0][0]) - 86_400_000;
+  const gridUpper = Date.parse(gridDates[gridDates.length - 1][6]) + 2 * 86_400_000;
+  // Pre-slice once to the visible 4..6-week grid UTC envelope so each week scan skips distant entries,
+  // while makeReportView below still validates all entries once for month-level diagnostics.
+  const gridEntries = data.entries.filter(entry => {
+    const start = Date.parse(entry.started_at);
+    const end = Date.parse(entry.ended_at);
+    return !Number.isFinite(start) || !Number.isFinite(end) || (end >= gridLower && start < gridUpper);
+  });
+  const gridData: CalendarReportData = { ...data, entries: gridEntries };
   const weeks: MonthCell[][] = [];
   let today = '';
   let unverifiedActive = false;
-  for (const dates of monthGrid(month)) {
-    const week = calendarWeek({ data, catalog, filter, weekStart: dates[0], now, snapshotActive, snapshotFresh });
+  for (const dates of gridDates) {
+    const week = calendarWeek({ data: gridData, catalog, filter, weekStart: dates[0], now, snapshotActive, snapshotFresh });
     if (!week) return null;
     today = week.today;
     // A timer to verify is drawn in the grid; it matters for the month when one of its days is in the month.

@@ -546,7 +546,8 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
         let window = tauri::WebviewWindowBuilder::new(&app, "widget", tauri::WebviewUrl::default())
             .title("TrackerMaster — mini timer").inner_size(WIDGET_WIDTH, WIDGET_COMPACT_HEIGHT)
             .decorations(false).resizable(false).build().map_err(|e| e.to_string())?;
-        let position_path = app.path().app_data_dir().map_err(|e| e.to_string())?.join("widget-position.txt");
+        let position_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let position_path = position_dir.join("widget-position.txt");
         if let Ok(saved) = std::fs::read_to_string(&position_path) {
             let mut coordinates = saved.split_whitespace().filter_map(|value| value.parse::<i32>().ok());
             if let (Some(x), Some(y), None) = (coordinates.next(), coordinates.next(), coordinates.next()) {
@@ -562,9 +563,16 @@ async fn open_widget(app: tauri::AppHandle) -> Cmd<()> {
                 }
             }
         }
+        let last_position = std::sync::Mutex::new(None::<(i32, i32)>);
         window.on_window_event(move |event| {
             if let tauri::WindowEvent::Moved(position) = event {
-                let _ = std::fs::write(&position_path, format!("{} {}", position.x, position.y));
+                let next = (position.x, position.y);
+                let changed = last_position.lock().map(|mut prev| {
+                    if *prev == Some(next) { false } else { *prev = Some(next); true }
+                }).unwrap_or(false);
+                if changed {
+                    let _ = ui_preferences::save_preference(&position_dir, "widget-position.txt", &format!("{} {}", next.0, next.1));
+                }
             }
         });
     }
@@ -1577,6 +1585,7 @@ fn main() {
                 err
             })?;
             let mut db = Connection::open(&database_path)?;
+            db.busy_timeout(std::time::Duration::from_secs(5))?;
             initialise_with_backup(&mut db, &dir, existing_database).map_err(|err| {
                 #[cfg(windows)]
                 show_start_error("Nie można bezpiecznie otworzyć bazy danych. Nie zmieniaj ani nie usuwaj jej; sprawdź kopię i skontaktuj się z osobą pomagającą w obsłudze aplikacji.");
