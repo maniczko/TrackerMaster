@@ -224,6 +224,8 @@ const handlers: Record<string, (a: any) => unknown> = {
   set_entry_billable: a => { const e = entries.find(x => x.id === a.entryId) ?? (active?.id === a.entryId ? active : null); if (e) e.billable = a.billable; return snapshot(); },
   shortcut_status: () => ({ registered: true, message: '', shortcut: 'Ctrl+Shift+Space' }),
   set_global_shortcut: a => ({ registered: true, message: '', shortcut: a.shortcut }),
+  get_autostart: () => ({ enabled: false, packaged_msix: false, registry_value: 'TrackerMaster', command: null, note: 'Podgląd interfejsu (brak rejestru Windows).' }),
+  set_autostart: a => ({ enabled: !!a?.enabled, packaged_msix: false, registry_value: 'TrackerMaster', command: a?.enabled ? '"C:\\TrackerMaster\\tracker-master.exe" --autostart' : null, note: 'Podgląd interfejsu (brak rejestru Windows).' }),
   get_report_filter: () => null, get_report_scope: () => null, get_draft_sort: () => 'newest',
   restore_widget_on_top: () => false, set_widget_on_top: () => null,
   diagnose_database: health, create_backup: () => 'C:\\Users\\(podgląd)\\backups\\tracker-podglad.sqlite3',

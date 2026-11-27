@@ -823,6 +823,66 @@ async function verifyMiniTimer(cdp, mainSession) {
   console.log('PASS: repeated key-downs in another focused window started exactly one timer; keyboard project search and restored pin also passed');
 }
 
+async function verifyAutostart(cdp, mainSession) {
+  const evaluate = async (expression) => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, mainSession);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const autostartKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+  const queryAutostart = () => {
+    try {
+      return execFileSync('reg.exe', ['query', autostartKey, '/v', 'TrackerMasterTest'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+      });
+    } catch (error) {
+      if (error.status === 1) return null;
+      throw error;
+    }
+  };
+  try { execFileSync('reg.exe', ['delete', autostartKey, '/v', 'TrackerMasterTest', '/f'], { stdio: 'ignore', windowsHide: true }); } catch {}
+  try {
+    // Launch with --autostart must never start an active timer automatically.
+    assert.equal(await evaluate(`document.querySelector('.timer .clock')?.textContent?.trim()`), '00:00:00');
+    assert.equal(await evaluate(`window.__TAURI_INTERNALS__.invoke('get_snapshot').then(s => s.active)`), null);
+    await evaluate(`(() => { const d = document.querySelector('#dane-i-ustawienia'); if (d) d.open = true; })()`);
+    const section = '[aria-label="Autostart Windows"]';
+    await waitFor('autostart checkbox loaded', () => evaluate(`(() => {
+      const box = document.querySelector(${JSON.stringify(`${section} input[type="checkbox"]`)});
+      return box && !box.disabled && !box.checked;
+    })()`));
+
+    // Error + Ponów retry path before persistence (one-shot isolated test marker consumed by backend).
+    const failFlag = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'fail-autostart-once.flag');
+    await writeFile(failFlag, '1', 'utf8');
+    await evaluate(`document.querySelector(${JSON.stringify(`${section} input[type="checkbox"]`)}).click()`);
+    await waitFor('autostart error alert displayed', () => evaluate(`Boolean(document.querySelector(${JSON.stringify(`${section} [role="alert"]`)})?.textContent.includes('Symulowany błąd zapisu autostartu'))`));
+    assert.equal(queryAutostart(), null, 'Failed autostart write must not write HKCU\\Run');
+
+    await evaluate(`document.querySelector(${JSON.stringify(`${section} [role="alert"] button`)}).click()`);
+    await waitFor('autostart retry enabled setting', () => evaluate(`(() => {
+      const box = document.querySelector(${JSON.stringify(`${section} input[type="checkbox"]`)});
+      const status = document.querySelector(${JSON.stringify(`${section} [role="status"]`)});
+      return box?.checked === true && Boolean(status?.textContent.includes('włączony'));
+    })()`));
+    const regOutput = queryAutostart();
+    assert.ok(regOutput && regOutput.includes('TrackerMasterTest') && regOutput.includes('--autostart'), `Unexpected Run entry: ${regOutput}`);
+
+    // Disable autostart and verify clean registry deletion.
+    await evaluate(`document.querySelector(${JSON.stringify(`${section} input[type="checkbox"]`)}).click()`);
+    await waitFor('autostart disabled in UI', () => evaluate(`(() => {
+      const box = document.querySelector(${JSON.stringify(`${section} input[type="checkbox"]`)});
+      const status = document.querySelector(${JSON.stringify(`${section} [role="status"]`)});
+      return box?.checked === false && Boolean(status?.textContent.includes('wyłączony'));
+    })()`));
+    assert.equal(queryAutostart(), null, 'Disabling autostart must delete HKCU\\Run value');
+    console.log('PASS: DEV-18 per-user Windows autostart toggles HKCU\\Run cleanly, handles error/retry, and --autostart leaves timer stopped');
+  } finally {
+    await rm(join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'fail-autostart-once.flag'), { force: true });
+    try { execFileSync('reg.exe', ['delete', autostartKey, '/v', 'TrackerMasterTest', '/f'], { stdio: 'ignore', windowsHide: true }); } catch {}
+  }
+}
+
 async function verifyShortcutAfterRestart(cdp, mainSession) {
   const evaluate = async (session, expression) => {
     const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, session);
@@ -2511,12 +2571,12 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
-async function runWindow(port, phase, recovery) {
+async function runWindow(port, phase, recovery, args = []) {
   const env = {
     ...process.env,
     WEBVIEW2_USER_DATA_FOLDER: await mkdtemp(join(temp, 'profile-')),
   };
-  const child = spawn(exe, [], {
+  const child = spawn(exe, args, {
     env,
     stdio: 'ignore',
     windowsHide: true,
@@ -2632,6 +2692,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'verify-recovery' || phase === 'draft-reopen') await verifyDraft(cdp, sessionId, phase, child);
     if (phase === 'draft-reopen') await verifyRestoreRetry(cdp, sessionId);
     if (phase === 'hotkey-restart') {
+      await verifyAutostart(cdp, sessionId);
       await verifyShortcutAfterRestart(cdp, sessionId);
       await verifyDuplicateClientChoices(cdp, sessionId);
     }
@@ -2751,7 +2812,7 @@ try {
   await waitForWindowClosed(port);
   await runWindow(port, 'draft-reopen', recovery);
   await waitForWindowClosed(port);
-  await runWindow(port, 'hotkey-restart', recovery);
+  await runWindow(port, 'hotkey-restart', recovery, ['--autostart']);
   assertBaselineHistory();
   // DEV-24: calendar week with fixed entries (separate client), before PTT-36 adds its own entries.
   await waitForWindowClosed(port);
@@ -2785,5 +2846,6 @@ try {
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);
+  try { execFileSync('reg.exe', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'TrackerMasterTest', '/f'], { stdio: 'ignore', windowsHide: true }); } catch {}
 }
 console.log('PASS: PTT-36 write failures in the running app kept the timer and data intact, and one retry saved each change once');
