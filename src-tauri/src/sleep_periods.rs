@@ -50,8 +50,7 @@ pub struct SleepPeriod {
     pub ended_ms: Option<i64>,
     pub manual_resume: bool,
     pub decision: String,
-    /// 'sleep' or 'idle' (always 'sleep' before v15). Not sent to the UI yet (DEV-39 PR 1).
-    #[serde(skip)]
+    /// 'sleep' or 'idle' (always 'sleep' before v15).
     pub source: String,
 }
 
@@ -201,6 +200,42 @@ pub fn record_suspend(db: &mut Connection, entry_id: i64, started_ms: i64) -> Re
     let id = tx.last_insert_rowid();
     tx.commit()?;
     Ok(id)
+}
+
+/// Start an idle period once the absence reaches the threshold while a timer runs (v15).
+pub fn record_idle(db: &mut Connection, entry_id: i64, started_ms: i64) -> Result<i64> {
+    if entry_id <= 0 || !valid_ms(started_ms) || !has_source(db)? {
+        return Err(Error::InvalidQuery);
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let start: Option<String> = tx.query_row(
+        "SELECT started_at FROM time_entries WHERE id=?1 AND ended_at IS NULL", [entry_id], |r| r.get(0)
+    ).optional()?;
+    let start = start.ok_or(Error::InvalidQuery)?;
+    let entry_start = DateTime::parse_from_rfc3339(&start).map_err(|_| Error::InvalidQuery)?.timestamp_millis();
+    if started_ms < entry_start {
+        return Err(Error::InvalidQuery);
+    }
+    tx.execute("INSERT INTO sleep_periods(entry_id,source,started_ms) VALUES(?1,'idle',?2)", params![entry_id, started_ms])?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Complete an open idle period on user input return (one-shot, stays pending for user decision).
+pub fn complete_idle(db: &mut Connection, entry_id: i64, period_id: i64, ended_ms: i64) -> Result<()> {
+    if entry_id <= 0 || period_id <= 0 || !valid_ms(ended_ms) || !has_source(db)? {
+        return Err(Error::InvalidQuery);
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let count = tx.execute(
+        "UPDATE sleep_periods SET ended_ms=?1 WHERE id=?2 AND entry_id=?3 AND source='idle' AND ended_ms IS NULL AND decision='pending' AND started_ms<?1",
+        params![ended_ms, period_id, entry_id],
+    )?;
+    if count != 1 {
+        return Err(Error::InvalidQuery);
+    }
+    tx.commit()
 }
 
 /// Fill the observed resume boundary once. A stale or repeated event fails.

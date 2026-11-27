@@ -85,6 +85,7 @@ fn handle_suspend(tracker: &mut Tracker, now_ms: i64, power: crate::PowerSample)
     let Some((id,periods,actual)) = active(tracker,now_ms,power)? else { return Ok(()); };
     let known = known_sleep(&periods).ok_or("Nierozstrzygnięty koniec uśpienia.")?;
     if known.abs_diff(actual) > 4_000 { return Err("Nie można ustalić czasu uśpienia.".into()); }
+    crate::attention::notify_suspend(now_ms);
     // record_suspend first ends an open idle period at the suspend time, in the same transaction.
     crate::sleep_periods::record_suspend(&mut tracker.db,id,now_ms).map_err(crate::db_err)?;
     Ok(())
@@ -101,7 +102,9 @@ fn handle_resume(tracker: &mut Tracker, now_ms: i64, power: crate::PowerSample) 
     let current = u64::try_from(now_ms.checked_sub(open.started_ms).ok_or("Niepoprawny czas.")?).map_err(|_| "Niepoprawny czas.")?;
     let expected = previous.checked_add(current).ok_or("Niepoprawny czas.")?;
     if actual.abs_diff(expected) > 4_000 { return Err("Nie można ustalić czasu wybudzenia.".into()); }
-    crate::sleep_periods::record_resume(&mut tracker.db,id,open.id,now_ms).map_err(crate::db_err)
+    crate::sleep_periods::record_resume(&mut tracker.db,id,open.id,now_ms).map_err(crate::db_err)?;
+    crate::attention::notify_resume(now_ms);
+    Ok(())
 }
 
 #[cfg(all(test, windows))]

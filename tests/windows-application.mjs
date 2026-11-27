@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'idle-reminders' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -2511,6 +2511,125 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
+// DEV-39 (PTT-61 / TECH-12): Idle & sleep distinction in Pending list/note, attention-settings.json persistence,
+// Dolicz/Odrzuć consistency across Snapshot/Report/CSV, and stop_timer_at_idle_start transactional cut (I15c).
+async function verifyIdleAndReminders(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+
+  // 1. AttentionSettingsPanel persists attention-settings.json cleanly.
+  await evaluate(`document.querySelector('#dane-i-ustawienia').open = true`);
+  await waitFor('attention threshold select ready', () => evaluate(`(el => Boolean(el && !el.disabled))(document.querySelector('#attention-idle-threshold'))`));
+  await evaluate(`(() => {
+    const select = document.querySelector('#attention-idle-threshold');
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, '15');
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    const btn = [...document.querySelectorAll('.attention-settings button')].find(b => b.textContent.trim() === 'Zapisz ustawienia przypomnień');
+    btn.click();
+  })()`);
+  await waitFor('attention settings save confirmed', () => evaluate(`document.querySelector('.attention-settings')?.textContent.includes('Zapisano ustawienia bezczynności i przypomnień.')`));
+  const settingsPath = join(process.env.APPDATA, 'pl.tracker.personal.testonly', 'attention-settings.json');
+  const savedJson = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.equal(savedJson.idleThresholdMinutes, 15);
+  await evaluate(`(() => {
+    const select = document.querySelector('#attention-idle-threshold');
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, '10');
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    [...document.querySelectorAll('.attention-settings button')].find(b => b.textContent.trim() === 'Zapisz ustawienia przypomnień').click();
+  })()`);
+  await waitFor('attention settings restored to 10 min', async () => JSON.parse(await readFile(settingsPath, 'utf8')).idleThresholdMinutes === 10);
+
+  // 2. Mixed idle + sleep periods recorded on a completed entry; UI separates them clearly and totals agree.
+  const minute = 60_000;
+  const start = Date.parse('2026-01-06T08:00:00.000Z');
+  const description = 'DEV-39 bezczynność i uśpienie';
+  let project;
+  {
+    const db = openTestDb({ readOnly: true });
+    try {
+      project = db.prepare(`SELECT p.id AS projectId, p.client_id AS clientId FROM projects p WHERE p.archived=0
+        AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=p.client_id) ORDER BY p.id LIMIT 1`).get();
+      assert.ok(project, 'active project for DEV-39');
+    } finally { db.close(); }
+  }
+  await invoke('create_project_manual_entry', {
+    projectId: project.projectId, taskId: null,
+    startedAt: new Date(start).toISOString(), endedAt: new Date(start + 60 * minute).toISOString(), description,
+  });
+  let entryId, idleId, sleepId;
+  {
+    const db = openTestDb();
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      entryId = db.prepare('SELECT e.id FROM time_entries e JOIN entry_descriptions d ON d.entry_id=e.id WHERE d.description=?').get(description).id;
+      idleId = Number(db.prepare("INSERT INTO sleep_periods(entry_id,source,started_ms,ended_ms) VALUES(?,'idle',?,?)").run(entryId, start + 10 * minute, start + 25 * minute).lastInsertRowid);
+      sleepId = Number(db.prepare("INSERT INTO sleep_periods(entry_id,source,started_ms,ended_ms) VALUES(?,'sleep',?,?)").run(entryId, start + 30 * minute, start + 40 * minute).lastInsertRowid);
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK');
+      throw error;
+    } finally { db.close(); }
+  }
+  const noteText = () => evaluate(`document.querySelector('.sleep-note')?.textContent ?? ''`);
+  await waitFor('mixed sleep/idle summary shown', async () => (await noteText()).includes('Okresy do rozstrzygnięcia: 2 okresy · 00:25:00'));
+  await evaluate(`document.querySelector('.sleep-note button').click()`);
+  const list = '#pending-sleep-list';
+  await waitFor('pending list distinguishes idle and sleep badges', () => evaluate(`(() => {
+    const rows = [...document.querySelectorAll(${JSON.stringify(`${list} tbody tr`)})];
+    const hasIdle = rows.some(r => r.textContent.includes(${JSON.stringify(`#${entryId}`)}) && r.querySelector('.pending-kind[data-source="idle"]')?.textContent === 'Bezczynność' && r.cells[2]?.textContent.startsWith('00:15:00'));
+    const hasSleep = rows.some(r => r.textContent.includes(${JSON.stringify(`#${entryId}`)}) && r.querySelector('.pending-kind[data-source="sleep"]')?.textContent === 'Uśpienie' && r.cells[2]?.textContent.startsWith('00:10:00'));
+    return hasIdle && hasSleep;
+  })()`));
+
+  const rowBySource = source => `[...document.querySelectorAll(${JSON.stringify(`${list} tbody tr`)})].find(r => r.textContent.includes(${JSON.stringify(`#${entryId}`)}) && r.querySelector('.pending-kind')?.dataset.source === ${JSON.stringify(source)})`;
+  const btn = (source, label) => `[...(${rowBySource(source)}?.querySelectorAll('button') ?? [])].find(b => b.textContent.trim() === ${JSON.stringify(label)})`;
+  await evaluate(`${btn('idle', 'Dolicz')}.click()`);
+  await waitFor('idle period included', async () => (await invoke('get_pending_sleep')).every(item => item.id !== idleId));
+  await waitFor('sleep reject button enabled', () => evaluate(`(b => Boolean(b && !b.disabled))(${btn('sleep', 'Odrzuć')})`));
+  await evaluate(`${btn('sleep', 'Odrzuć')}.click()`);
+  await waitFor('both periods decided', async () => (await invoke('get_pending_sleep')).every(item => item.entryId !== entryId));
+  const counted = async () => {
+    const snap = await invoke('get_snapshot');
+    const rep = await invoke('get_report_data', { scope: { clientId: null, projectId: null, taskId: null } });
+    const csv = await invoke('get_client_export_data', { scope: { clientId: project.clientId, projectId: null, taskId: null } });
+    const s = list => list.find(i => i.id === entryId)?.duration_seconds;
+    return [s(snap.entries), s(rep.entries), s(csv.entries)];
+  };
+  assert.deepEqual(await counted(), [3000, 3000, 3000]);
+
+  // 3. stop_timer_at_idle_start (I15c) on an active entry cuts end cleanly to idle started_ms and hides period.
+  const startedSnap = await invoke('start_project_timer', {
+    projectId: project.projectId, taskId: null, expectedActiveId: null, description: 'DEV-39 aktywny cut',
+  });
+  const activeId = startedSnap.active.id;
+  await delay(2500);
+  let cutIdleId;
+  {
+    const db = openTestDb();
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      const row = db.prepare('SELECT started_at FROM time_entries WHERE id=?').get(activeId);
+      const exactStartMs = Date.parse(row.started_at);
+      cutIdleId = Number(db.prepare("INSERT INTO sleep_periods(entry_id,source,started_ms) VALUES(?,'idle',?)").run(activeId, exactStartMs + 2000).lastInsertRowid);
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK');
+      throw error;
+    } finally { db.close(); }
+  }
+  await invoke('stop_timer_at_idle_start', { expectedActiveId: activeId, periodId: cutIdleId });
+  const afterCutSnap = await invoke('get_snapshot');
+  assert.equal(afterCutSnap.active, null, 'entry stopped cleanly at idle start');
+  const cutEntry = afterCutSnap.entries.find(e => e.id === activeId);
+  assert.equal(cutEntry?.duration_seconds, 2, 'duration equals exact 2 s work before idle start');
+  assert.equal((await invoke('get_pending_sleep')).some(p => p.id === cutIdleId), false, 'cut idle period outside entry is hidden');
+  console.log('PASS: DEV-39 attention settings persistence, idle/sleep distinction, totals, and stop_timer_at_idle_start verified');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -2582,7 +2701,7 @@ async function runWindow(port, phase, recovery) {
       if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep', 'idle-reminders'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -2642,6 +2761,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
+    if (phase === 'idle-reminders') await verifyIdleAndReminders(cdp, sessionId);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -2782,6 +2902,9 @@ try {
   // D4 short sleep (schema v14): last, after T27 restored the profile, so the entry counts asserted above are unaffected.
   await waitForWindowClosed(port);
   await runWindow(port, 'short-sleep', recovery);
+  // DEV-39: idle detection & attention settings / mixed idle+sleep reconciliation / stop_timer_at_idle_start.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'idle-reminders', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

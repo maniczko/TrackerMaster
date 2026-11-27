@@ -8,6 +8,8 @@ mod ui_preferences;
 mod entry_drafts;
 mod calendar_entry;
 mod editor_close;
+mod attention_settings;
+mod attention;
 #[cfg(windows)]
 mod quit_dialog;
 #[cfg(windows)]
@@ -163,7 +165,7 @@ struct Snapshot { clients: Vec<Client>, projects: Vec<Project>, tasks: Vec<Task>
 struct ReportActive { id: i64, task_id: Option<i64>, project_id: i64, started_at: String, ended_at: Option<String>, duration_seconds: Option<i64>, unresolved: bool, billable: bool, description: String, #[serde(skip_serializing_if = "Option::is_none")] sleep_periods: Option<Vec<sleep_periods::SleepPeriod>> }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PendingSleep { id: i64, entry_id: i64, started_ms: i64, ended_ms: Option<i64>, client: String, project: String, task: Option<String>, manual_resume: bool }
+struct PendingSleep { id: i64, entry_id: i64, started_ms: i64, ended_ms: Option<i64>, client: String, project: String, task: Option<String>, manual_resume: bool, source: String }
 #[derive(Serialize)]
 struct ReportData { entries: Vec<Entry>, active: Option<ReportActive>, time_zone: String }
 #[derive(Serialize)]
@@ -367,8 +369,9 @@ fn report_data_for_scope(tracker: &Tracker, current: DateTime<Utc>, power: Cmd<P
 fn pending_sleep(db: &Connection) -> Cmd<Vec<PendingSleep>> {
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(db_err)?;
     if version < 12 { return Ok(Vec::new()); }
-    let mut stmt = db.prepare("SELECT s.id,s.entry_id,s.started_ms,s.ended_ms,c.name,p.name,t.name,s.manual_resume,e.ended_at FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id WHERE s.decision='pending' AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id) ORDER BY s.started_ms,s.id").map_err(db_err)?;
-    let rows = stmt.query_map([], |r| Ok((PendingSleep { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, client:r.get(4)?, project:r.get(5)?, task:r.get(6)?, manual_resume:r.get(7)? }, r.get::<_, Option<String>>(8)?))).map_err(db_err)?;
+    let source = if version >= sleep_periods::SOURCE_SCHEMA_VERSION { "s.source" } else { "'sleep'" };
+    let mut stmt = db.prepare(&format!("SELECT s.id,s.entry_id,s.started_ms,s.ended_ms,c.name,p.name,t.name,s.manual_resume,e.ended_at,{source} FROM sleep_periods s JOIN time_entries e ON e.id=s.entry_id JOIN projects p ON p.id=e.project_id JOIN clients c ON c.id=p.client_id LEFT JOIN tasks t ON t.id=e.task_id WHERE s.decision='pending' AND NOT EXISTS(SELECT 1 FROM entry_deletions d WHERE d.entry_id=e.id) ORDER BY s.started_ms,s.id")).map_err(db_err)?;
+    let rows = stmt.query_map([], |r| Ok((PendingSleep { id:r.get(0)?, entry_id:r.get(1)?, started_ms:r.get(2)?, ended_ms:r.get(3)?, client:r.get(4)?, project:r.get(5)?, task:r.get(6)?, manual_resume:r.get(7)?, source:r.get(9)? }, r.get::<_, Option<String>>(8)?))).map_err(db_err)?;
     let mut pending = Vec::new();
     for row in rows {
         let (mut item, entry_end) = row.map_err(db_err)?;
@@ -399,10 +402,15 @@ fn set_sleep_resume(state: State<'_, Shared>, entry_id: i64, period_id: i64, end
 }
 
 #[tauri::command]
-fn resolve_sleep_period(state: State<'_, Shared>, entry_id: i64, period_id: i64, include: bool) -> Cmd<()> {
+fn resolve_sleep_period(app: tauri::AppHandle, state: State<'_, Shared>, attention_state: State<'_, attention::SharedAttention>, entry_id: i64, period_id: i64, include: bool) -> Cmd<()> {
     let mut tracker = locked(&state)?;
     sleep_periods::resolve(&mut tracker.db, entry_id, period_id, include, Utc::now().timestamp_millis())
-        .map_err(|_| "Nie można zapisać decyzji. Odśwież listę i spróbuj ponownie.".into())
+        .map_err(|_| String::from("Nie można zapisać decyzji. Odśwież listę i spróbuj ponownie."))?;
+    drop(tracker);
+    if let Some(snapshot) = attention::clear_prompt_for_period(&attention_state, period_id) {
+        attention::emit_state(&app, &snapshot);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1523,6 +1531,7 @@ fn main() {
     // Keeps the build profile marker in the executable for the packaging check.
     std::hint::black_box(BUILD_PROFILE_MARKER);
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| {
             if event.state() != ShortcutState::Pressed { return; }
             let hotkey = app.state::<Hotkey>();
@@ -1594,6 +1603,10 @@ fn main() {
             app.manage(quit_dialog::QuitDialog::default());
             app.manage(Mutex::new(RestoreState::default()));
             app.manage(editor_close::EditorClose::default());
+            let attention_runtime = Arc::new(Mutex::new(attention::AttentionRuntime::new(dir.clone())));
+            attention::register_global(attention_runtime.clone());
+            app.manage(attention_runtime);
+            attention::start_polling(app.handle().clone());
             let saved = std::fs::read_to_string(dir.join("shortcut.txt")).ok().filter(|value| valid_shortcut(value)).unwrap_or_else(|| DEFAULT_SHORTCUT.into());
             let registered = app.global_shortcut().register(saved.as_str());
             if let Ok(mut state) = app.state::<Hotkey>().lock() {
@@ -1661,7 +1674,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::get_report_scope,ui_preferences::set_report_scope,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
+        .invoke_handler(tauri::generate_handler![get_snapshot,get_pending_sleep,set_sleep_resume,resolve_sleep_period,get_report_data,get_client_export_data,set_report_timezone,create_backup,diagnose_database,prepare_backup_restore,cancel_backup_restore,apply_backup_restore,exit_after_restore,create_client,create_project,create_task,set_project_billable,set_entry_billable,set_entry_description,rename_item,archive_project,archive_client,archive_task,start_timer,start_project_timer,resume_entry,stop_timer,recover_timer,create_manual_entry,create_project_manual_entry,edit_time_entry,entry_revisions,billing_revisions,description_revisions,delete_time_entry,deleted_entries,open_widget,show_main,ui_preferences::get_report_filter,ui_preferences::set_report_filter,ui_preferences::get_report_scope,ui_preferences::set_report_scope,ui_preferences::restore_widget_on_top,ui_preferences::set_widget_on_top,ui_preferences::get_draft_sort,ui_preferences::set_draft_sort,entry_drafts::get_entry_edit_source,entry_drafts::get_entry_drafts,entry_drafts::save_entry_draft,entry_drafts::check_entry_draft_source,entry_drafts::apply_entry_draft,entry_drafts::get_entry_draft_origin,entry_drafts::discard_entry_draft,editor_close::set_entry_editor_guard,editor_close::resolve_entry_editor_close,attention::get_attention_settings,attention::save_attention_settings,attention::get_attention_state,attention::dismiss_idle_prompt,attention::mute_start_reminder_today,attention::mute_long_timer,attention::sync_attention_work_window,attention::stop_timer_at_idle_start,widget_start,widget_project_start,widget_stop,widget_panel,widget_drag,close_widget,set_shortcut_task,widget_shortcut_ready,shortcut_status,set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("Nie można uruchomić aplikacji");
 }

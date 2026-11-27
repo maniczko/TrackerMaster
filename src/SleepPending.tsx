@@ -5,7 +5,7 @@ import { localInputRange, localRangeProblem, parseLocalDate } from './localDateT
 import type { LocalRangeProblem } from './localDateTime';
 import { sleepPeriodCount } from './plural';
 
-type PendingSleep = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean };
+type PendingSleep = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean; source?: 'sleep' | 'idle' };
 
 // UI hints only; the backend checks the wake-up time against the sleep period and the clock.
 const resumeHints: Record<LocalRangeProblem, string> = {
@@ -127,7 +127,14 @@ export function SleepReadError({ sleep }: { sleep: PendingSleepState }) {
 /** One line about the periods with the only button that leads to the list. */
 export function SleepNote({ sleep }: { sleep: PendingSleepState }) {
   if (!sleep.loaded || !sleep.items.length) return null;
-  return <p className="sleep-note"><strong>Uśpienie do rozstrzygnięcia: {sleep.summary}.</strong>{' '}
+  const hasSleep = sleep.items.some(item => item.source !== 'idle');
+  const hasIdle = sleep.items.some(item => item.source === 'idle');
+  const heading = hasSleep && hasIdle
+    ? 'Okresy do rozstrzygnięcia'
+    : hasIdle
+      ? 'Bezczynność do rozstrzygnięcia'
+      : 'Uśpienie do rozstrzygnięcia';
+  return <p className="sleep-note"><strong>{heading}: {sleep.summary}.</strong>{' '}
     <button type="button" aria-controls="pending-sleep-list" aria-expanded={sleep.open} onClick={sleep.showList}>Przejdź do listy</button></p>;
 }
 
@@ -135,13 +142,17 @@ export function SleepNote({ sleep }: { sleep: PendingSleepState }) {
 export function SleepPendingList({ sleep }: { sleep: PendingSleepState }) {
   const { items, open, busy, now, resumeInput } = sleep;
   if (!sleep.loaded || !items.length || !open) return null;
-  return <section ref={sleep.listRef} id="pending-sleep-list" className="card pending-card" aria-label="Okresy uśpienia do rozstrzygnięcia">
-    <div className="section-top"><div><h2>Uśpienie do rozstrzygnięcia</h2><p className="muted">{sleep.summary}. Te okresy nie są zaliczane do pracy przed decyzją.</p></div></div>
-    <div className="table-wrap"><table><thead><tr><th>Okres</th><th>Klient / projekt / zadanie</th><th>Czas</th><th>Decyzja</th></tr></thead><tbody>{items.map(item => { const resumeValue = resumeInput[item.id] ?? ''; const limits = localInputRange(item.startedMs, now); const problem = item.endedMs === null ? localRangeProblem(resumeValue, item.startedMs, now) : null; return <tr key={item.id}>
-      <td>{dateTime(item.startedMs)} – {item.endedMs === null ? 'brak czasu wybudzenia' : dateTime(item.endedMs)}</td>
+  return <section ref={sleep.listRef} id="pending-sleep-list" className="card pending-card" aria-label="Okresy do rozstrzygnięcia">
+    <div className="section-top"><div><h2>Okresy do rozstrzygnięcia</h2><p className="muted">{sleep.summary}. Te okresy nie są zaliczane do pracy przed decyzją.</p></div></div>
+    <div className="table-wrap"><table><thead><tr><th>Rodzaj i okres</th><th>Klient / projekt / zadanie</th><th>Czas</th><th>Decyzja</th></tr></thead><tbody>{items.map(item => { const resumeValue = resumeInput[item.id] ?? ''; const isIdle = item.source === 'idle'; const limits = localInputRange(item.startedMs, now); const problem = item.endedMs === null && !isIdle ? localRangeProblem(resumeValue, item.startedMs, now) : null; return <tr key={item.id}>
+      <td><span className="pending-kind" data-source={isIdle ? 'idle' : 'sleep'}>{isIdle ? 'Bezczynność' : 'Uśpienie'}</span> {dateTime(item.startedMs)} – {item.endedMs === null ? (isIdle ? 'trwa' : 'brak czasu wybudzenia') : dateTime(item.endedMs)}</td>
       <td>{item.client} / {item.project} / {item.task || 'Bez zadania'} <small>· wpis #{item.entryId}</small></td>
-      <td>{item.endedMs === null ? 'Nieznany' : <>{formatDuration((item.endedMs - item.startedMs) / 1000)}{item.manualResume && <small> · wybudzenie wskazane ręcznie</small>}</>}</td>
-      <td>{item.endedMs === null ? <form onSubmit={event => { event.preventDefault(); void sleep.supplyResume(item); }}><label>Faktyczna lub szacowana godzina wybudzenia <input type="datetime-local" step="1" required disabled={busy} min={limits.min} max={limits.max} aria-invalid={problem !== null} aria-describedby={problem ? `resume-problem-${item.id}` : undefined} value={resumeValue} onFocus={() => sleep.setNow(Date.now())} onChange={event => { sleep.setNow(Date.now()); sleep.setResumeInput(current => ({ ...current, [item.id]: event.target.value })); }} /></label> <button type="submit" className="primary" disabled={busy || !resumeValue || problem !== null}>Zapisz godzinę</button>{problem && <p id={`resume-problem-${item.id}`} className="field-problem" role="status">{resumeHints[problem]}</p>}</form> : <><button type="button" className="secondary" disabled={busy} onClick={() => void sleep.decide(item, true)}>Dolicz</button>{' '}<button type="button" className="secondary" disabled={busy} onClick={() => void sleep.decide(item, false)}>Odrzuć</button></>}</td>
+      <td>{item.endedMs === null ? 'Nieznany' : <>{formatDuration((item.endedMs - item.startedMs) / 1000)}{item.manualResume && <small>{isIdle ? ' · koniec wpisu przy odzyskaniu' : ' · wybudzenie wskazane ręcznie'}</small>}</>}</td>
+      <td>{item.endedMs === null
+        ? (isIdle
+          ? <span className="muted">Bezczynność trwa — zamknie się po powrocie.</span>
+          : <form onSubmit={event => { event.preventDefault(); void sleep.supplyResume(item); }}><label>Faktyczna lub szacowana godzina wybudzenia <input type="datetime-local" step="1" required disabled={busy} min={limits.min} max={limits.max} aria-invalid={problem !== null} aria-describedby={problem ? `resume-problem-${item.id}` : undefined} value={resumeValue} onFocus={() => sleep.setNow(Date.now())} onChange={event => { sleep.setNow(Date.now()); sleep.setResumeInput(current => ({ ...current, [item.id]: event.target.value })); }} /></label> <button type="submit" className="primary" disabled={busy || !resumeValue || problem !== null}>Zapisz godzinę</button>{problem && <p id={`resume-problem-${item.id}`} className="field-problem" role="status">{resumeHints[problem]}</p>}</form>)
+        : <><button type="button" className="secondary" disabled={busy} onClick={() => void sleep.decide(item, true)}>Dolicz</button>{' '}<button type="button" className="secondary" disabled={busy} onClick={() => void sleep.decide(item, false)}>Odrzuć</button></>}</td>
     </tr>; })}</tbody></table><button type="button" className="secondary" onClick={() => sleep.setOpen(false)}>Później</button></div>
   </section>;
 }

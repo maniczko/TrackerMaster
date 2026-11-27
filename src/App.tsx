@@ -3,6 +3,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
 import ShortcutSettings from './ShortcutSettings';
+import AttentionSettingsPanel from './AttentionSettings';
+import AttentionBanner from './AttentionBanner';
+import { openIdleLabel } from './attentionSchedule';
+import { useAttention } from './useAttention';
 import { SleepNote, SleepPendingList, SleepReadError, usePendingSleep } from './SleepPending';
 import EntryDraftEditor from './EntryDraftEditor';
 import type { EntryDraftEditorHandle } from './EntryDraftEditor';
@@ -137,8 +141,6 @@ export default function App() {
   const activeTask = data.tasks.find(t => same(t.id, data.active?.task_id));
   const activeProject = data.projects.find(p => same(p.id, data.active?.project_id));
   const activeClient = data.clients.find(c => same(c.id, activeProject?.client_id));
-  const elapsed = data.active ? Math.max(0, (now - new Date(data.active.started_at).getTime() - (data.active.excluded_sleep_ms ?? 0)) / 1000) : 0;
-  const displayElapsed = Number.isFinite(elapsed) ? elapsed : 0;
   const entries = useMemo(() => [...data.entries].sort((a, b) => b.started_at.localeCompare(a.started_at)), [data.entries]);
   // Quick start: the mini timer's project/task choice (same model and component), mapped onto the lists below.
   const pickerInput = useRef<HTMLInputElement>(null);
@@ -179,6 +181,24 @@ export default function App() {
     setReportRevision(version => version + 1);
     await refresh();
   });
+  const attentionZone = allClients.read?.data.time_zone ?? 'Europe/Warsaw';
+  const attention = useAttention(loaded, attentionZone, now, async () => {
+    setReportRevision(version => version + 1);
+    await refresh();
+    await sleep.refresh();
+  });
+  const openIdleStartedMs = attention.state.openIdle
+    && data.active
+    && same(attention.state.openIdle.entryId, data.active.id)
+    && !data.active.recovered
+    && !data.active.uncertain
+    ? attention.state.openIdle.startedMs
+    : null;
+  const openIdleMs = openIdleStartedMs === null ? 0 : Math.max(0, now - openIdleStartedMs);
+  const elapsed = data.active
+    ? Math.max(0, (now - new Date(data.active.started_at).getTime() - (data.active.excluded_sleep_ms ?? 0) - openIdleMs) / 1000)
+    : 0;
+  const displayElapsed = Number.isFinite(elapsed) ? elapsed : 0;
   function startTimer() {
     return execute(async () => { await invoke('start_project_timer', { projectId: Number(projectId), taskId: taskId ? Number(taskId) : null, expectedActiveId: data.active ? Number(data.active.id) : null, description: timerDescription }); setTimerDescription(''); }, data.active ? 'Przełączono zadanie.' : 'Pomiar uruchomiony.');
   }
@@ -350,6 +370,8 @@ export default function App() {
         <details className="timer-review-why"><summary>Dlaczego?</summary><p>{data.active.has_sleep ? 'Jeśli praca zakończyła się przed uśpieniem komputera, wpisz tę godzinę — późniejsze okresy uśpienia nie będą liczone. Okres uśpienia, który trwał w chwili zakończenia, zostanie przycięty do tej godziny i pozostanie do Twojej decyzji. Pozostały czas między początkiem a wskazanym końcem, także niezarejestrowane przerwy, zostanie zaliczony jako praca.' : 'Cały okres między początkiem a wskazanym końcem zostanie zaliczony jako praca, także ewentualne przerwy.'}</p></details></div>}
       {loaded && !data.active?.recovered && !data.active?.uncertain && sleep.items.length > 0 && <div role="status" className="alert timer-review"><SleepNote sleep={sleep} /></div>}
       <SleepReadError sleep={sleep} />
+      <AttentionBanner attention={attention} reportZone={attentionZone} now={now} hasActiveTimer={Boolean(data.active)}
+        onStartFocus={() => { if (needsStructure) openStructure(); else { pickerInput.current?.focus(); pickerInput.current?.scrollIntoView({ block: 'nearest' }); } }} />
       {notice && <div role="status" className="alert success">{notice}</div>}
       <div className="timer-view" hidden={view !== 'timer'}>
       <section className="timer card" aria-label="Pomiar czasu">
@@ -358,7 +380,8 @@ export default function App() {
           <div className="section-top"><div><p className="section-kicker">AKTUALNY POMIAR</p><h2>Timer</h2></div><span className={`status ${loaded && data.active && !data.active.recovered && !data.active.uncertain ? 'running' : loaded && (data.active?.recovered || data.active?.uncertain) ? 'pending' : ''}`}><span />{!loaded ? 'Brak danych' : data.active?.recovered || data.active?.uncertain ? 'Do weryfikacji' : data.active ? 'W trakcie' : 'Zatrzymany'}</span></div>
           {clockUnknown
             ? <div className="clock clock-unknown" role="img" aria-label={loaded ? 'Czas do weryfikacji' : 'Czas nieznany'} aria-live="off"><span>—</span><span className="clock-sep">:</span><span>—</span><span className="clock-sep">:</span><span>—</span></div>
-            : <div className="clock" aria-live="off">{formatDuration(displayElapsed)}</div>}<p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered || data.active?.uncertain ? 'Pomiar wymaga weryfikacji' : data.active ? 'Czas zapisze się przy zatrzymaniu' : 'Wybierz projekt lub zadanie, aby rozpocząć'}</p>
+            : <div className="clock" aria-live="off">{formatDuration(displayElapsed)}</div>}<p className="clock-caption">{!loaded ? 'Nie można ustalić stanu pomiaru' : data.active?.recovered || data.active?.uncertain ? 'Pomiar wymaga weryfikacji' : data.active ? (openIdleStartedMs !== null ? 'Czas zatrzymany do decyzji o bezczynności' : 'Czas zapisze się przy zatrzymaniu') : 'Wybierz projekt lub zadanie, aby rozpocząć'}</p>
+          {openIdleStartedMs !== null && <p className="idle-indicator" role="status">{openIdleLabel(openIdleStartedMs, now, attentionZone)}</p>}
           <p className="timer-totals" aria-label="Suma czasu, wszyscy klienci">{totals ? totals.text : 'Dziś — · Tydzień —'}{totals?.needsReview && <span className="timer-totals-note"> · raport zawiera uwagi</span>}</p>
           {/* The main action: one place and size for Start (Deep Teal) and Stop (coral). */}
           <div className={`actions timer-main ${main.kind === 'stop' ? 'timer-stop' : 'timer-start'}`}>
@@ -441,6 +464,7 @@ export default function App() {
           </details>
         </aside>
       <ShortcutSettings onChange={setShortcut} />
+      <AttentionSettingsPanel onChange={attention.setSettings} />
       <section className="card" aria-label="Bezpieczeństwo danych"><div className="section-top"><div><p className="section-kicker">TWOJE DANE</p><h2>Kopia zapasowa</h2></div></div><p className="muted">Utwórz lokalną kopię bazy danych, również podczas trwającego pomiaru.</p><div className="actions"><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setLastBackup(await invoke<string>('create_backup')); }, 'Kopia została utworzona i sprawdzona.')}>Utwórz kopię</button><button className="secondary" type="button" disabled={!loaded || busy} onClick={() => void execute(async () => { setDatabaseHealth(await invoke<DatabaseHealth>('diagnose_database')); }, 'Sprawdzono bazę danych.')}>Sprawdź bazę</button></div>{lastBackup && <p role="status">Kopia została zapisana: <code>{lastBackup}</code>. Zawiera dane klientów i nie jest szyfrowana.</p>}{databaseHealth && <p role="status">Baza poprawna · Klienci: {databaseHealth.clients} · Projekty: {databaseHealth.projects} · Zadania: {databaseHealth.tasks} · Zakończone wpisy: {databaseHealth.completed_entries} · Otwarte pomiary: {databaseHealth.open_entries}</p>}
         <details><summary>Przywróć kopię</summary><p className="muted">Podaj pełną ścieżkę do pliku kopii. Przed przywróceniem aplikacja sprawdzi plik i utworzy kopię obecnych danych. Zakończ aktywny pomiar.</p><label>Ścieżka do kopii <input type="text" value={restorePath} disabled={busy || !!restorePreview} onChange={e => setRestorePath(e.target.value)} placeholder="C:\\...\\kopia.sqlite3" /></label>{' '}{!restorePreview && <button className="secondary" type="button" disabled={busy || !restorePath.trim()} onClick={() => void prepareRestore()}>Sprawdź kopię</button>}
           {restorePreview && <div><p role="status">Kopia zawiera: klientów {restorePreview.health.clients}, projektów {restorePreview.health.projects}, zadań {restorePreview.health.tasks}, zakończonych wpisów {restorePreview.health.completed_entries}, otwartych pomiarów {restorePreview.health.open_entries}.</p><p>Uwaga: przywrócenie zastąpi CAŁĄ obecną bazę danych tego komputera. Wpisy, klienci i projekty z obu komputerów NIE ZOSTANĄ SCALONE. Przed zastąpieniem powstanie lokalna kopia bezpieczeństwa dotychczasowych danych; po przywróceniu konieczny będzie restart aplikacji.</p>{restorePreview.health.open_entries > 0 && <p>Otwarty pomiar z kopii będzie wymagał weryfikacji po ponownym uruchomieniu.</p>}<label><input type="checkbox" checked={restoreConfirmed} onChange={e => setRestoreConfirmed(e.target.checked)} /> Rozumiem, że dane tego komputera zostaną zastąpione, a historie obu komputerów nie będą łączone.</label><div className="actions"><button className="danger" type="button" disabled={busy || !loaded || !!data.active || !restoreConfirmed} onClick={() => void applyRestore()}>Przywróć kopię</button><button className="secondary" type="button" disabled={busy} onClick={() => void cancelRestore()}>Anuluj</button></div>{data.active && <p className="muted">Zakończ lub rozlicz aktywny pomiar przed przywróceniem.</p>}</div>}

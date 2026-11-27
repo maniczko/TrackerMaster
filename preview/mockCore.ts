@@ -84,16 +84,30 @@ for (let back = 8; back <= 45; back++) {
 // ?scenario=empty: first run without clients, projects or entries.
 if (scenario === 'empty') { clients.length = 0; projects.length = 0; tasks.length = 0; entries.length = 0; }
 let active: Entry | null = null;
-type Pending = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean };
+type Pending = { id: number; entryId: number; startedMs: number; endedMs: number | null; client: string; project: string; task: string | null; manualResume: boolean; source?: 'sleep' | 'idle' };
 let pending: Pending[] = [];
+let attentionSettings = {
+  idleEnabled: true, idleThresholdMinutes: 10, startReminderEnabled: true, workdays: [1, 2, 3, 4, 5],
+  workStart: '09:00', workEnd: '17:00', firstReminderMinutes: 15, repeatReminderMinutes: 30,
+  longTimerEnabled: true, longTimerHours: 4, notificationsEnabled: true,
+};
+let dismissedPrompt = false;
+let mutedToday: string | null = null;
+let mutedLongId: number | null = null;
 
 if (scenario === 'running') active = { id: 50, task_id: 112, project_id: 11, started_at: iso(now() - 25 * M), ended_at: null, billable: true, description: 'Poprawki po przeglądzie' };
+if (scenario === 'idle') {
+  active = { id: 50, task_id: 112, project_id: 11, started_at: iso(now() - 45 * M), ended_at: null, billable: true, description: 'Pomiar z przerwą bezczynności' };
+  pending = [
+    { id: 3, entryId: 50, startedMs: now() - 25 * M, endedMs: now() - 10 * M, client: clients[0].name, project: projects[0].name, task: tasks[1].name, manualResume: false, source: 'idle' },
+  ];
+}
 if (scenario === 'recovered' || scenario === 'sleep') {
   active = { id: 51, task_id: null, project_id: 21, started_at: iso(now() - 5 * H), ended_at: null, billable: true, description: 'Pomiar przerwany przez zakończenie procesu',
     recovered: scenario === 'recovered', uncertain: scenario === 'sleep', has_sleep: true };
   pending = [
-    { id: 1, entryId: 51, startedMs: now() - 4 * H, endedMs: now() - 3.5 * H, client: clients[1].name, project: projects[2].name, task: null, manualResume: false },
-    { id: 2, entryId: 51, startedMs: now() - 2 * H, endedMs: null, client: clients[1].name, project: projects[2].name, task: null, manualResume: false },
+    { id: 1, entryId: 51, startedMs: now() - 4 * H, endedMs: now() - 3.5 * H, client: clients[1].name, project: projects[2].name, task: null, manualResume: false, source: 'sleep' },
+    { id: 2, entryId: 51, startedMs: now() - 2 * H, endedMs: null, client: clients[1].name, project: projects[2].name, task: null, manualResume: false, source: 'sleep' },
   ];
 }
 
@@ -228,6 +242,24 @@ const handlers: Record<string, (a: any) => unknown> = {
   restore_widget_on_top: () => false, set_widget_on_top: () => null,
   diagnose_database: health, create_backup: () => 'C:\\Users\\(podgląd)\\backups\\tracker-podglad.sqlite3',
   entry_revisions: () => [], billing_revisions: () => [], description_revisions: () => [], deleted_entries: () => [],
+  get_attention_settings: () => ({ settings: attentionSettings, warning: null }),
+  save_attention_settings: a => { attentionSettings = { ...a.settings }; return { settings: attentionSettings, warning: null }; },
+  get_attention_state: () => {
+    const idleItem = pending.find(p => p.source === 'idle' && p.endedMs !== null);
+    return {
+      openIdle: null,
+      completedIdle: !dismissedPrompt && idleItem ? { periodId: idleItem.id, entryId: idleItem.entryId, startedMs: idleItem.startedMs, endedMs: idleItem.endedMs } : null,
+      noTimerReminder: null,
+      longTimerReminder: active && Date.now() - Date.parse(active.started_at) >= attentionSettings.longTimerHours * H && mutedLongId !== active.id ? { entryId: active.id, startedMs: Date.parse(active.started_at), level: 1 } : null,
+      mutedToday,
+      settingsWarning: null,
+    };
+  },
+  dismiss_idle_prompt: () => { dismissedPrompt = true; },
+  mute_start_reminder_today: a => { mutedToday = a?.localDate ?? '2026-11-26'; return handlers.get_attention_state({}); },
+  mute_long_timer: a => { mutedLongId = a.entryId; return handlers.get_attention_state({}); },
+  sync_attention_work_window: () => null,
+  stop_timer_at_idle_start: a => { const p = pending.find(x => x.id === a.periodId); if (active && p) close(p.startedMs); pending = pending.filter(x => x.entryId !== a.expectedActiveId); return handlers.get_attention_state({}); },
   widget_panel: a => resize(!!a?.expanded),
   ...entryHandlers,
 };

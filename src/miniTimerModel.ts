@@ -128,14 +128,15 @@ export function durationText(seconds: number) {
   return [Math.floor(value / 3600), Math.floor(value / 60) % 60, value % 60].map(n => String(n).padStart(2, '0')).join(':');
 }
 
-export function clockState(snapshot: Snapshot | null, now: number) {
+export function clockState(snapshot: Snapshot | null, now: number, openIdleStartedMs?: number | null) {
   if (!snapshot) return { mode: 'unavailable', text: '––:––:––' } as const;
   const active = snapshot.active;
   if (!active) return { mode: 'idle', text: '00:00:00' } as const;
   if (active.recovered || active.uncertain) return { mode: 'recovered', text: '––:––:––' } as const;
   const start = Date.parse(active.started_at);
   if (!Number.isFinite(start)) return { mode: 'unavailable', text: '––:––:––' } as const;
-  const elapsed = now - start - (active.excluded_sleep_ms ?? 0);
+  const idleMs = openIdleStartedMs != null && Number.isFinite(openIdleStartedMs) ? Math.max(0, now - openIdleStartedMs) : 0;
+  const elapsed = now - start - (active.excluded_sleep_ms ?? 0) - idleMs;
   if (!Number.isFinite(elapsed)) return { mode: 'unavailable', text: '––:––:––' } as const;
   return { mode: 'running', text: durationText(elapsed / 1000) } as const;
 }
