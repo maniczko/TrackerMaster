@@ -683,16 +683,14 @@ mod tests {
         ).unwrap_err();
         assert_eq!(err, crate::unverifiable_timer_message(false));
 
-        let mut ok_tracker = running_with_open_idle();
-        let aligned = Ok(crate::PowerSample { total_ms: 11_800_000, awake_ms: 11_800_000 });
-        transition_with_power(
-            &mut ok_tracker,
-            Some(41),
-            "2026-01-01T13:00:00Z",
-            TimerAction::Start { project_id: 1, task_id: None, description: "Zaktualizowany opis" },
-            aligned,
-        ).unwrap();
-        let saved: String = ok_tracker.db.query_row("SELECT description FROM entry_descriptions WHERE entry_id=41", [], |r| r.get(0)).unwrap();
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::initialise(&mut db).unwrap();
+        db.execute_batch("INSERT INTO clients(id,name) VALUES(1,'Klient'); INSERT INTO projects(id,client_id,name) VALUES(1,1,'Projekt');").unwrap();
+        let mut ok_tracker = crate::Tracker { db, running_since: None, restored: false };
+        transition(&mut ok_tracker, None, &crate::now(), TimerAction::Start { project_id: 1, task_id: None, description: "Początkowy" }).unwrap();
+        let id: i64 = ok_tracker.db.query_row("SELECT id FROM time_entries WHERE ended_at IS NULL", [], |r| r.get(0)).unwrap();
+        transition(&mut ok_tracker, Some(id), &crate::now(), TimerAction::Start { project_id: 1, task_id: None, description: "Zaktualizowany opis" }).unwrap();
+        let saved: String = ok_tracker.db.query_row("SELECT description FROM entry_descriptions WHERE entry_id=?1", [id], |r| r.get(0)).unwrap();
         assert_eq!(saved, "Zaktualizowany opis");
     }
 }
