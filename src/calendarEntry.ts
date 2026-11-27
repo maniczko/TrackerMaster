@@ -50,8 +50,16 @@ export function defaultEnd(start: string, zone: string): string {
   return Temporal.PlainDateTime.from(start).add({ minutes: DEFAULT_MINUTES }).toString({ smallestUnit: 'second' });
 }
 
-/** New entry from the keyboard ("Dodaj wpis"): the last full half hour of today, or 09:00 on Monday of another week. */
-export function keyboardRange(weekStart: string, today: string | null, nowMs: number, zone: string): { start: string; end: string } {
+/** New entry from the keyboard ("Dodaj wpis"): the last full half hour of today, or 09:00 on the selected day / Monday. */
+export function keyboardRange(weekStart: string, today: string | null, nowMs: number, zone: string, targetDate?: string): { start: string; end: string } {
+  if (targetDate) {
+    if (today && today === targetDate) {
+      const startMs = Math.floor((nowMs - DEFAULT_MINUTES * 60_000) / (SLOT_MINUTES * 60_000)) * SLOT_MINUTES * 60_000;
+      return { start: wallValue(startMs, zone), end: wallValue(startMs + DEFAULT_MINUTES * 60_000, zone) };
+    }
+    const start = slotStart(targetDate, 9 * 60);
+    return { start, end: defaultEnd(start, zone) };
+  }
   const weekEnd = Temporal.PlainDate.from(weekStart).add({ days: 7 }).toString();
   if (today && today >= weekStart && today < weekEnd) {
     const startMs = Math.floor((nowMs - DEFAULT_MINUTES * 60_000) / (SLOT_MINUTES * 60_000)) * SLOT_MINUTES * 60_000;

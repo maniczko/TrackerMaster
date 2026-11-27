@@ -14,8 +14,10 @@
 .app-shell .calendar-range { margin: 0; font-size: var(--text-md); font-weight: 650; white-space: nowrap; }
 .calendar-filters { display: flex; flex: 1 1 360px; gap: var(--space-2); min-width: 0; }
 .app-shell .calendar-filters select { flex: 1 1 0; min-width: 0; max-width: 200px; min-height: var(--control-h); padding-top: 0; padding-bottom: 0; font-size: var(--text-sm); }
-.calendar-total { display: flex; align-items: center; gap: var(--space-2); margin: 0 0 0 auto; color: var(--color-text-muted); font-size: var(--text-sm); white-space: nowrap; }
+.calendar-total { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin: 0 0 0 auto; color: var(--color-text-muted); font-size: var(--text-sm); white-space: nowrap; }
 .calendar-total strong { color: var(--color-text); font-size: var(--text-md); font-variant-numeric: tabular-nums; }
+.calendar-week-full { font-size: var(--text-xs); color: var(--color-text-muted); }
+.calendar-week-full strong { font-size: var(--text-sm); color: var(--color-text); font-variant-numeric: tabular-nums; }
 .app-shell .calendar-info { width: var(--control-h); min-width: var(--control-h); padding: 0; border-radius: 50%; font-weight: 700; }
 .calendar-scope-note { margin: 0 0 var(--space-3); }
 .calendar .alert { margin-bottom: var(--space-2); padding-top: var(--space-2); padding-bottom: var(--space-2); }
@@ -23,6 +25,8 @@
 
 .calendar-grid { border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow: hidden; background: var(--color-surface); }
 .calendar-head, .calendar-canvas { display: grid; grid-template-columns: 56px repeat(7, minmax(0, 1fr)); }
+.calendar-head[data-cols='5'], .calendar-canvas[data-cols='5'] { grid-template-columns: 56px repeat(5, minmax(0, 1fr)); }
+.calendar-head[data-cols='1'], .calendar-canvas[data-cols='1'] { grid-template-columns: 56px minmax(0, 1fr); }
 .calendar-head { position: sticky; top: 0; z-index: 4; border-bottom: 1px solid var(--color-border); background: var(--color-surface-muted); }
 .calendar-day-head { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--space-1); padding: var(--space-1) var(--space-2); border-left: 1px solid var(--color-border); font-size: var(--text-xs); color: var(--color-text-muted); }
 .calendar-day-head strong { color: var(--color-text); font-size: var(--text-sm); }

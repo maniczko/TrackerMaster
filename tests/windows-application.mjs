@@ -449,7 +449,7 @@ async function exercisePage(data, phase) {
   await until('test build and current data', () => testProfileVisible() && !pick(`${timer} select`)?.disabled &&
     pickerReady() && pick('#new-client'));
 
-  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry') return null;
+  if (phase === 'hotkey-restart' || phase === 'write-failure' || phase === 'write-failure-reopen' || phase === 'disk-full' || phase === 'short-sleep' || phase === 'calendar' || phase === 'calendar-month' || phase === 'calendar-entry' || phase === 'calendar-modes') return null;
 
   if (phase === 'recover' || phase === 'verify-recovery' || phase === 'draft-reopen') {
     if (phase === 'recover') {
@@ -2511,6 +2511,94 @@ async function verifyShortSleep(cdp, sessionId) {
   console.log(`PASS: D4 short sleep — under ${threshold} ms counted as work without a question; ${threshold} ms and longer asked as before; History, report and CSV agree (2700 s, then 3000 s)`);
 }
 
+async function verifyCalendarModes(cdp, sessionId) {
+  const evaluate = async expression => {
+    const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  const invoke = (command, args = {}) => evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`);
+  const viewButton = label => `[...document.querySelectorAll('.view-switch button')].find(b => b.textContent.trim() === ${JSON.stringify(label)})`;
+  const modeButton = label => `[...document.querySelectorAll('.calendar-mode button')].find(b => b.textContent.trim() === ${JSON.stringify(label)})`;
+  const key = async (key, code, keyCode) => {
+    for (const type of ['keyDown', 'keyUp']) await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: keyCode }, sessionId);
+  };
+
+  const cid = await invoke('create_client', { name: 'DEV-37 Tryby Kalendarz' });
+  const pid = await invoke('create_project', { clientId: cid, name: 'DEV-37 Projekt' });
+  // AC1: Week 2026-04-06..12 -> Mon-Fri 2h each (10h total) + Sat 2h (12h full week).
+  for (const day of [6, 7, 8, 9, 10]) {
+    const d = String(day).padStart(2, '0');
+    await invoke('create_project_manual_entry', { projectId: pid, taskId: null, startedAt: `2026-04-${d}T07:00:00.000Z`, endedAt: `2026-04-${d}T09:00:00.000Z`, description: `DEV-37 pn-pt ${d}` });
+  }
+  await invoke('create_project_manual_entry', { projectId: pid, taskId: null, startedAt: '2026-04-11T08:00:00.000Z', endedAt: '2026-04-11T10:00:00.000Z', description: 'DEV-37 sobota 2h' });
+  // AC2: 15 short overlapping entries on 2026-04-13.
+  for (let i = 0; i < 15; i++) {
+    const startMs = Date.parse('2026-04-13T08:00:00.000Z') + i * 60_000;
+    await invoke('create_project_manual_entry', {
+      projectId: pid, taskId: null,
+      startedAt: new Date(startMs).toISOString(), endedAt: new Date(startMs + 600_000).toISOString(),
+      description: `DEV-37 gęsty #${i + 1}`,
+    });
+  }
+  await invoke('start_project_timer', { projectId: pid, taskId: null, expectedActiveId: null, description: 'DEV-37 timer w tle' });
+  const running = await waitFor('DEV-37 timer running', () => invoke('get_snapshot').then(s => s.active && { id: s.active.id, startedAt: s.active.started_at }));
+
+  await evaluate(`${viewButton('Kalendarz')}.click()`);
+  await waitFor('Calendar open for DEV-37', () => evaluate(`Boolean(${modeButton('5 dni')}) && Boolean(${modeButton('Dzień')})`));
+  await evaluate(`${modeButton('Tydzień')}.click()`);
+  await waitFor('7-day view ready', () => evaluate(`document.querySelectorAll('.calendar-column').length === 7`));
+  await evaluate(`(() => {
+    const sel = document.querySelectorAll('.calendar-filters select')[0];
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(sel, ${JSON.stringify(String(cid))});
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    const date = document.querySelector('.calendar-date');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(date, '2026-04-06');
+    date.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await waitFor('7-day week 2026-04-06 shows 12:00:00', () => evaluate(`document.querySelector('.calendar-week-total')?.textContent === '12:00:00'`));
+
+  // AC1: 5-day view shows 10:00:00 (Mon-Fri) and preserves 12:00:00 separately as full week.
+  await evaluate(`${modeButton('5 dni')}.click()`);
+  await waitFor('5-day view shows 5 cols, 10h and 12h full week', () => evaluate(`document.querySelectorAll('.calendar-column').length === 5 && document.querySelector('.calendar-week-total')?.textContent === '10:00:00' && document.querySelector('.calendar-full-week-total')?.textContent === '12:00:00'`));
+
+  // AC2 & AC3: 1-day view shows 15 short entries on 2026-04-13, clickable edit modal & filter/date preserved across 7d <-> 5d <-> 1d.
+  await evaluate(`(() => {
+    const date = document.querySelector('.calendar-date');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(date, '2026-04-13');
+    date.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await evaluate(`${modeButton('Dzień')}.click()`);
+  await waitFor('1-day view renders all 15 short entries', () => evaluate(`document.querySelectorAll('.calendar-column').length === 1 && document.querySelectorAll('.calendar-block').length === 15`));
+  await evaluate(`document.querySelectorAll('.calendar-block')[0].click()`);
+  await waitFor('edit dialog opens from dense 1-day block', () => evaluate(`Boolean(document.querySelector('dialog.calendar-entry-dialog textarea'))`));
+  await evaluate(`document.querySelector('dialog.calendar-entry-dialog textarea').focus()`);
+  await key('Escape', 'Escape', 27);
+  await waitFor('edit dialog closed', () => evaluate(`!document.querySelector('dialog.calendar-entry-dialog')`));
+
+  // AC3 & AC4: Switch 1d -> 5d -> 7d -> 1d keeping filter and date without overflowing at 1280x720 and 125%.
+  await evaluate(`${modeButton('5 dni')}.click()`);
+  await evaluate(`${modeButton('Tydzień')}.click()`);
+  await evaluate(`${modeButton('Dzień')}.click()`);
+  await waitFor('1-day date & client filter survived two switches', () => evaluate(`document.querySelectorAll('.calendar-column').length === 1 && document.querySelectorAll('.calendar-filters select')[0]?.value === ${JSON.stringify(String(cid))} && document.querySelector('.calendar-date')?.value === '2026-04-13'`));
+  for (const [label, metrics] of [['1280x720', { width: 1280, height: 720, deviceScaleFactor: 1 }],
+    ['1280x720-dpi125', { width: 1024, height: 576, deviceScaleFactor: 1.25 }]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...metrics, mobile: false }, sessionId);
+    try {
+      await waitFor(`DEV-37 layout at ${label}`, () => evaluate(`window.innerWidth === ${metrics.width} && window.innerHeight === ${metrics.height}`));
+      await delay(200);
+      assert.ok(await evaluate(`document.documentElement.scrollWidth <= document.documentElement.clientWidth`), `DEV-37 horizontal overflow at ${label}`);
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sessionId);
+    }
+  }
+  await evaluate(`${modeButton('Tydzień')}.click()`);
+  assert.deepEqual(await invoke('get_snapshot').then(s => s.active && { id: s.active.id, startedAt: s.active.started_at }), running);
+  await invoke('stop_timer', { expectedActiveId: running.id });
+  await waitFor('DEV-37 timer stopped', () => invoke('get_snapshot').then(s => s.active === null));
+  console.log('PASS: DEV-37 calendar day and 5-day modes, 10h vs 12h, 15 dense blocks, filter round-trip & DPI verified');
+}
+
 async function runWindow(port, phase, recovery) {
   const env = {
     ...process.env,
@@ -2582,7 +2670,7 @@ async function runWindow(port, phase, recovery) {
       if (phase === 'initial') await verifyReportSummary(cdp, sessionId, seconds);
     } else {
       assert.equal(seconds, null);
-      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
+      if (!['hotkey-restart', 'write-failure', 'write-failure-reopen', 'disk-full', 'short-sleep', 'calendar-modes'].includes(phase)) console.log(`${phase}: history showed the manually recovered entry`);
     }
     await access(testDb);
     if (phase === 'initial') {
@@ -2642,6 +2730,7 @@ async function runWindow(port, phase, recovery) {
     if (phase === 'write-failure-reopen') await verifyDraftAfterWriteFailure(cdp, sessionId, pendingWriteFailure);
     if (phase === 'disk-full') await verifyDiskFull(cdp, sessionId, testDisk);
     if (phase === 'short-sleep') await verifyShortSleep(cdp, sessionId);
+    if (phase === 'calendar-modes') await verifyCalendarModes(cdp, sessionId);
     return seconds;
   } finally {
     if (phase === 'initial') {
@@ -2782,6 +2871,9 @@ try {
   // D4 short sleep (schema v14): last, after T27 restored the profile, so the entry counts asserted above are unaffected.
   await waitForWindowClosed(port);
   await runWindow(port, 'short-sleep', recovery);
+  // DEV-37: optional 1-day and 5-day calendar modes.
+  await waitForWindowClosed(port);
+  await runWindow(port, 'calendar-modes', recovery);
 } finally {
   csvWatcher.close();
   registry('delete', ['/f']);

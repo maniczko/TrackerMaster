@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { calendarWeek, entryPieces, layoutDay, pieceRange, shiftWeek, weekDates, weekLabel, weekStartOf, MIN_BLOCK_MINUTES } from '../src/calendarModel.ts';
+import { calendarWeek, entryPieces, layoutDay, pieceRange, rangeHeading, shiftDate, shiftWeek, weekDates, weekLabel, weekStartOf, MIN_BLOCK_MINUTES } from '../src/calendarModel.ts';
 import type { CalendarClockEntry, CalendarFilter, CalendarReportData } from '../src/calendarModel.ts';
 import { reportByDay } from '../src/reportTime.ts';
 import { makeReportView } from '../src/reportView.ts';
@@ -240,4 +240,42 @@ test('live time after a Sunday read still counts on Monday (PR #65): the next we
   assert.deepEqual(monday.days[0].blocks.map(block => [block.entryId, block.running, block.kind]), [[9, true, 'work']]);
   // Not live (stale snapshot): nothing beyond the projection, so Monday stays empty.
   assert.equal(week(data, '2026-11-30', now, { snapshotActive: snapshot, snapshotFresh: false }).weekSeconds, 0);
+});
+
+test('DEV-37 AC1: 5-day mode displays Pn-Pt 10h separately from full 12h week without modifying Saturday', () => {
+  const entries: CompletedReportEntry[] = [
+    entry(1, '2026-04-06T07:00:00Z', '2026-04-06T09:00:00Z'),
+    entry(2, '2026-04-07T07:00:00Z', '2026-04-07T09:00:00Z'),
+    entry(3, '2026-04-08T07:00:00Z', '2026-04-08T09:00:00Z'),
+    entry(4, '2026-04-09T07:00:00Z', '2026-04-09T09:00:00Z'),
+    entry(5, '2026-04-10T07:00:00Z', '2026-04-10T09:00:00Z'),
+    entry(6, '2026-04-11T08:00:00Z', '2026-04-11T10:00:00Z'), // Saturday 2h
+  ];
+  const data: CalendarReportData = { entries, active: null, time_zone: zone };
+  const five = week(data, '2026-04-06', 0, { span: 'five' });
+  const seven = week(data, '2026-04-06', 0, { span: 'week' });
+  assert.equal(five.days.length, 5);
+  assert.equal(five.from, '2026-04-06');
+  assert.equal(five.through, '2026-04-10');
+  assert.equal(five.weekSeconds, 36_000);
+  assert.equal(five.fullWeekSeconds, 43_200);
+  assert.equal(seven.days.length, 7);
+  assert.equal(seven.weekSeconds, 43_200);
+  assert.equal(seven.fullWeekSeconds, 43_200);
+});
+
+test('DEV-37 AC2: 1-day mode supports prev/next navigation and lays out 15 short overlapping entries cleanly', () => {
+  const entries = Array.from({ length: 15 }, (_, idx) => {
+    const startMs = Date.parse('2026-04-13T08:00:00Z') + idx * 60_000;
+    return entry(100 + idx, new Date(startMs).toISOString(), new Date(startMs + 600_000).toISOString());
+  });
+  const data: CalendarReportData = { entries, active: null, time_zone: zone };
+  const oneDay = week(data, '2026-04-13', 0, { span: 'day', anchorDate: '2026-04-13' });
+  assert.equal(oneDay.days.length, 1);
+  assert.equal(oneDay.days[0].date, '2026-04-13');
+  assert.equal(oneDay.days[0].blocks.length, 15);
+  assert.equal(oneDay.weekSeconds, 15 * 600);
+  assert.equal(shiftDate('2026-04-13', 1), '2026-04-14');
+  assert.equal(shiftDate('2026-04-13', -1), '2026-04-12');
+  assert.ok(rangeHeading('2026-04-13', '2026-04-13', 'day').includes('2026'));
 });
