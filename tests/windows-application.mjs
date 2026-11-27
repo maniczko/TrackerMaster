@@ -2518,10 +2518,9 @@ async function verifySidebarShell(cdp, sessionId) {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
     return result.result.value;
   };
-  const press = async (key, code, windowsVirtualKeyCode) => {
-    for (const type of ['keyDown', 'keyUp']) {
-      await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode }, sessionId);
-    }
+  const press = async (key, code, windowsVirtualKeyCode, text) => {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode, ...(text ? { text } : {}) }, sessionId);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode }, sessionId);
   };
   const setField = async (selector, value, event = 'input') => {
     const ok = await evaluate(`(() => {
@@ -2627,7 +2626,7 @@ async function verifySidebarShell(cdp, sessionId) {
   await evaluate(`document.querySelector('.app-sidebar-btn[data-section="clients"]').focus()`);
   await press('ArrowDown', 'ArrowDown', 40);
   await waitFor('ArrowDown moves focus to settings', () => evaluate(`document.activeElement?.dataset?.section === 'settings'`));
-  await press('Enter', 'Enter', 13);
+  await press('Enter', 'Enter', 13, '\r');
   await waitFor('Enter opens settings with shortcut & backup cards', () => evaluate(`
     document.querySelector('.app-sidebar-btn[aria-current="page"]')?.dataset.section === 'settings'
     && Boolean(document.querySelector('[aria-label="Skrót klawiaturowy"]'))
