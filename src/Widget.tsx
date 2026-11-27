@@ -6,6 +6,7 @@ import { MiniTimerTaskPicker, TimerIcon } from './MiniTimerPanel';
 import { activeContext, barContext, choicesFor, clockState, createActionSettle, createRequestGate, descriptionCommand, projectColour, projectPath, readLegacyPin, recentChoices, switchChoices, switchCommand, taskName, toggleCommand } from './miniTimerModel';
 import type { DescriptionDraft } from './miniTimerModel';
 import { defaultShortcut, matchesShortcut, shortcutLabel } from './shortcut';
+import { sentence } from './messageText';
 import './miniTimer.css';
 
 type ShortcutStatus = { registered: boolean; message: string; shortcut: string };
@@ -123,13 +124,14 @@ export default function Widget() {
       if (nextSnapshot) { setData(next); setNow(Date.now()); }
       else if (!await refresh(true)) { setNotice('Zapis potwierdzony. Ponów odczyt.'); return; }
       setNotice(name === 'widget_project_start' ? '' : name === 'start_project_timer' ? 'Przełączono.' : 'Zapisano.');
-    } catch {
+    } catch (problem) {
       setVerify(true);
+      setWindowError(sentence(problem));
       await refresh(true);
     } finally { gate.endWrite(); setBusy(false); }
   }
   async function checkState() {
-    if (await refresh()) setVerify(false);
+    if (await refresh(true)) { setVerify(false); setWindowError(''); }
   }
   useEffect(() => {
     if (!notice) return;
@@ -225,7 +227,7 @@ export default function Widget() {
   if (busy) status = { text: 'Zapisywanie…', tone: 'quiet' };
   else if (clock.mode === 'recovered') status = { text: 'Czas wymaga weryfikacji', tone: 'warn', action: 'Rozstrzygnij czas', run: showApp };
   else if (!data) status = loadedOnce ? { text: 'Brak odczytu danych', tone: 'error', action: 'Ponów odczyt', run: () => void checkState() } : { text: 'Łączenie z aplikacją…', tone: 'quiet' };
-  else if (verify) status = { text: 'Nie potwierdzono zapisu', tone: 'error', action: 'Sprawdź stan', run: () => void checkState() };
+  else if (verify) status = { text: windowError || 'Nie potwierdzono zapisu', tone: 'error', action: 'Sprawdź stan', run: () => void checkState() };
   else if (clock.mode === 'unavailable') status = { text: 'Czas jest niedostępny', tone: 'warn', action: 'Otwórz aplikację', run: showApp };
   else if (dirtyEdit) status = { text: conflict ? 'Opis zmieniono w innym oknie' : 'Niezapisany opis', tone: 'warn', action: open ? undefined : 'Pokaż opis', run: () => void setPanel(true) };
   else if (windowError || shortcutError || shortcut?.message) status = { text: windowError || shortcutError || shortcut!.message, tone: 'error' };

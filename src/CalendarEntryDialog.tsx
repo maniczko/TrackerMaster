@@ -17,6 +17,7 @@ import type { ReportCatalog } from './reportScope';
 import { clientLabels } from './clientLabels';
 import { formatDuration } from './reportCsv';
 import { sentence } from './messageText';
+import type { EditorCloseRequest } from './App';
 import './calendarEntry.css';
 
 export type CalendarEntryRequest =
@@ -32,6 +33,9 @@ type Props = {
   data: CalendarReportData;
   active: CalendarClockEntry | null;
   enabled: boolean;
+  closeRequest: EditorCloseRequest | null;
+  onResolveClose: (requestId: number, proceed: boolean) => Promise<void>;
+  onEditorState: (open: boolean, dirty: boolean) => void | Promise<void>;
   /** `note`: what the calendar should say after closing (e.g. a draft kept after a failed save). */
   onClose: (note?: string) => void;
   onSaved: (message: string) => Promise<void>;
@@ -43,11 +47,13 @@ type Form = { start: string; end: string; description: string; clientId: string;
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 const shortDay = (value: string) => `${Number(value.slice(8, 10))}.${value.slice(5, 7)}.${value.slice(0, 4)}`;
 
-export default function CalendarEntryDialog({ request, zone, now, catalog, data, active, enabled, onClose, onSaved }: Props) {
+export default function CalendarEntryDialog({ request, zone, now, catalog, data, active, enabled, closeRequest, onResolveClose, onEditorState, onClose, onSaved }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const operation = useRef(false);
   const savedDraft = useRef<EntryDraft | null>(null);
   const fieldRefs = useRef(new Map<FormField, HTMLElement>());
+  const stayConfirm = useRef<HTMLButtonElement>(null);
+  const handledCloseId = useRef<number | null>(null);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [blocked, setBlocked] = useState('');
   const [form, setForm] = useState<Form>(() => request.mode === 'new'
@@ -56,6 +62,7 @@ export default function CalendarEntryDialog({ request, zone, now, catalog, data,
   const [attempted, setAttempted] = useState(false);
   const [working, setWorking] = useState(false);
   const [saveError, setSaveError] = useState('');
+  const [closeConfirm, setCloseConfirm] = useState<EditorCloseRequest | null>(null);
   const editing = request.mode === 'edit';
   const entryId = editing ? request.entryId : null;
   const reportEntry = entryId === null ? undefined : data.entries.find(entry => entry.id === entryId);
@@ -117,6 +124,45 @@ export default function CalendarEntryDialog({ request, zone, now, catalog, data,
   const project = catalog.projects.find(item => String(item.id) === form.projectId) as (ReportCatalog['projects'][number] & { billable?: boolean }) | undefined;
   const billable = form.billable ?? project?.billable ?? false;
   const ready = !editing || loaded !== null;
+  const dirty = useMemo(() => {
+    if (blocked || !ready) return false;
+    if (request.mode === 'edit') {
+      if (!loaded) return false;
+      return form.start !== loaded.baseline.start
+        || form.end !== loaded.baseline.end
+        || form.description !== loaded.source.description
+        || billable !== loaded.source.billable
+        || savedDraft.current !== null;
+    }
+    return Boolean(form.clientId || form.projectId || form.taskId || form.description.trim())
+      || form.start !== request.start
+      || form.end !== request.end
+      || form.billable !== null;
+  }, [blocked, ready, loaded, form, billable, request, saveError]);
+
+  useEffect(() => {
+    void onEditorState(true, dirty);
+  }, [dirty, onEditorState]);
+  useEffect(() => () => { void onEditorState(false, false); }, [onEditorState]);
+
+  useEffect(() => {
+    if (!closeRequest || handledCloseId.current === closeRequest.id || working || operation.current) return;
+    handledCloseId.current = closeRequest.id;
+    if (!dirty) {
+      void onResolveClose(closeRequest.id, true)
+        .catch(() => {})
+        .finally(() => {
+          onClose(savedDraft.current ? `Niezapisane zmiany wpisu #${savedDraft.current.source.entryId} zachowano jako szkic. Dokończ je w Historii (widok Timer).` : undefined);
+        });
+      return;
+    }
+    setCloseConfirm(closeRequest);
+  }, [closeRequest, dirty, working, onClose, onResolveClose]);
+
+  useEffect(() => {
+    if (closeConfirm) stayConfirm.current?.focus();
+  }, [closeConfirm]);
+
   const problem = ready && !blocked ? formProblem({
     start: form.start, end: form.end, description: form.description, zone, nowMs: now, entryId,
     needsProject: !editing, projectId: form.projectId ? Number(form.projectId) : null, others,
@@ -135,17 +181,51 @@ export default function CalendarEntryDialog({ request, zone, now, catalog, data,
 
   function cancel() {
     if (operation.current) return;
+    if (closeConfirm) {
+      void answerClose(closeConfirm, false);
+      return;
+    }
     const kept = savedDraft.current;
     onClose(kept ? `Niezapisane zmiany wpisu #${kept.source.entryId} zachowano jako szkic. Dokończ je w Historii (widok Timer).` : undefined);
   }
 
-  async function save() {
+  async function answerClose(requestToClose: EditorCloseRequest, proceed: boolean, note?: string) {
+    setCloseConfirm(null);
+    await onResolveClose(requestToClose.id, proceed);
+    if (proceed) onClose(note);
+  }
+
+  async function discardAndClose(requestToClose: EditorCloseRequest) {
+    if (operation.current) return;
+    operation.current = true;
+    setWorking(true);
+    setSaveError('');
+    try {
+      if (savedDraft.current) {
+        await invoke('discard_entry_draft', { entryId: savedDraft.current.source.entryId, revision: savedDraft.current.revision });
+        savedDraft.current = null;
+      }
+      await answerClose(requestToClose, true);
+    } catch (error) {
+      setSaveError(`Nie udało się odrzucić szkicu: ${sentence(error)}`);
+      await answerClose(requestToClose, false);
+    } finally {
+      operation.current = false;
+      setWorking(false);
+    }
+  }
+
+  async function save(fromClose?: EditorCloseRequest) {
     if (editing) {
       if (!loaded) return;
       const fields: DraftFields = { start: form.start, end: form.end, description: form.description, inputTimeZone: zone };
       const rangeChanged = form.start !== loaded.baseline.start || form.end !== loaded.baseline.end;
       const billingChanged = billable !== loaded.source.billable;
-      if (!rangeChanged && form.description === loaded.source.description && !billingChanged && !savedDraft.current) { onClose(); return; }
+      if (!rangeChanged && form.description === loaded.source.description && !billingChanged && !savedDraft.current) {
+        if (fromClose) await answerClose(fromClose, true);
+        else onClose();
+        return;
+      }
       // The draft first, so a failed write keeps the edit (T26/T27); the same revision is applied on a retry.
       let saved = savedDraft.current;
       if (!saved || !matchesFields(saved.fields, fields)) {
@@ -157,26 +237,42 @@ export default function CalendarEntryDialog({ request, zone, now, catalog, data,
         ...(billingChanged ? { billable } : {}),
       } });
       savedDraft.current = null;
-      onClose();
+      if (fromClose) {
+        await answerClose(fromClose, true);
+      } else {
+        onClose();
+      }
       await onSaved('Zmiany wpisu zostały zapisane.');
       return;
     }
     const range = draftRange({ start: form.start, end: form.end, description: form.description, inputTimeZone: zone });
     await invoke('create_project_manual_entry', { projectId: Number(form.projectId), taskId: form.taskId ? Number(form.taskId) : null,
       startedAt: range.startedAt, endedAt: range.endedAt, description: form.description, billable });
-    onClose();
+    if (fromClose) {
+      await answerClose(fromClose, true);
+    } else {
+      onClose();
+    }
     await onSaved('Dodano wpis.');
   }
 
-  function submit() {
+  function submit(fromClose?: EditorCloseRequest) {
     setAttempted(true);
-    if (operation.current || !enabled || !ready || blocked) return;
-    if (problem) { fieldRefs.current.get(problem.field)?.focus(); return; }
+    if (operation.current || !enabled || !ready || blocked) {
+      if (fromClose && !operation.current) void answerClose(fromClose, false);
+      return;
+    }
+    if (problem) {
+      if (fromClose) void answerClose(fromClose, false);
+      fieldRefs.current.get(problem.field)?.focus();
+      return;
+    }
     operation.current = true;
     setWorking(true);
     setSaveError('');
-    void save().catch(error => {
+    void save(fromClose).catch(async error => {
       setSaveError(`Nie zapisano: ${sentence(error)} ${editing ? 'Zmiany zachowano w formularzu i w szkicu.' : 'Dane zostały w formularzu.'} Nic nie zostało zmienione; możesz spróbować ponownie.`);
+      if (fromClose) await answerClose(fromClose, false);
     }).finally(() => { operation.current = false; setWorking(false); });
   }
 
@@ -243,9 +339,18 @@ export default function CalendarEntryDialog({ request, zone, now, catalog, data,
           {!enabled && <p role="status" className="helper">Zapis jest chwilowo niedostępny (trwa inna operacja lub dane nie są aktualne).</p>}
         </>}
       <div className="actions">
-        {!blocked && <button type="submit" className="primary" disabled={working || !ready || !enabled}>{working ? 'Zapisywanie…' : saveError ? 'Spróbuj ponownie' : 'Zapisz'}</button>}
-        <button type="button" className="secondary" disabled={working} onClick={cancel}>{blocked ? 'Zamknij' : 'Anuluj'}</button>
+        {!blocked && <button type="submit" className="primary" disabled={working || !ready || !enabled || !!closeConfirm}>{working ? 'Zapisywanie…' : saveError ? 'Spróbuj ponownie' : 'Zapisz'}</button>}
+        <button type="button" className="secondary" disabled={working || !!closeConfirm} onClick={cancel}>{blocked ? 'Zamknij' : 'Anuluj'}</button>
       </div>
+      {closeConfirm && <section className="calendar-close-confirm" role="alertdialog" aria-labelledby="calendar-close-title">
+        <h4 id="calendar-close-title">Zapisać zmiany w edytowanym wpisie?</h4>
+        <p className="helper">{closeConfirm.action === 'quit' ? 'Najpierw zdecyduj, co zrobić z edycją, aby zakończyć aplikację.' : 'Wybierz, co zrobić z edycją przed zamknięciem okna.'}</p>
+        <div className="actions">
+          <button type="button" className="primary" disabled={working || !enabled} onClick={() => submit(closeConfirm)}>Zapisz</button>
+          <button type="button" className="secondary" disabled={working} onClick={() => { void discardAndClose(closeConfirm); }}>Odrzuć zmiany</button>
+          <button ref={stayConfirm} type="button" className="secondary" disabled={working} onClick={() => { void answerClose(closeConfirm, false); }}>Pozostań</button>
+        </div>
+      </section>}
     </form>
   </dialog>;
 }

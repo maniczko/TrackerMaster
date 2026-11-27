@@ -22,6 +22,7 @@ pub fn preflight_existing(path: &Path) -> Result<()> {
         return Err(invalid());
     }
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.execute_batch("PRAGMA trusted_schema = OFF;")?;
     validate_database(&db)
 }
 
@@ -64,6 +65,14 @@ fn validate_database(db: &Connection) -> Result<()> {
         return Err(invalid());
     }
 
+    let table_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('clients','projects','tasks','time_entries')",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_count != 4 {
+        return Err(invalid());
+    }
     // These four tables and their core columns existed even in the
     // unversioned prototype, so an existing file missing one is not new.
     for query in [
@@ -201,7 +210,9 @@ fn copy_database(source: &Connection, destination: &mut Connection) -> Result<()
 pub fn prepare_restore(path: &Path) -> Result<PreparedRestore> {
     if !path.is_file() { return Err(Error::InvalidPath(path.to_path_buf())); }
     let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    source.execute_batch("PRAGMA trusted_schema = OFF;")?;
     let mut staged = Connection::open_in_memory()?;
+    staged.execute_batch("PRAGMA trusted_schema = OFF;")?;
     copy_database(&source, &mut staged)?;
     validate_database(&staged)?;
     // Migrate only the isolated copy, never the selected source file.
@@ -279,7 +290,7 @@ mod tests {
     fn existing_legacy_database_passes_preflight_and_migrates() {
         let path = test_path("legacy");
         let _cleanup = Cleanup(path.clone());
-        let mut db = Connection::open(&path).unwrap();
+        let db = Connection::open(&path).unwrap();
         db.execute_batch("
             CREATE TABLE clients (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
             CREATE TABLE projects (id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id), name TEXT NOT NULL);

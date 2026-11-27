@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chartScale, chartUnit, entryRelations, formatPercent, summaryChart, summaryGroups, summaryKpis } from '../src/reportSummaryModel.ts';
+import { chartScale, chartUnit, entryRelations, formatPercent, summaryChart, summaryGroups, summaryGroupsByProject, summaryKpis } from '../src/reportSummaryModel.ts';
 import type { SummaryGroup } from '../src/reportSummaryModel.ts';
 import { makeReportView } from '../src/reportView.ts';
 import type { ActiveReportEntry, CompletedReportEntry } from '../src/reportView.ts';
@@ -188,4 +188,18 @@ test('presets feed the summary: "Ten tydzień" equals the sum of its day buckets
   const chart = summaryChart(v, relations(d), catalog, labels, range.from, range.through);
   assert.equal(chart.buckets.length, 7);
   assert.equal(chart.buckets.reduce((total, bucket) => total + bucket.seconds, 0), summaryKpis(v).totalSeconds);
+});
+
+test('project-task grouping sums match the report total and keep unassigned entries visible', () => {
+  const d = data([
+    ...fixture,
+    entry(9, 999, '2026-11-18T12:00:00Z', '2026-11-18T12:30:00Z', { taskId: null }),
+  ]);
+  const v = view(d, '2026-11-16', '2026-11-22');
+  const byProject = summaryGroupsByProject(v, relations(d), catalog, labels);
+  assert.equal(byProject.reduce((sum, item) => sum + item.seconds, 0), summaryKpis(v).totalSeconds);
+  for (const project of byProject) {
+    assert.equal(project.level, 'project');
+    assert.equal(project.children.reduce((sum, task) => sum + task.seconds, 0), project.seconds);
+  }
 });

@@ -9,7 +9,7 @@ import { allReportClients, resolveReportScope } from './reportScope';
 import type { ReportCatalog, ReportScope } from './reportScope';
 import type { AllClientsReport } from './useAllClientsReport';
 import CalendarFilters from './CalendarFilters';
-import { readSaved, save } from './CalendarWeek';
+import { readSavedState, save } from './calendarSaved';
 import './calendar.css';
 import './calendarMonth.css';
 
@@ -40,12 +40,14 @@ function entryState(item: MonthCellEntry): string {
 }
 
 export default function CalendarMonth({ report, catalog, loaded, now, snapshotActive, snapshotFresh, viewSwitch, onOpenWeek }: Props) {
-  const [saved] = useState(readSaved);
+  const [initialRead] = useState(readSavedState);
+  const saved = initialRead.saved;
   const zone = report.read?.data.time_zone;
   const today = zone ? (() => { try { return dateInZone(now, zone); } catch { return null; } })() : null;
   const [month, setMonth] = useState<string | null>(validCalendarMonth(saved.month) ? saved.month : null);
   const [scope, setScope] = useState<ReportScope>(saved.scope ?? allReportClients);
   const [billable, setBillable] = useState<CalendarBillable>(saved.billable ?? 'all');
+  const [savedCorrupt, setSavedCorrupt] = useState(initialRead.corrupt);
   const [selected, setSelected] = useState<string | null>(null);
   const [focused, setFocused] = useState<string | null>(null);
   const [scopeNotice, setScopeNotice] = useState('');
@@ -55,7 +57,7 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
   const details = useRef<HTMLDivElement>(null);
   const focusAfterRender = useRef<string | null>(null);
 
-  useEffect(() => { if (shownMonth) save({ month: shownMonth, scope, billable }); }, [shownMonth, scope, billable]);
+  useEffect(() => { if (!savedCorrupt && shownMonth) save({ month: shownMonth, scope, billable }); }, [savedCorrupt, shownMonth, scope, billable]);
 
   const resolved = useMemo(() => resolveReportScope(scope, catalog), [scope, catalog]);
   const filter: CalendarFilter = { scope, billable };
@@ -67,10 +69,10 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
   const activeKey = snapshotActive ? `${snapshotActive.id}|${snapshotActive.project_id}|${snapshotActive.task_id}|${snapshotActive.started_at}|${snapshotActive.billable}|${snapshotActive.description}|${!!snapshotActive.recovered}|${!!snapshotActive.uncertain}` : '';
   const stableActive = useMemo(() => snapshotActive, [activeKey]);
   const base = useMemo(() => {
-    if (!report.read || !shownMonth || resolved.problem) return null;
+    if (savedCorrupt || !report.read || !shownMonth || resolved.problem) return null;
     try { return calendarMonth({ data: report.read.data, catalog, filter, month: shownMonth, now: nowRef.current, snapshotActive: stableActive, snapshotFresh: false }); }
     catch { return null; }
-  }, [report.read, catalog, scope, billable, shownMonth, today, stableActive, resolved.problem]);
+  }, [savedCorrupt, report.read, catalog, scope, billable, shownMonth, today, stableActive, resolved.problem]);
   const view = useMemo(() => {
     if (!base || !report.read) return base;
     try { return liveMonth(base, { data: report.read.data, catalog, filter, month: base.month, now, snapshotActive: stableActive, snapshotFresh }); }
@@ -118,13 +120,15 @@ export default function CalendarMonth({ report, catalog, loaded, now, snapshotAc
       </div>
       <h2 className="calendar-range">{shownMonth ? monthLabel(shownMonth) : 'Miesiąc'}</h2>
       <CalendarFilters catalog={catalog} scope={scope} billable={billable} resolved={resolved}
-        onScope={(next, message) => { setScope(next); setScopeNotice(message); }} onBillable={setBillable} />
+        onScope={(next, message) => { setSavedCorrupt(false); setScope(next); setScopeNotice(message); }}
+        onBillable={next => { setSavedCorrupt(false); setBillable(next); }} />
       <p className="calendar-total"><span>{filtered ? 'Suma miesiąca (filtry)' : 'Suma miesiąca'}</span> <strong className="calendar-month-total" aria-live="off">{view ? duration(view.monthSeconds) : '—'}</strong>
         <button type="button" className="secondary calendar-info" aria-label="Jak liczone są sumy" aria-expanded={noteOpen} aria-controls="calendar-month-note" title={scopeNote(filtered, zone)} onClick={() => setNoteOpen(open => !open)}><span aria-hidden="true">i</span></button></p>
     </div>
     {noteOpen && <p id="calendar-month-note" role="note" className="helper calendar-scope-note">{scopeNote(filtered, zone)}</p>}
     {scopeNotice && <p role="status" className="helper">{scopeNotice}</p>}
-    {resolved.problem && <p role="alert" className="alert error">{resolved.problem} Wybierz inny filtr.</p>}
+    {savedCorrupt && <p role="alert" className="alert error">Zapisany filtr kalendarza jest nieprawidłowy. Wybierz filtr ręcznie.</p>}
+    {!savedCorrupt && resolved.problem && <p role="alert" className="alert error">{resolved.problem} Wybierz inny filtr.</p>}
     {!loaded ? <p role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie w widoku Timer.</p>
       : report.failed ? <p role="alert" className="alert error">Nie udało się odczytać wpisów do kalendarza. Spróbuj ponownie za chwilę.</p>
       : !report.read ? <p role="status" className="calendar-loading">Wczytywanie kalendarza…</p>

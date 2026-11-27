@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import Report from './Report';
@@ -36,6 +37,8 @@ type DraftOrigin = { sourceEntryId: Id; createdAt: string };
 type DatabaseHealth = { schema_version: number; clients: number; projects: number; tasks: number; completed_entries: number; open_entries: number };
 type RestorePreview = { token: string; health: DatabaseHealth };
 type ShortcutStatus = { registered: boolean; message: string; shortcut: string };
+export type EditorCloseRequest = { id: number; action: 'hide' | 'quit' };
+type EditorCloseState = { request: EditorCloseRequest; step: 'calendar' | 'draft' } | null;
 export type Snapshot = { clients: Client[]; projects: Project[]; tasks: Task[]; active: Entry | null; entries: Entry[] };
 const EMPTY: Snapshot = { clients: [], projects: [], tasks: [], active: null, entries: [] };
 export const same = (a: Id | undefined | null, b: Id | undefined | null) => a != null && b != null && String(a) === String(b);
@@ -90,7 +93,40 @@ export default function App() {
   const revisionsRequest = useRef(0);
   const revisionSection = useRef<HTMLElement>(null);
   const entryEditor = useRef<EntryDraftEditorHandle>(null);
-  const hasUnsavedReportEdit = useCallback(() => entryEditor.current?.hasUnsavedChanges() ?? false, []);
+  const editorStateRef = useRef({ draft: false, calendar: false, calendarDirty: false });
+  const [closeReady, setCloseReady] = useState(false);
+  const [closeState, setCloseState] = useState<EditorCloseState>(null);
+  const closeStateRef = useRef<EditorCloseState>(null);
+  closeStateRef.current = closeState;
+  const hasUnsavedReportEdit = useCallback(
+    () => (entryEditor.current?.hasUnsavedChanges() ?? false) || editorStateRef.current.calendarDirty,
+    [],
+  );
+  const syncEditorGuard = useCallback((source: 'draft' | 'calendar', open: boolean, dirty = false) => {
+    if (source === 'draft') editorStateRef.current.draft = open;
+    else {
+      editorStateRef.current.calendar = open;
+      editorStateRef.current.calendarDirty = open && dirty;
+    }
+    const guardOpen = editorStateRef.current.draft || editorStateRef.current.calendar;
+    return invoke<void>('set_entry_editor_guard', { open: guardOpen });
+  }, []);
+  const handleDraftOpenChange = useCallback((open: boolean) => syncEditorGuard('draft', open), [syncEditorGuard]);
+  const handleCalendarEditorState = useCallback((open: boolean, dirty: boolean) => syncEditorGuard('calendar', open, dirty), [syncEditorGuard]);
+  const handleResolveClose = useCallback(async (requestId: number, proceed: boolean) => {
+    const active = closeStateRef.current;
+    if (proceed && active?.step === 'calendar' && editorStateRef.current.draft) {
+      setView('timer');
+      try { window.localStorage.setItem('trackermaster.view.v1', 'timer'); } catch { /* convenience only */ }
+      setCloseState({ request: active.request, step: 'draft' });
+      return;
+    }
+    try {
+      await invoke('resolve_entry_editor_close', { requestId, proceed });
+    } finally {
+      setCloseState(current => current?.request.id === requestId ? null : current);
+    }
+  }, []);
   const descriptionRef = useRef<HTMLElement>(null);
   const [loaded, setLoaded] = useState(false);
   const [reportRevision, setReportRevision] = useState(0);
@@ -103,30 +139,71 @@ export default function App() {
     window.addEventListener('focus', readShortcut);
     return () => window.removeEventListener('focus', readShortcut);
   }, [readShortcut]);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    setCloseReady(false);
+    void listen<EditorCloseRequest>('entry-editor-close', event => {
+      if (disposed) return;
+      const request = event.payload;
+      const state = editorStateRef.current;
+      if (state.calendar) {
+        setCloseState({ request, step: 'calendar' });
+        return;
+      }
+      if (state.draft) {
+        setCloseState({ request, step: 'draft' });
+        return;
+      }
+      void invoke('resolve_entry_editor_close', { requestId: request.id, proceed: true }).catch(() => {});
+    }).then(stop => {
+      if (disposed) stop();
+      else {
+        unlisten = stop;
+        setCloseReady(true);
+      }
+    }).catch(() => {
+      if (!disposed) setCloseReady(false);
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+      void invoke('set_entry_editor_guard', { open: false }).catch(() => {});
+    };
+  }, []);
   const needsStructure = loaded && data.clients.length === 0;
   // A first run needs the structure forms; keep the section open once it was shown.
   useEffect(() => { if (needsStructure) setSettingsOpen(true); }, [needsStructure]);
   const openStructure = () => { setSettingsOpen(true); window.setTimeout(() => document.getElementById('new-client')?.focus(), 0); };
   useEffect(() => { if (describe) descriptionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, [describe?.id]);
   useEffect(() => { if (revisions?.reveal) revisionSection.current?.scrollIntoView({ block: 'start' }); }, [revisions]);
-  const refresh = useCallback(async () => {
+  // One write at a time: a fast double click cannot send a second start before the first returns.
+  const writes = useRef(createRequestGate()).current;
+  const readSnapshot = useCallback(async (poll: boolean) => {
+    if (poll && writes.writing) return;
+    const ticket = writes.beginRead();
     try {
       const next = await invoke<Snapshot>('get_snapshot');
+      if (!writes.isCurrent(ticket)) return;
       setData(next);
       setSnapshotAt(Date.now());
       setLoaded(true);
     } catch (e) {
+      if (!writes.isCurrent(ticket)) return;
       setLoaded(false);
       throw e;
     }
-  }, []);
+  }, [writes]);
+  const refresh = useCallback(async () => {
+    await readSnapshot(false);
+  }, [readSnapshot]);
 
   useEffect(() => {
     refresh().catch(e => setError(`Nie udało się odczytać danych: ${String(e)}`));
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    const sync = window.setInterval(() => refresh().catch(e => setError(`Nie udało się odczytać danych: ${String(e)}`)), 2500);
+    const sync = window.setInterval(() => readSnapshot(true).catch(e => setError(`Nie udało się odczytać danych: ${String(e)}`)), 2500);
     return () => { window.clearInterval(timer); window.clearInterval(sync); };
-  }, [refresh]);
+  }, [refresh, readSnapshot]);
 
   const projects = data.projects.filter(p => same(p.client_id, clientId) && (showArchived || !p.archived));
   const selectedProject = data.projects.find(p => same(p.id, projectId));
@@ -169,8 +246,6 @@ export default function App() {
     if (!allClients.read) return null;
     try { return historyDays(entries, allClients.read.data, catalog, allClients.read.at); } catch { return null; }
   }, [entries, allClients.read, catalog]);
-  // One write at a time: a fast double click cannot send a second start before the first returns.
-  const writes = useRef(createRequestGate()).current;
   const startDisabled = startBlocked({ busy, loaded, projectId, taskId, client: selectedClient, project: selectedProject, task: selectedTask, active: data.active });
   const main = mainAction({ busy, loaded, projectId, taskId, client: selectedClient, project: selectedProject, task: selectedTask, active: data.active });
   // Start and Stop are one button that changes meaning in place: after either, a second click is ignored for a moment.
@@ -255,7 +330,7 @@ export default function App() {
   }
   async function applyRestore() {
     if (!restorePreview || !restoreConfirmed) return;
-    if (entryEditor.current?.hasUnsavedChanges()) {
+    if (hasUnsavedReportEdit()) {
       setError('Zapisz lub zachowaj szkic edycji przed przywróceniem kopii.');
       return;
     }
@@ -415,7 +490,9 @@ export default function App() {
           </form>
         </details>
         <EntryDraftEditor ref={entryEditor} clients={data.clients} projects={data.projects} tasks={data.tasks}
-          enabled={loaded && !busy} onCommitted={async entryId => {
+          enabled={loaded && !busy} closeReady={closeReady} closeRequest={closeState?.step === 'draft' ? closeState.request : null}
+          onResolveClose={handleResolveClose} onOpenChange={handleDraftOpenChange}
+          onCommitted={async entryId => {
             setNotice('Zmiany wpisu zostały zapisane.');
             setReportRevision(version => version + 1);
             try {
@@ -451,7 +528,9 @@ export default function App() {
       </div>
       {view === 'calendar' && <CalendarShell report={allClients} catalog={catalog} loaded={loaded} now={now} snapshotFresh={now - snapshotAt <= 5000}
         snapshotActive={data.active ? { id: data.active.id, project_id: data.active.project_id, task_id: data.active.task_id, started_at: data.active.started_at, description: data.active.description, billable: data.active.billable, recovered: data.active.recovered, uncertain: data.active.uncertain } : null}
-        editable={loaded && !busy} onEntrySaved={async () => { setReportRevision(version => version + 1); await refresh(); }} />}
+        editable={loaded && !busy} closeReady={closeReady} closeRequest={closeState?.step === 'calendar' ? closeState.request : null}
+        onResolveClose={handleResolveClose} onEditorState={handleCalendarEditorState}
+        onEntrySaved={async () => { setReportRevision(version => version + 1); await refresh(); }} />}
       <footer>Wersja rozwojowa · Dane przechowywane lokalnie</footer>
     </main>
   </div>;

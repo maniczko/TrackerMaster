@@ -11,6 +11,10 @@ import CalendarFilters from './CalendarFilters';
 import CalendarEntryDialog from './CalendarEntryDialog';
 import type { CalendarEntryRequest } from './CalendarEntryDialog';
 import { defaultEnd, keyboardRange, minuteAt, slotStart } from './calendarEntry';
+import type { EditorCloseRequest } from './App';
+import { readSavedState, save } from './calendarSaved';
+export { readSavedState, readSaved, save } from './calendarSaved';
+export type { Saved, SavedRead } from './calendarSaved';
 import './calendar.css';
 
 type Props = {
@@ -22,26 +26,13 @@ type Props = {
   editable: boolean;
   /** DEV-26: after a saved entry; refreshes the shared data (calendar, History, report). Throws when the refresh fails. */
   onEntrySaved: () => Promise<void>;
+  closeReady: boolean; closeRequest: EditorCloseRequest | null;
+  onResolveClose: (requestId: number, proceed: boolean) => Promise<void>;
+  onEditorState: (open: boolean, dirty: boolean) => void | Promise<void>;
 };
 /** DEV-26: finished work blocks open the edit form; running, sleep-to-decide and to-verify ones only show details. */
 const editableBlock = (block: CalendarBlock, all: readonly CalendarBlock[]) => block.kind === 'work' && !block.running && block.entryEndMs !== null
   && !all.some(other => other.entryId === block.entryId && other.kind !== 'work');
-
-// Convenience only (DEV-28): the last week and filters. Never a source of data; failures are ignored.
-const STORAGE_KEY = 'trackermaster.calendar.v1';
-export type Saved = { week?: string; month?: string; scope?: ReportScope; billable?: CalendarBillable };
-export function readSaved(): Saved {
-  try {
-    const value = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? 'null');
-    if (!value || typeof value !== 'object') return {};
-    const id = (item: unknown) => item === null || (Number.isSafeInteger(item) && (item as number) > 0);
-    const scope = value.scope && id(value.scope.clientId) && id(value.scope.projectId) && id(value.scope.taskId) ? value.scope as ReportScope : undefined;
-    return { week: validCalendarDate(value.week) ? weekStartOf(value.week) : undefined, month: typeof value.month === 'string' ? value.month : undefined, scope,
-      billable: ['all', 'billable', 'nonbillable'].includes(value.billable) ? value.billable : undefined };
-  } catch { return {}; }
-}
-// Week and month keep each other's last position and share the filters (DEV-25).
-export function save(value: Saved) { try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...readSaved(), ...value })); } catch { /* convenience only */ } }
 
 // 40 px per hour: about 10 hours of the axis at 1280×720 and 6 at 125 % DPI (PO, PR #63 review).
 const HOUR_PX = 40;
@@ -64,13 +55,15 @@ function blockLabel(block: CalendarBlock): string {
   return `${block.title} — ${block.path}, ${pieceRange(block)}, ${state}`;
 }
 
-export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, initialWeek, viewSwitch, editable, onEntrySaved }: Props) {
-  const [saved] = useState(readSaved);
+export default function CalendarWeek({ report, catalog, loaded, now, snapshotActive, snapshotFresh, initialWeek, viewSwitch, editable, onEntrySaved, closeReady, closeRequest, onResolveClose, onEditorState }: Props) {
+  const [initialRead] = useState(readSavedState);
+  const saved = initialRead.saved;
   const zone = report.read?.data.time_zone;
   const today = zone ? (() => { try { return dateInZone(now, zone); } catch { return null; } })() : null;
   const [week, setWeek] = useState<string | null>(initialWeek && validCalendarDate(initialWeek) ? weekStartOf(initialWeek) : saved.week ?? null);
   const [scope, setScope] = useState<ReportScope>(saved.scope ?? allReportClients);
   const [billable, setBillable] = useState<CalendarBillable>(saved.billable ?? 'all');
+  const [savedCorrupt, setSavedCorrupt] = useState(initialRead.corrupt);
   const [selected, setSelected] = useState<string | null>(null);
   const [scopeNotice, setScopeNotice] = useState('');
   const [noteOpen, setNoteOpen] = useState(false);
@@ -86,15 +79,15 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   const opener = useRef<HTMLElement | null>(null);
   const addButton = useRef<HTMLButtonElement>(null);
 
-  useEffect(() => { if (shownWeek) save({ week: shownWeek, scope, billable }); }, [shownWeek, scope, billable]);
+  useEffect(() => { if (!savedCorrupt && shownWeek) save({ week: shownWeek, scope, billable }); }, [savedCorrupt, shownWeek, scope, billable]);
 
   const resolved = useMemo(() => resolveReportScope(scope, catalog), [scope, catalog]);
   const filter: CalendarFilter = { scope, billable };
   const view = useMemo(() => {
-    if (!report.read || !shownWeek || resolved.problem) return null;
+    if (savedCorrupt || !report.read || !shownWeek || resolved.problem) return null;
     try { return calendarWeek({ data: report.read.data, catalog, filter, weekStart: shownWeek, now, snapshotActive, snapshotFresh, minMinutes: MIN_MINUTES }); }
     catch { return null; }
-  }, [report.read, catalog, scope, billable, shownWeek, now, snapshotActive, snapshotFresh, resolved.problem]);
+  }, [savedCorrupt, report.read, catalog, scope, billable, shownWeek, now, snapshotActive, snapshotFresh, resolved.problem]);
   const blocks = view ? view.days.flatMap(day => day.blocks) : [];
   const chosen = blocks.find(block => block.key === selected) ?? null;
   const filtered = scope.clientId !== null || billable !== 'all';
@@ -120,7 +113,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
     fit();
     window.addEventListener('resize', fit);
     return () => window.removeEventListener('resize', fit);
-  });
+  }, []);
   useEffect(() => { if (chosen) dialog.current?.focus(); }, [chosen?.key]);
   useEffect(() => { if (selected && !chosen) setSelected(null); }, [selected, chosen]);
 
@@ -133,6 +126,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
   function go(next: string | null) { setSelected(null); setWeek(next); }
   function openForm(request: CalendarEntryRequest, from: HTMLElement | null) {
     if (!editable || entryForm) return;
+    if (!closeReady) { setEntryNote({ text: 'Ochrona edycji nie jest jeszcze dostępna. Spróbuj otworzyć formularz ponownie.', problem: true }); return; }
     opener.current = from; setSelected(null); setEntryNote(null); setEntryForm(request);
   }
   function closeForm(note?: string) {
@@ -173,14 +167,16 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
       </div>
       <h2 className="calendar-range">{view ? weekLabel(view.from, view.through) : 'Tydzień'}</h2>
       <CalendarFilters catalog={catalog} scope={scope} billable={billable} resolved={resolved}
-        onScope={(next, message) => { setScope(next); setScopeNotice(message); }} onBillable={setBillable} />
+        onScope={(next, message) => { setSavedCorrupt(false); setScope(next); setScopeNotice(message); }}
+        onBillable={next => { setSavedCorrupt(false); setBillable(next); }} />
       <p className="calendar-total"><span>{filtered ? 'Suma (filtry)' : 'Suma'}</span> <strong className="calendar-week-total" aria-live="off">{view ? duration(view.weekSeconds) : '—'}</strong>
         <button type="button" className="secondary calendar-info" aria-label="Jak liczone są sumy" aria-expanded={noteOpen} aria-controls="calendar-scope-note" title={scopeNote(filtered, zone)} onClick={() => setNoteOpen(open => !open)}><span aria-hidden="true">i</span></button></p>
     </div>
     {noteOpen && <p id="calendar-scope-note" role="note" className="helper calendar-scope-note">{scopeNote(filtered, zone)}</p>}
     {scopeNotice && <p role="status" className="helper">{scopeNotice}</p>}
     {entryNote && <p role={entryNote.problem ? 'alert' : 'status'} className={entryNote.problem ? 'alert error calendar-entry-note' : 'alert success calendar-entry-note'}>{entryNote.text}</p>}
-    {resolved.problem && <p role="alert" className="alert error">{resolved.problem} Wybierz inny filtr.</p>}
+    {savedCorrupt && <p role="alert" className="alert error">Zapisany filtr kalendarza jest nieprawidłowy. Wybierz filtr ręcznie.</p>}
+    {!savedCorrupt && resolved.problem && <p role="alert" className="alert error">{resolved.problem} Wybierz inny filtr.</p>}
     {!loaded ? <p role="status" className="alert error">Dane nie są aktualne. Odczytaj je ponownie w widoku Timer.</p>
       : report.failed ? <p role="alert" className="alert error">Nie udało się odczytać wpisów do kalendarza. Spróbuj ponownie za chwilę.</p>
       : !report.read ? <p role="status" className="calendar-loading">Wczytywanie kalendarza…</p>
@@ -235,7 +231,7 @@ export default function CalendarWeek({ report, catalog, loaded, now, snapshotAct
           <p className="helper">{chosen.running ? 'Trwającego pomiaru nie edytuje się w kalendarzu.' : 'Tego wpisu nie można edytować w kalendarzu, dopóki ma okres do rozstrzygnięcia lub weryfikacji.'}</p>
         </div>}
         {entryForm && report.read && <CalendarEntryDialog request={entryForm} zone={view.zone} now={now} catalog={catalog} data={report.read.data}
-          active={snapshotActive} enabled={editable} onClose={closeForm} onSaved={entrySaved} />}
+          active={snapshotActive} enabled={editable} closeRequest={closeRequest} onResolveClose={onResolveClose} onEditorState={onEditorState} onClose={closeForm} onSaved={entrySaved} />}
       </>}
   </section>;
 }

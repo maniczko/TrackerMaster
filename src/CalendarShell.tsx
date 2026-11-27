@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { CalendarClockEntry } from './calendarModel';
 import type { ReportCatalog } from './reportScope';
 import type { AllClientsReport } from './useAllClientsReport';
+import type { EditorCloseRequest } from './App';
 import CalendarWeek from './CalendarWeek';
 import CalendarMonth from './CalendarMonth';
 
@@ -12,11 +13,14 @@ type Props = {
   snapshotActive: CalendarClockEntry | null; snapshotFresh: boolean;
   /** DEV-26: the week adds and edits entries; the month stays read only. */
   editable: boolean; onEntrySaved: () => Promise<void>;
+  closeReady: boolean; closeRequest: EditorCloseRequest | null;
+  onResolveClose: (requestId: number, proceed: boolean) => Promise<void>;
+  onEditorState: (open: boolean, dirty: boolean) => void | Promise<void>;
 };
 type Mode = 'week' | 'month';
 const MODE_KEY = 'trackermaster.calendar.mode.v1';
 
-export default function CalendarShell(props: Props) {
+export default function CalendarShell({ closeReady, closeRequest, onResolveClose, onEditorState, ...shared }: Props) {
   const [mode, setMode] = useState<Mode>(() => { try { return window.localStorage.getItem(MODE_KEY) === 'month' ? 'month' : 'week'; } catch { return 'week'; } });
   const [weekOf, setWeekOf] = useState<string | undefined>(undefined);
   function show(next: Mode, date?: string) {
@@ -29,6 +33,6 @@ export default function CalendarShell(props: Props) {
     <button type="button" aria-pressed={mode === 'month'} onClick={() => show('month')}>Miesiąc</button>
   </div>;
   return mode === 'month'
-    ? <CalendarMonth {...props} viewSwitch={viewSwitch} onOpenWeek={date => show('week', date)} />
-    : <CalendarWeek key={weekOf ?? 'saved'} {...props} initialWeek={weekOf} viewSwitch={viewSwitch} />;
+    ? <CalendarMonth {...shared} viewSwitch={viewSwitch} onOpenWeek={date => show('week', date)} />
+    : <CalendarWeek key={weekOf ?? 'saved'} {...shared} closeReady={closeReady} closeRequest={closeRequest} onResolveClose={onResolveClose} onEditorState={onEditorState} initialWeek={weekOf} viewSwitch={viewSwitch} />;
 }

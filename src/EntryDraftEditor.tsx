@@ -1,11 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { draftRange, editableFields, matchesFields, mergeDraftFields, sourceFields } from './entryDraft';
 import type { DraftApplication, DraftFields, DraftList, DraftSource, DraftSourceStatus, EditableField, EntryDraft } from './entryDraft';
 import { createDraftSort } from './draftSort';
 import type { DraftSort, DraftSortState } from './draftSort';
 import { clientLabels } from './clientLabels';
+import type { EditorCloseRequest } from './App';
 
 type NamedItem = { id: number | string; name: string; archived: boolean };
 type Project = NamedItem & { client_id: number | string };
@@ -15,6 +15,10 @@ type Props = {
   projects: Project[];
   tasks: Task[];
   enabled: boolean;
+  closeReady: boolean;
+  closeRequest: EditorCloseRequest | null;
+  onResolveClose: (requestId: number, proceed: boolean) => Promise<void>;
+  onOpenChange: (open: boolean) => Promise<void>;
   onCommitted: (entryId: number) => Promise<void>;
 };
 
@@ -41,7 +45,7 @@ type Review = {
   databaseId: string | null;
   selected: EditableField[];
 };
-type CloseRequest = { id: number; action: 'hide' | 'quit' };
+type CloseRequest = EditorCloseRequest;
 
 const emptyTarget = { clientId: '', projectId: '', taskId: '' };
 const fieldLabels: Record<EditableField, string> = { start: 'Rozpoczęcie', end: 'Zakończenie', description: 'Opis' };
@@ -52,7 +56,7 @@ function fieldHasChanges(editor: Editor): boolean {
 }
 
 const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function EntryDraftEditor(
-  { clients, projects, tasks, enabled, onCommitted }, ref,
+  { clients, projects, tasks, enabled, closeReady, closeRequest, onResolveClose, onOpenChange, onCommitted }, ref,
 ) {
   const [editor, setEditor] = useState<Editor | null>(null);
   const [review, setReview] = useState<Review | null>(null);
@@ -66,8 +70,6 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
   const [sorting] = useState(() => createDraftSort(order => invoke('set_draft_sort', { order }), setSort));
   const [sortReady, setSortReady] = useState(false);
   const [sortReadProblem, setSortReadProblem] = useState(false);
-  const [closeReady, setCloseReady] = useState(false);
-  const [closeRequest, setCloseRequest] = useState<CloseRequest | null>(null);
   const current = useRef<Editor | null>(null);
   const sequence = useRef(0);
   const operation = useRef(false);
@@ -81,21 +83,6 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
   const closeDialog = useRef<HTMLDialogElement>(null);
   const stay = useRef<HTMLButtonElement>(null);
   const automaticCloseId = useRef<number | null>(null);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen<CloseRequest>('entry-editor-close', request => {
-      setError('');
-      setCloseRequest(request.payload);
-    }).then(remove => {
-      if (disposed) remove();
-      else { unlisten = remove; setCloseReady(true); }
-    }).catch(() => {
-      if (!disposed) setError('Nie udało się włączyć ochrony edycji przy zamykaniu aplikacji.');
-    });
-    return () => { disposed = true; unlisten?.(); };
-  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -122,6 +109,10 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     return () => {
       cancelled = true;
       window.clearTimeout(timer.current);
+      if (current.current !== null) {
+        current.current = null;
+        void onOpenChange(false);
+      }
     };
   }, []);
 
@@ -137,11 +128,11 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     setEditor(value);
   }
 
-  async function dismissEditor() {
+  async function dismissEditor(notifyGuard = true) {
     window.clearTimeout(timer.current);
     setStorageProblem('');
     replaceEditor(null);
-    await invoke('set_entry_editor_guard', { open: false });
+    if (notifyGuard) await onOpenChange(false);
   }
 
   async function readDrafts(): Promise<DraftList> {
@@ -167,7 +158,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
   ) {
     if (!closeReady) throw new Error('Ochrona edycji nie jest jeszcze dostępna. Otwórz edycję ponownie.');
     const baseline = base ? sourceFields(base, fields.inputTimeZone) : null;
-    await invoke('set_entry_editor_guard', { open: true });
+    await onOpenChange(true);
     setReview(null);
     setStorageProblem('');
     replaceEditor({ session: ++sequence.current, source, base, baseline, fields, saved, target, focus });
@@ -289,14 +280,14 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     clearListed(draft);
   }
 
-  async function applyEditor() {
+  async function applyEditor(notifyGuard = true) {
       const active = current.current;
       if (!active) return;
       window.clearTimeout(timer.current);
       if (!fieldHasChanges(active)) {
         await pendingWrite.current;
         if (current.current?.saved) await discard(current.current.saved);
-        await dismissEditor();
+        await dismissEditor(notifyGuard);
         return;
       }
       await storeSnapshot(active.session);
@@ -320,11 +311,11 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
       }
       const entryId = await invoke<number>('apply_entry_draft', { entryId: saved.source.entryId, revision: saved.revision, application });
       clearListed(saved);
-      await dismissEditor();
+      await dismissEditor(notifyGuard);
       await onCommitted(entryId);
   }
 
-  async function leaveEditor(keep: boolean) {
+  async function leaveEditor(keep: boolean, notifyGuard = true) {
       const active = current.current;
       if (!active) return;
       window.clearTimeout(timer.current);
@@ -333,7 +324,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
         await pendingWrite.current;
         if (current.current?.saved) await discard(current.current.saved);
       }
-      await dismissEditor();
+      await dismissEditor(notifyGuard);
   }
 
   function updateTarget(target: Target) {
@@ -374,8 +365,7 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
   }
 
   async function answerClose(request: CloseRequest, proceed: boolean) {
-    await invoke('resolve_entry_editor_close', { requestId: request.id, proceed });
-    setCloseRequest(null);
+    await onResolveClose(request.id, proceed);
   }
 
   const needsCloseChoice = closeRequest !== null && editor !== null && fieldHasChanges(editor);
@@ -394,10 +384,11 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
     automaticCloseId.current = closeRequest.id;
     run(async () => {
       await pendingWrite.current;
-      await answerClose(closeRequest, true);
       // The window can be reopened from the tray without reopening a clean form.
       window.clearTimeout(timer.current);
       replaceEditor(null);
+      await answerClose(closeRequest, true);
+      await onOpenChange(false);
     });
   }, [closeRequest, needsCloseChoice, working]);
 
@@ -462,10 +453,10 @@ const EntryDraftEditor = forwardRef<EntryDraftEditorHandle, Props>(function Entr
       {error && needsCloseChoice && <p className="alert error" role="alert">{error}</p>}
       <div className="actions">
         <button type="button" className="primary" disabled={working || !enabled} onClick={() => {
-          if (closeRequest) run(async () => { await applyEditor(); await answerClose(closeRequest, true); });
+          if (closeRequest) run(async () => { await applyEditor(false); await answerClose(closeRequest, true); await onOpenChange(false); });
         }}>Zapisz</button>
         <button type="button" className="secondary" disabled={working} onClick={() => {
-          if (closeRequest) run(async () => { await leaveEditor(false); await answerClose(closeRequest, true); });
+          if (closeRequest) run(async () => { await leaveEditor(false, false); await answerClose(closeRequest, true); await onOpenChange(false); });
         }}>Odrzuć zmiany</button>
         <button ref={stay} type="button" className="secondary" disabled={working} onClick={() => {
           if (closeRequest) run(() => answerClose(closeRequest, false));

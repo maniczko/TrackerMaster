@@ -1,8 +1,8 @@
 import { useId, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { formatDuration as duration } from './reportCsv';
-import { chartScale, formatPercent, summaryChart, summaryGroups, summaryKpis } from './reportSummaryModel';
-import type { ChartBucket, EntryRelations, SummaryGroup } from './reportSummaryModel';
+import { chartScale, formatPercent, summaryChart, summaryGroups, summaryGroupsByProject, summaryKpis } from './reportSummaryModel';
+import type { ChartBucket, EntryRelations, SummaryGroup, SummaryGrouping } from './reportSummaryModel';
 import type { makeReportView } from './reportView';
 import type { ReportCatalog } from './reportScope';
 
@@ -23,9 +23,12 @@ const unitHint = { day: 'dzień', week: 'tydzień (od poniedziałku)', month: 'm
 const tickLabel = (seconds: number, step: number) => step >= 3600 ? `${seconds / 3600} h` : `${seconds / 60} min`;
 
 export default function ReportSummary({ view, relations, catalog, clientLabelById, from, through, incomplete }: Props) {
+  const [grouping, setGrouping] = useState<SummaryGrouping>('client-project-task');
   const kpi = useMemo(() => summaryKpis(view), [view]);
   const chart = useMemo(() => summaryChart(view, relations, catalog, clientLabelById, from, through), [view, relations, catalog, clientLabelById, from, through]);
-  const groups = useMemo(() => summaryGroups(view, relations, catalog, clientLabelById), [view, relations, catalog, clientLabelById]);
+  const groups = useMemo(() => grouping === 'project-task'
+    ? summaryGroupsByProject(view, relations, catalog, clientLabelById)
+    : summaryGroups(view, relations, catalog, clientLabelById), [grouping, view, relations, catalog, clientLabelById]);
   const live = kpi.liveSeconds !== kpi.totalSeconds;
   return <>
     <div className="report-summary report-kpis" aria-label="Wskaźniki zatwierdzonego czasu">
@@ -43,7 +46,7 @@ export default function ReportSummary({ view, relations, catalog, clientLabelByI
     </p>}
     {kpi.totalSeconds === 0 ? <p className="muted report-summary-empty">Brak zatwierdzonego czasu w wybranym zakresie.</p> : <>
       <ReportChart buckets={chart.buckets} unit={chart.unit} maxSeconds={chart.maxSeconds} legend={chart.legend} />
-      <ReportGroups groups={groups} totalSeconds={kpi.totalSeconds} />
+      <ReportGroups groups={groups} totalSeconds={kpi.totalSeconds} grouping={grouping} onGroupingChange={setGrouping} />
     </>}
   </>;
 }
@@ -126,7 +129,7 @@ function ReportChart({ buckets, unit, maxSeconds, legend }: ChartProps) {
   </figure>;
 }
 
-function ReportGroups({ groups, totalSeconds }: { groups: SummaryGroup[]; totalSeconds: number }) {
+function ReportGroups({ groups, totalSeconds, grouping, onGroupingChange }: { groups: SummaryGroup[]; totalSeconds: number; grouping: SummaryGrouping; onGroupingChange: (next: SummaryGrouping) => void }) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set(groups.map(group => group.key)));
   const all = useMemo(() => groups.flatMap(group => [group.key, ...group.children.map(child => child.key)]), [groups]);
   const toggle = (key: string) => setExpanded(current => {
@@ -142,14 +145,19 @@ function ReportGroups({ groups, totalSeconds }: { groups: SummaryGroup[]; totalS
     }
   };
   visit(groups, 0);
+  const heading = grouping === 'project-task' ? 'Projekt → zadanie' : 'Klient → projekt → zadanie';
   return <section className="report-groups" aria-label="Podział czasu: klient, projekt, zadanie">
-    <div className="section-top"><h3>Klient → projekt → zadanie</h3>
+    <div className="section-top"><h3>{heading}</h3>
       <div className="actions">
+        <div className="report-group-switch" role="group" aria-label="Poziom grupowania">
+          <button type="button" className="secondary report-button" aria-pressed={grouping === 'client-project-task'} onClick={() => onGroupingChange('client-project-task')}>Klient → projekt</button>
+          <button type="button" className="secondary report-button" aria-pressed={grouping === 'project-task'} onClick={() => onGroupingChange('project-task')}>Projekt → zadanie</button>
+        </div>
         <button type="button" className="secondary report-button" onClick={() => setExpanded(new Set(all))}>Rozwiń wszystko</button>
         <button type="button" className="secondary report-button" onClick={() => setExpanded(new Set())}>Zwiń wszystko</button>
       </div></div>
     <div className="table-wrap"><table>
-      <thead><tr><th scope="col">Klient / projekt / zadanie</th><th scope="col">Czas</th><th scope="col">Udział</th></tr></thead>
+      <thead><tr><th scope="col">{grouping === 'project-task' ? 'Projekt / zadanie' : 'Klient / projekt / zadanie'}</th><th scope="col">Czas</th><th scope="col">Udział</th></tr></thead>
       <tbody>{rows.map(({ group, depth }) => <tr key={group.key} data-level={group.level} data-key={group.key}>
         <th scope="row" className={`report-group-name report-group-depth-${depth}`}>
           {group.children.length ? <button type="button" className="report-group-toggle" aria-expanded={expanded.has(group.key)} onClick={() => toggle(group.key)}>

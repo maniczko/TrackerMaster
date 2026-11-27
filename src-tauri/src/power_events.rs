@@ -1,12 +1,17 @@
 //! Windows suspend/resume notifications. The registered context remains valid
 //! for the lifetime of the process; Windows releases the handle on exit.
 #[cfg(windows)]
-use std::sync::OnceLock;
+use std::sync::{mpsc::{self, SyncSender}, OnceLock};
 #[cfg(windows)]
 use crate::{Shared, Tracker};
 
 #[cfg(windows)]
+type QueuedPowerEvent = (u32, i64, crate::PowerSample);
+
+#[cfg(windows)]
 static TRACKER: OnceLock<Shared> = OnceLock::new();
+#[cfg(windows)]
+static SENDER: OnceLock<SyncSender<QueuedPowerEvent>> = OnceLock::new();
 #[cfg(windows)]
 static REGISTRATION: OnceLock<usize> = OnceLock::new();
 
@@ -24,20 +29,24 @@ extern "system" {
 }
 
 #[cfg(windows)]
+fn dispatch_event(tracker: &mut Tracker, event: u32, now_ms: i64, power: crate::PowerSample) {
+    match event {
+        4 => { let _ = handle_suspend(tracker, now_ms, power); }, // PBT_APMSUSPEND
+        18 => { let _ = handle_resume(tracker, now_ms, power); }, // PBT_APMRESUMEAUTOMATIC
+        _ => (),
+    }
+}
+
+#[cfg(windows)]
 unsafe extern "system" fn callback(_: *const std::ffi::c_void, event: u32, _: *const std::ffi::c_void) -> u32 {
-    // Never unwind through an operating-system callback. If a lock is held,
-    // skip the event; the existing clock-discontinuity protection will refuse
-    // to silently finalise the affected timer.
+    // Never unwind or block on Shared inside the OS callback: sample clocks immediately
+    // and hand off SQLite work to the worker thread so brief reads/backups do not drop sleep events.
     let _ = std::panic::catch_unwind(|| {
-        let Some(shared) = TRACKER.get() else { return; };
-        let Ok(mut tracker) = shared.try_lock() else { return; };
+        if !matches!(event, 4 | 18) { return; }
+        let Some(sender) = SENDER.get() else { return; };
         let Ok(power) = crate::power_sample() else { return; };
         let now = chrono::Utc::now().timestamp_millis();
-        match event {
-            4 => { let _ = handle_suspend(&mut tracker, now, power); }, // PBT_APMSUSPEND
-            18 => { let _ = handle_resume(&mut tracker, now, power); }, // PBT_APMRESUMEAUTOMATIC
-            _ => (),
-        }
+        let _ = sender.try_send((event, now, power));
     });
     0
 }
@@ -45,6 +54,19 @@ unsafe extern "system" fn callback(_: *const std::ffi::c_void, event: u32, _: *c
 #[cfg(windows)]
 pub fn register(shared: Shared) -> Result<(), &'static str> {
     TRACKER.set(shared).map_err(|_| "Rejestracja monitora uśpienia już istnieje.")?;
+    let (sender, receiver) = mpsc::sync_channel::<QueuedPowerEvent>(64);
+    SENDER.set(sender).map_err(|_| "Rejestracja monitora uśpienia już istnieje.")?;
+    let _ = std::thread::Builder::new()
+        .name("tm-power-events".into())
+        .spawn(move || {
+            while let Ok((event, now, power)) = receiver.recv() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Some(shared) = TRACKER.get() else { return; };
+                    let Ok(mut tracker) = shared.lock() else { return; };
+                    dispatch_event(&mut tracker, event, now, power);
+                }));
+            }
+        });
     let params = SubscribeParameters { callback: Some(callback), context: std::ptr::null() };
     let mut handle = std::ptr::null_mut();
     // DEVICE_NOTIFY_CALLBACK is 2. No caller-owned context is passed to Windows.

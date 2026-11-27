@@ -160,6 +160,7 @@ export function chartScale(maxSeconds: number): { max: number; step: number } {
   return { max: Math.max(step, Math.ceil(maxSeconds / step) * step), step };
 }
 
+export type SummaryGrouping = 'client-project-task' | 'project-task';
 export type SummaryGroup = { key: string; level: 'client' | 'project' | 'task'; name: string; seconds: number; children: SummaryGroup[] };
 
 /**
@@ -198,4 +199,48 @@ export function summaryGroups(view: SummaryInput, relations: EntryRelations, cat
     .sort((a, b) => b.seconds - a.seconds || a.name.localeCompare(b.name, 'pl') || a.key.localeCompare(b.key))
     .map(group => ({ ...group, children: sort(group.children) }));
   return sort([...clients.values()]);
+}
+
+/** Project → task grouping across the filtered period (DEV-31 grouping switch). */
+export function summaryGroupsByProject(view: SummaryInput, relations: EntryRelations, catalog: ReportCatalog, clientLabelById: ReadonlyMap<string, string>): SummaryGroup[] {
+  const projects = new Map(catalog.projects.map(project => [String(project.id), project]));
+  const tasks = new Map(catalog.tasks.map(task => [String(task.id), task]));
+  const projectMap = new Map<string, SummaryGroup>();
+  for (const row of view.rows) {
+    if (row.status !== 'finalized' || row.contribution <= 0) continue;
+    const relation = relations.get(row.source.id);
+    const projectId = relation ? String(relation.projectId) : 'unknown';
+    const project = projects.get(projectId);
+    const clientName = project ? (clientLabelById.get(String(project.client_id)) ?? row.source.client) : UNASSIGNED;
+    let projectGroup = projectMap.get(projectId);
+    if (!projectGroup) {
+      projectGroup = {
+        key: `project:${projectId}`,
+        level: 'project',
+        name: project ? `${project.name} (${clientName})` : UNASSIGNED,
+        seconds: 0,
+        children: [],
+      };
+      projectMap.set(projectId, projectGroup);
+    }
+    const taskId = relation?.taskId ?? null;
+    const taskKey = taskId === null ? `task:none:${projectId}` : `task:${taskId}`;
+    let taskGroup = projectGroup.children.find(item => item.key === taskKey);
+    if (!taskGroup) {
+      taskGroup = {
+        key: taskKey,
+        level: 'task',
+        name: taskId === null ? 'Bez zadania' : tasks.get(String(taskId))?.name ?? UNASSIGNED,
+        seconds: 0,
+        children: [],
+      };
+      projectGroup.children.push(taskGroup);
+    }
+    projectGroup.seconds += row.contribution;
+    taskGroup.seconds += row.contribution;
+  }
+  const sort = (groups: SummaryGroup[]): SummaryGroup[] => groups
+    .sort((a, b) => b.seconds - a.seconds || a.name.localeCompare(b.name, 'pl') || a.key.localeCompare(b.key))
+    .map(group => ({ ...group, children: sort(group.children) }));
+  return sort([...projectMap.values()]);
 }
