@@ -2623,18 +2623,25 @@ async function runWindow(port, phase, recovery) {
       assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.xlsx')).length, 0);
 
       await cdp.send('Runtime.evaluate', {
+        expression: `[...document.querySelectorAll('.report-export button')].find(item => item.textContent === 'Przygotuj podgląd XLSX')?.click()`,
+        returnByValue: true,
+      }, sessionId);
+      await waitFor('XLSX preview opened', async () => (await cdp.send('Runtime.evaluate', {
+        expression: `Boolean(document.querySelector('.export-preview tbody'))`,
+        returnByValue: true,
+      }, sessionId)).result.value === true);
+
+      await cdp.send('Runtime.evaluate', {
         expression: `(() => {
-          const orig = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
-          window.__TAURI_INTERNALS__.invoke = (cmd, args) => {
-            if (cmd === 'get_client_export_data') {
-              window.__TAURI_INTERNALS__.invoke = orig;
-              return Promise.reject('Symulowany błąd zapisu XLSX');
-            }
-            return orig(cmd, args);
+          const orig = URL.createObjectURL.bind(URL);
+          URL.createObjectURL = () => {
+            URL.createObjectURL = orig;
+            throw new Error('Symulowany błąd zapisu XLSX');
           };
-          const btn = [...document.querySelectorAll('.report-export button')].find(item => item.textContent === 'Przygotuj podgląd XLSX');
-          btn.click();
+          const button = [...document.querySelectorAll('.export-preview button')].find(item => item.textContent === 'Potwierdź i pobierz XLSX');
+          button.click();
         })()`,
+        userGesture: true,
         returnByValue: true,
       }, sessionId);
       await waitFor('XLSX error alert shown', async () => (await cdp.send('Runtime.evaluate', {
@@ -2643,14 +2650,6 @@ async function runWindow(port, phase, recovery) {
       }, sessionId)).result.value === true);
       assert.equal((await readdir(csvDirectory)).filter(name => name.endsWith('.xlsx')).length, 0);
 
-      await cdp.send('Runtime.evaluate', {
-        expression: `[...document.querySelectorAll('.report-export button')].find(item => item.textContent === 'Przygotuj podgląd XLSX')?.click()`,
-        returnByValue: true,
-      }, sessionId);
-      await waitFor('XLSX retry reopened preview', async () => (await cdp.send('Runtime.evaluate', {
-        expression: `Boolean(document.querySelector('.export-preview tbody'))`,
-        returnByValue: true,
-      }, sessionId)).result.value === true);
       const xlsxDownload = await cdp.send('Runtime.evaluate', {
         expression: `(() => {
           const button = [...document.querySelectorAll('.export-preview button')].find(item => item.textContent === 'Potwierdź i pobierz XLSX');
