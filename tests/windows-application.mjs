@@ -2538,7 +2538,7 @@ async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
   {
     const db = openTestDb();
     try {
-      project = db.prepare(`SELECT p.id, p.client_id FROM projects p JOIN clients c ON c.id = p.client_id WHERE p.archived=0 AND c.archived=0 LIMIT 1`).get();
+      project = db.prepare(`SELECT p.id, p.client_id FROM projects p WHERE p.archived=0 AND NOT EXISTS (SELECT 1 FROM client_archives a WHERE a.client_id=p.client_id) LIMIT 1`).get();
       db.exec('BEGIN IMMEDIATE');
       const insertEntry = db.prepare(`INSERT INTO time_entries (project_id, task_id, started_at, ended_at, duration_seconds, manually_resolved) VALUES (?, NULL, ?, ?, ?, 0)`);
       const insertDesc = db.prepare(`INSERT INTO entry_descriptions (entry_id, description) VALUES (?, ?)`);
@@ -2579,6 +2579,7 @@ async function verifyDev36Polish(cdp, sessionId, recoveryDescription) {
   }
   await waitFor('M8 escape closed details', () => evaluate(`!document.querySelector('.calendar-details')`));
   await invoke('stop_timer', { expectedActiveId: m8Active.id });
+  await waitFor('M8 timer stopped cleanly', () => invoke('get_snapshot').then(s => s.active === null));
 
   await evaluate(`(() => {
     const d = document.querySelector('.calendar-date');
